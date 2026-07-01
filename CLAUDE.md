@@ -126,13 +126,19 @@ filtered queries as a "simplification," it multiplies calls for any station
 shared by more than one route.
 
 Matched by `scheduleMetadata.identity`. The rate-limit handling in
-`_adjust_delay()` reads both `X-RateLimit-Remaining-Minute` (pauses outright
-if ≤2 left — 30/min is the tightest, most immediate cap) and
-`X-RateLimit-Remaining-Hour` (backs off the steady-state delay); `api_get()`
-also retries on 429 using the `Retry-After` header. Confirmed live against
-the API: entitlements carry limits of 30/minute, 750/hour, 9000/day,
-30000/week. Don't remove this — a full run makes ~720 calls (8 stations ×
-90 days), close to the hourly cap on its own.
+`_adjust_delay()` reads both `X-RateLimit-Remaining-Minute` (pauses 20s
+outright if ≤2 left — 30/min is the tightest, most immediate cap) and
+`X-RateLimit-Remaining-Hour` (pauses until the next wall-clock hour outright
+if it hits 0); `api_get()` also retries on 429 using the `Retry-After`
+header. Confirmed live against the API: entitlements carry limits of
+30/minute, 750/hour, 9000/day, 30000/week. A full run makes ~720 calls (8
+stations × 90 days), under the hourly cap — the request pace (2s flat, no
+graduated ramp) is deliberately not backed off pre-emptively as the hourly
+budget runs low, since this account is only shared with occasional manual
+testing, not other concurrent automated consumers. The `update-schedule.yml`
+workflow's `concurrency` group is what actually prevents two Action runs
+racing this same budget — don't remove that lock without reintroducing some
+other protection against overlapping runs.
 
 ## Caching strategy — stale-while-revalidate, not network-first
 
@@ -216,8 +222,12 @@ confirmed against the live API:
   populated for the great majority of legs were all confirmed against real
   `data.rtt.io` responses.
 - **RTT rate limits for the new API** — confirmed live: 30/minute,
-  750/hour, 9000/day, 30000/week (`X-RateLimit-Limit-*` headers). The
-  dynamic backoff in `_adjust_delay()` is tuned against these real numbers.
+  750/hour, 9000/day, 30000/week (`X-RateLimit-Limit-*` headers). The pacing
+  in `_adjust_delay()` is tuned against these real numbers. The hourly
+  window's reset timing is *not* confirmed (no reset-time header exists) —
+  `_seconds_until_next_hour()`'s wall-clock-hour assumption is inferred from
+  observed behaviour, not documented, and falls back to `api_get()`'s
+  429/`Retry-After` handling if it's wrong.
 
 ## Known limitations, not bugs
 

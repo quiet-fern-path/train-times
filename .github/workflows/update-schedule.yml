@@ -24,6 +24,15 @@ on:
 permissions:
   contents: write
 
+# Only one fetch against the RTT API at a time, regardless of which branch
+# or trigger (cron, manual dispatch, routes.json push) started it — two runs
+# racing the same RTT_TOKEN would share its 750/hour budget unpredictably.
+# cancel-in-progress stays false so a queued run waits instead of killing an
+# in-flight fetch (which would waste the calls it already made this hour).
+concurrency:
+  group: rtt-schedule-fetch
+  cancel-in-progress: false
+
 jobs:
   update-schedule:
     runs-on: ubuntu-latest
