@@ -14,6 +14,19 @@ const liveEverSucceeded = {};
 // routeId -> Date.now() of the last successful live fetch, used to show
 // "X min ago" alongside the stale/offline status.
 const lastLiveSuccessAt = {};
+// Set by fetchBoard() when Darwin rejects the key itself (401/403), reset at
+// the start of each refreshLiveOverlay() round — lets that round's status
+// message say "invalid key" instead of the generic "update failed", since
+// the two need different user action (fix the key vs. just wait/retry).
+let liveAuthError = false;
+// Strings describing each board fetch that failed this refreshLiveOverlay()
+// round (network error, unexpected HTTP status, etc.) — reset at the start
+// of each round, read at the end to build lastLiveErrorReport.
+let liveErrorDetails = [];
+// Full copyable text for the error-details panel, or null when the last
+// round had nothing to report (hides the header's alert button).
+let lastLiveErrorReport = null;
+let scrollSaveTimer = null;
 
 // ── Time helpers ────────────────────────────────────────────────────
 // Timetable day starts at 03:00. Before 03:00 we're still on yesterday's day.
@@ -102,6 +115,63 @@ function currentRoute() {
   return ROUTES.find(r => r.id === activeRouteId);
 }
 
+// ── State persistence (route/direction/date) ───────────────────────
+// Mirrored into both the URL hash and localStorage, so a refresh, a
+// bookmark, or a shared link all reopen the same view. The hash (not a
+// query string) is deliberate: a query string would change the exact
+// request URL the service worker caches (see sw.js), fragmenting one
+// cached page into one entry per route/date ever visited. A hash is never
+// sent to the network or included in a same-document navigation's fetch,
+// so it carries view state without touching caching at all (the bootstrap
+// script in index.html also caches by location.pathname, not
+// location.href, for the same reason). localStorage is only a fallback
+// for the rare case of opening a bare URL with no hash at all (e.g. a
+// home-screen icon someone saved before this existed).
+function readURLState() {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+  return { route: params.get('route'), dir: params.get('dir'), date: params.get('date') };
+}
+function writeURLState(state) {
+  const params = new URLSearchParams();
+  params.set('route', state.route);
+  params.set('dir', state.dir);
+  params.set('date', state.date);
+  const hash = '#' + params.toString();
+  if (location.hash !== hash) history.replaceState(null, '', hash);
+}
+function persistState() {
+  const state = { route: activeRouteId, dir: activeDir, date: inp.value || todayStr() };
+  localStorage.setItem('lastRouteId', state.route);
+  localStorage.setItem('lastDir', state.dir);
+  localStorage.setItem('lastDate', state.date);
+  writeURLState(state);
+}
+function restoreState() {
+  const url = readURLState();
+  const routeId = url.route || localStorage.getItem('lastRouteId');
+  const dir = url.dir || localStorage.getItem('lastDir');
+  const dateStr = url.date || localStorage.getItem('lastDate');
+  if (routeId && ROUTES.some(r => r.id === routeId)) activeRouteId = routeId;
+  if (dir === 'out' || dir === 'ret') activeDir = dir;
+  if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) inp.value = dateStr;
+  persistState(); // normalize the hash to reflect what we actually settled on
+}
+function applyActiveDirUI() {
+  document.querySelectorAll('.tab').forEach(b => {
+    const active = b.dataset.dir === activeDir;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + activeDir));
+}
+// Auto-scrolling to the next train only makes sense when actually
+// navigating (switching route/tab/date, or tapping Now) — not on every
+// periodic re-render (see renderDirection), which would otherwise yank a
+// reader's manual scroll position back every minute.
+function scrollToNextIfToday() {
+  if ((inp.value || todayStr()) === todayStr()) scrollToNext(document.querySelector('.panel.active'));
+}
+
 // ── Platform rendering ──────────────────────────────────────────────
 // state: 'none' | 'planned' | 'confirmed' | 'changed'
 function platformHtml(platform, confirmed, changed, bookedPlatform) {
@@ -114,6 +184,17 @@ function platformHtml(platform, confirmed, changed, bookedPlatform) {
   return `<div class="platform planned">Plat ${platform} (planned)</div>`;
 }
 
+// A delayed departure shows the original scheduled time struck through
+// above the actual (live) time in red — mirrors the platform "(was X)"
+// treatment above, but stacked rather than inline since tval's font is much
+// larger. Skipped for a cancelled leg, whose tval is already fully struck
+// through by the .cancelled class — stacking both would be redundant.
+function depTimeHtml(scheduled, live, isCancelled) {
+  const delayed = !isCancelled && !!live && live !== scheduled;
+  const was = delayed ? `<span class="was-time">${scheduled}</span>` : '';
+  return `<div class="tval${isCancelled ? ' cancelled' : ''}${delayed ? ' delayed' : ''}">${was}${live || scheduled}</div>`;
+}
+
 // ── Route picker / tabs ─────────────────────────────────────────────
 function renderRoutePicker() {
   const el = document.getElementById('route-picker');
@@ -123,7 +204,9 @@ function renderRoutePicker() {
   el.querySelectorAll('.route-chip').forEach(btn => {
     btn.addEventListener('click', () => {
       activeRouteId = btn.dataset.route;
+      persistState();
       render();
+      scrollToNextIfToday();
     });
   });
 }
@@ -152,7 +235,6 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 
   const nextHtml = `<div class="next-row"><span class="next-badge">Next</span><span class="next-mins">${isNext ? label : ''}</span></div>`;
 
-  const depTime = leg._liveDep || leg.dep;
   const arrTime = leg._liveArr || leg.arr;
 
   const delayTag = leg._delayMins > 0
@@ -177,7 +259,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
     ${nextHtml}
     <div class="journey">
       <div class="tblock">
-        <div class="tval${isCancelled ? ' cancelled' : ''}">${depTime}</div>
+        ${depTimeHtml(leg.dep, leg._liveDep, isCancelled)}
         <div class="tlabel">${fromName}</div>
         ${platformHtml(leg._platform || leg.platform, leg._platformConfirmed ?? leg.platformConfirmed, leg._platformChanged, leg.platform)}
       </div>
@@ -225,7 +307,7 @@ function connectionCard(leg, route, dir, isToday, curM) {
     ${nextHtml}
     <div class="journey">
       <div class="tblock">
-        <div class="tval">${leg._liveDep || leg.dep}</div>
+        ${depTimeHtml(leg.dep, leg._liveDep, false)}
         <div class="tlabel">${fromName}</div>
         ${platformHtml(leg._platform1 || leg.platform1, leg._platform1Confirmed ?? leg.platform1Confirmed, leg._platform1Changed, leg.platform1)}
       </div>
@@ -290,7 +372,7 @@ function renderDirection(dir) {
 
   if (dir === activeDir) {
     document.getElementById('slower-count').textContent =
-      slowerCount > 0 ? `&middot; ${slowerCount} slower train${slowerCount === 1 ? '' : 's'} dimmed`.replace('&middot;', '·') : '';
+      slowerCount > 0 ? `· ${slowerCount} slower train${slowerCount === 1 ? '' : 's'} dimmed` : '';
   }
 
   const parts = [];
@@ -310,14 +392,15 @@ function renderDirection(dir) {
   listEl.innerHTML = parts.join('');
 
   if (isToday && document.getElementById('panel-' + dir).classList.contains('active')) {
-    scrollToNext(document.getElementById('panel-' + dir));
+    // Scrolling happens only from explicit navigation (see scrollToNextIfToday),
+    // not here — this runs on every periodic re-render (tickMinute, live
+    // refresh) and must not disturb a reader's current scroll position.
     const nextLeg = legs.find(l => l._next);
     if (nextLeg) maybeStartSecTimer(effDepM(nextLeg)); else clearSecTimer();
   }
 }
 
 function render() {
-  ROUTES.forEach(() => {}); // no-op, kept for symmetry with future per-route flags
   Object.values(SCHEDULE.routes).forEach(rd => {
     (rd.out || []).forEach(l => { delete l._next; });
     (rd.ret || []).forEach(l => { delete l._next; });
@@ -326,7 +409,6 @@ function render() {
   updateRouteTitle();
   renderDirection('out');
   renderDirection('ret');
-  updateNowBtn();
   document.getElementById('schedule-age').textContent = scheduleAgeLabel();
   refreshLiveOverlay();
 }
@@ -340,11 +422,6 @@ function scheduleAgeLabel() {
 }
 
 // ── NOW button & live tick ──────────────────────────────────────────
-function updateNowBtn() {
-  const dateStr = document.getElementById('vdate').value || todayStr();
-  document.getElementById('btn-now').disabled = dateStr !== todayStr();
-}
-
 function activeNextCard() {
   const p = document.querySelector('.panel.active');
   return p ? p.querySelector('.train-card.is-next') : null;
@@ -406,10 +483,23 @@ async function fetchBoard(crs, filterCrs, filterType) {
   url += '?' + params.toString();
   try {
     const r = await fetch(url, { headers: { 'x-apikey': key } });
-    if (!r.ok) return null;
+    if (r.status === 401 || r.status === 403) {
+      liveAuthError = true;
+      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}`.trim());
+      return null;
+    }
+    if (!r.ok) {
+      let bodySnippet = '';
+      try { bodySnippet = (await r.text()).slice(0, 300); } catch (e2) { /* body already consumed or unreadable */ }
+      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}${bodySnippet ? '\n  ' + bodySnippet : ''}`.trim());
+      return null;
+    }
     return await r.json();
   } catch (e) {
-    return null; // offline, or CORS/network failure — fall back to scheduled silently
+    // offline, or CORS/network failure — fall back to scheduled silently,
+    // but keep the detail for the error panel in case it's not obvious.
+    liveErrorDetails.push(`GET ${crs} board -> ${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`);
+    return null;
   }
 }
 
@@ -424,32 +514,50 @@ function staleLiveLabel(routeId) {
   return `Showing last known live data (offline${age ? ', ' + age : ''})`;
 }
 
-async function refreshLiveOverlay() {
-  const route = currentRoute();
+// Drives both the detailed status-bar dot/label and the quiet header strip
+// (see .site-header.live-* in styles.css) from one place, so they can never
+// disagree about the current state. state: 'off' | 'on' | 'stale' | 'error'.
+function setLiveStatus(state, text) {
   const dot = document.getElementById('live-dot');
   const label = document.getElementById('live-label');
+  dot.className = 'live-dot' + (state !== 'off' ? ' ' + state : '');
+  label.textContent = text;
+  hdr.classList.remove('live-on', 'live-stale', 'live-error');
+  if (state !== 'off') hdr.classList.add('live-' + state);
+}
+
+function updateLiveErrorIndicator() {
+  document.getElementById('btn-live-error').style.display = lastLiveErrorReport ? '' : 'none';
+}
+
+async function refreshLiveOverlay() {
+  const route = currentRoute();
   if (!route) return;
 
+  // Cleared unconditionally up front so a stale alert from a previous route/
+  // date never lingers into a state where live data isn't even being checked.
+  liveErrorDetails = [];
+  lastLiveErrorReport = null;
+  updateLiveErrorIndicator();
+
   if (!apiKey()) {
-    dot.className = 'live-dot';
-    label.textContent = 'Scheduled times';
+    setLiveStatus('off', 'Scheduled times');
     return;
   }
 
   const dateStr = document.getElementById('vdate').value || todayStr();
   if (dateStr !== todayStr()) {
-    dot.className = 'live-dot';
-    label.textContent = 'Scheduled times (live only available for today)';
+    setLiveStatus('off', 'Scheduled times (live only available for today)');
     return;
   }
 
-  dot.className = 'live-dot stale';
-  label.textContent = liveEverSucceeded[route.id] ? 'Updating live data…' : 'Checking live data…';
+  setLiveStatus('stale', liveEverSucceeded[route.id] ? 'Updating live data…' : 'Checking live data…');
 
   // A fetch failure (offline, CORS, rate limit) must NOT wipe out delay/
   // cancellation/platform info from the last successful fetch — the caller
   // (e.g. someone on a train losing signal in a tunnel) still wants to see
   // the last known state, just clearly marked as not current.
+  liveAuthError = false;
   let ok = false;
   try {
     ok = route.change
@@ -457,20 +565,37 @@ async function refreshLiveOverlay() {
       : await overlayDirectLive(route, dateStr);
   } catch (e) {
     ok = false;
+    liveErrorDetails.push(`Unexpected error in refreshLiveOverlay: ${e && e.stack ? e.stack : e}`);
   }
 
   if (ok) {
     liveEverSucceeded[route.id] = true;
     lastLiveSuccessAt[route.id] = Date.now();
-    dot.className = 'live-dot on';
-    label.textContent = 'Live platforms & delays';
+    setLiveStatus('on', 'Live platforms & delays');
+  } else if (liveAuthError) {
+    // Distinct from a generic/transient failure: Darwin rejected the key
+    // itself, so retrying on its own won't help — the visitor needs to fix
+    // the key in Settings.
+    setLiveStatus('error', 'Invalid API key — check Settings ⚙');
   } else if (liveEverSucceeded[route.id]) {
-    dot.className = 'live-dot stale';
-    label.textContent = staleLiveLabel(route.id);
+    setLiveStatus('stale', staleLiveLabel(route.id));
   } else {
-    dot.className = 'live-dot';
-    label.textContent = 'Scheduled times (live update failed)';
+    setLiveStatus('error', 'Scheduled times (live update failed)');
   }
+
+  if (!ok && liveErrorDetails.length) {
+    lastLiveErrorReport = [
+      `Train Times — live data error report`,
+      `Time: ${new Date().toString()}`,
+      `Route: ${route.id} (${route.name})`,
+      `Date viewed: ${dateStr}`,
+      `Status shown: ${document.getElementById('live-label').textContent}`,
+      `Online: ${navigator.onLine}`,
+      'Details:',
+      ...liveErrorDetails.map(d => '- ' + d),
+    ].join('\n');
+  }
+  updateLiveErrorIndicator();
 
   renderDirection('out');
   renderDirection('ret');
@@ -582,6 +707,7 @@ document.querySelectorAll('.tab').forEach(btn => {
     btn.classList.add('active'); btn.setAttribute('aria-selected', 'true');
     activeDir = btn.dataset.dir;
     document.getElementById('panel-' + activeDir).classList.add('active');
+    persistState();
     renderDirection(activeDir); // refreshes the slower-train count text for this direction
     const dateStr = document.getElementById('vdate').value || todayStr();
     if (dateStr === todayStr()) {
@@ -608,16 +734,50 @@ document.getElementById('btn-settings-save').addEventListener('click', () => {
   refreshLiveOverlay();
 });
 
+// ── Live data error panel ────────────────────────────────────────────
+document.getElementById('btn-live-error').addEventListener('click', () => {
+  document.getElementById('error-details-text').value = lastLiveErrorReport || '(no details captured)';
+  document.getElementById('error-overlay').classList.add('open');
+});
+document.getElementById('btn-error-close').addEventListener('click', () => {
+  document.getElementById('error-overlay').classList.remove('open');
+});
+document.getElementById('btn-error-copy').addEventListener('click', async () => {
+  const textEl = document.getElementById('error-details-text');
+  try {
+    await navigator.clipboard.writeText(textEl.value);
+  } catch (e) {
+    // Clipboard API unavailable/denied (e.g. insecure context) — select the
+    // text so it's still copyable manually via the keyboard/context menu.
+    textEl.select();
+  }
+});
+
 // ── Header height tracking ──────────────────────────────────────────
 const hdr = document.getElementById('hdr');
 function setHH() { document.documentElement.style.setProperty('--header-h', hdr.offsetHeight + 'px'); }
 
 // ── Date nav ────────────────────────────────────────────────────────
 const inp = document.getElementById('vdate');
-inp.addEventListener('change', () => { clearSecTimer(); render(); });
-document.getElementById('btn-prev-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), -1); clearSecTimer(); render(); });
-document.getElementById('btn-next-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), 1); clearSecTimer(); render(); });
-document.getElementById('btn-now').addEventListener('click', () => { scrollToNext(document.querySelector('.panel.active')); });
+function onDateNavChange() {
+  clearSecTimer();
+  persistState();
+  render();
+  scrollToNextIfToday();
+}
+inp.addEventListener('change', onDateNavChange);
+document.getElementById('btn-prev-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), -1); onDateNavChange(); });
+document.getElementById('btn-next-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), 1); onDateNavChange(); });
+// "Now" always means now, regardless of which date is currently being
+// browsed — jump back to today first if we're not there, then scroll.
+document.getElementById('btn-now').addEventListener('click', () => {
+  if ((inp.value || todayStr()) !== todayStr()) {
+    inp.value = todayStr();
+    onDateNavChange();
+  } else {
+    scrollToNext(document.querySelector('.panel.active'));
+  }
+});
 
 // Getting a signal back (e.g. surfacing from the Tube) should refresh live
 // data immediately rather than waiting for the next route/date switch.
@@ -635,10 +795,29 @@ window.addEventListener('online', () => refreshLiveOverlay());
       `<div class="no-svc"><strong>Something went wrong loading the timetable</strong>${e.message}. If you're offline and this is your first visit to this page, you'll need a connection at least once before it works offline.</div>`;
     return;
   }
+  restoreState(); // route/dir/date from the URL hash or localStorage, if any
+  applyActiveDirUI();
+
   new ResizeObserver(setHH).observe(hdr);
   setHH();
   render();
   scheduleNextMinute();
+
+  // A saved scroll position means this is a reload of the same tab/session —
+  // restore exactly where the reader was instead of jumping to "next", which
+  // only makes sense for a genuinely fresh visit (a bookmark opened in a new
+  // tab has no sessionStorage, so it still gets the normal jump-to-next).
+  const savedScrollY = sessionStorage.getItem('scrollY');
+  if (savedScrollY != null) {
+    setTimeout(() => window.scrollTo(0, parseInt(savedScrollY, 10) || 0), 150);
+  } else {
+    scrollToNextIfToday();
+  }
+  window.addEventListener('scroll', () => {
+    clearTimeout(scrollSaveTimer);
+    scrollSaveTimer = setTimeout(() => sessionStorage.setItem('scrollY', String(window.scrollY)), 200);
+  }, { passive: true });
+
   const ic = activeNextCard();
   if (ic) maybeStartSecTimer(parseInt(ic.dataset.depm));
 })();

@@ -5,14 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Train Times</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 </head>
 <body>
 
 <header class="site-header" id="hdr">
   <div class="hrow">
     <div class="route-title" id="route-title">Loading…</div>
+    <button id="btn-live-error" class="icon-btn live-error-btn" title="Live data error — tap for details" style="display:none">&#9888;</button>
     <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
-    <button id="btn-now" class="icon-btn btn-now" disabled title="Jump to current time">Now</button>
+    <button id="btn-now" class="icon-btn btn-now" title="Jump to current time">Now</button>
   </div>
   <div class="route-picker" id="route-picker"></div>
   <div class="date-nav" style="display:flex;align-items:center;gap:6px;margin-top:6px">
@@ -52,6 +54,18 @@
   </div>
 </div>
 
+<div class="settings-overlay" id="error-overlay">
+  <div class="settings-sheet">
+    <h2>Live data error details</h2>
+    <p>The last live-data refresh for this route failed. Copy the text below and paste it wherever you're debugging (e.g. into Claude Code).</p>
+    <textarea id="error-details-text" class="error-text" readonly rows="9"></textarea>
+    <div class="row">
+      <button class="btn-close" id="btn-error-close">Close</button>
+      <button class="btn-save" id="btn-error-copy">Copy</button>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
 <script>
 if ('serviceWorker' in navigator) {
@@ -64,7 +78,7 @@ if ('serviceWorker' in navigator) {
       const cache = await caches.open(key);
       // Bootstrap-cache this page plus the static data files, in case the
       // very first navigation raced ahead of the service worker activating.
-      const urls = [location.href, './styles.css', './app.js', './routes.json', './stations.json', './data/schedule.json'];
+      const urls = [location.pathname, './styles.css', './app.js', './favicon.svg', './routes.json', './stations.json', './data/schedule.json'];
       for (const url of urls) {
         if (await cache.match(url)) continue;
         try {
