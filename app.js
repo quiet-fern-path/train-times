@@ -7,6 +7,13 @@ let SCHEDULE = { routes: {} };
 let activeRouteId = null;
 let activeDir = 'out';
 let secTimer = null;
+// routeId -> has a live fetch ever succeeded for this route (today)? Drives
+// whether a failed refresh reports "still showing last known live data" vs
+// "no live data yet" — see refreshLiveOverlay().
+const liveEverSucceeded = {};
+// routeId -> Date.now() of the last successful live fetch, used to show
+// "X min ago" alongside the stale/offline status.
+const lastLiveSuccessAt = {};
 
 // ── Time helpers ────────────────────────────────────────────────────
 // Timetable day starts at 03:00. Before 03:00 we're still on yesterday's day.
@@ -35,6 +42,21 @@ function secsUntil(depM) {
   const curM = n.getHours() < DAY_START_HOUR ? raw + 1440 : raw;
   return (depM - curM) * 60 - n.getSeconds();
 }
+// Converts a live "HH:MM" ETD string into a depM-comparable minute value,
+// applying the same 3am day-boundary shift used for stored depM/arrM —
+// without this, a delayed post-midnight service would compare its live time
+// against the wrong day and produce a nonsense delay/countdown.
+function liveMinute(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m + (h < DAY_START_HOUR ? 1440 : 0);
+}
+// The depM to use for now/next/past classification and the countdown: the
+// live-adjusted departure minute when we have one, otherwise the scheduled
+// one. Deliberately NOT used by overtakers() — overtaking compares scheduled
+// timetables, not live running.
+function effDepM(leg) {
+  return leg._liveDepM != null ? leg._liveDepM : leg.depM;
+}
 function countdownText(secs) {
   if (secs <= 0) return 'Departing now';
   if (secs < 180) {
@@ -51,6 +73,13 @@ function durFmt(mins) {
     return r ? `${h}h ${r}m` : `${h} hr`;
   }
   return `${mins} min`;
+}
+function formatAge(ms) {
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  return hrs === 1 ? '1 hr ago' : `${hrs} hr ago`;
 }
 
 // ── Data loading ────────────────────────────────────────────────────
@@ -112,10 +141,11 @@ function overtakers(leg, pool) {
 }
 
 function directCard(leg, route, dir, isToday, curM, faster) {
-  const isPast = isToday && leg.depM < curM;
+  const effM = effDepM(leg);
+  const isPast = isToday && effM < curM;
   const isNext = !isPast && leg._next;
   const isCancelled = !!leg._cancelled;
-  const minsAway = isNext ? leg.depM - curM : 0;
+  const minsAway = isNext ? effM - curM : 0;
   const label = countdownText(minsAway * 60 - new Date().getSeconds());
   const fromName = STATIONS[dir === 'out' ? route.from : route.to] || (dir === 'out' ? route.from : route.to);
   const toName = STATIONS[dir === 'out' ? route.to : route.from] || (dir === 'out' ? route.to : route.from);
@@ -143,7 +173,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
     isNext && minsAway < 5 ? 'is-soon' : '', isCancelled ? 'is-cancelled' : '',
     isSlower ? 'is-slower' : ''].filter(Boolean).join(' ');
 
-  return `<div class="${cls}" data-depm="${leg.depM}" data-uid="${leg.uid || ''}">
+  return `<div class="${cls}" data-depm="${effM}" data-uid="${leg.uid || ''}">
     ${nextHtml}
     <div class="journey">
       <div class="tblock">
@@ -167,9 +197,10 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 }
 
 function connectionCard(leg, route, dir, isToday, curM) {
-  const isPast = isToday && leg.depM < curM;
+  const effM = effDepM(leg);
+  const isPast = isToday && effM < curM;
   const isNext = !isPast && leg._next;
-  const minsAway = isNext ? leg.depM - curM : 0;
+  const minsAway = isNext ? effM - curM : 0;
   const label = countdownText(minsAway * 60 - new Date().getSeconds());
   const fromName = STATIONS[dir === 'out' ? route.from : route.to] || (dir === 'out' ? route.from : route.to);
   const toName = STATIONS[dir === 'out' ? route.to : route.from] || (dir === 'out' ? route.to : route.from);
@@ -190,7 +221,7 @@ function connectionCard(leg, route, dir, isToday, curM) {
     ? `<div class="change-row"><span class="delay-tag">Tight connection: ${leg._liveChangeMins} min</span></div>`
     : '';
 
-  return `<div class="${cls}" data-depm="${leg.depM}">
+  return `<div class="${cls}" data-depm="${effM}">
     ${nextHtml}
     <div class="journey">
       <div class="tblock">
@@ -252,8 +283,8 @@ function renderDirection(dir) {
 
   if (isToday) {
     const isSlowerLeg = l => fasterMap.has(l) && fasterMap.get(l) !== null;
-    let next = visible.find(l => l.depM >= curM && !l._cancelled && !isSlowerLeg(l));
-    if (!next) next = visible.find(l => l.depM >= curM && !l._cancelled); // fall back to a slower train if that's all there is
+    let next = visible.find(l => effDepM(l) >= curM && !l._cancelled && !isSlowerLeg(l));
+    if (!next) next = visible.find(l => effDepM(l) >= curM && !l._cancelled); // fall back to a slower train if that's all there is
     if (next) next._next = true;
   }
 
@@ -265,7 +296,7 @@ function renderDirection(dir) {
   const parts = [];
   let nowDone = false;
   for (const leg of visible) {
-    if (isToday && !nowDone && leg.depM >= curM) {
+    if (isToday && !nowDone && effDepM(leg) >= curM) {
       const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
       parts.push(`<div class="now-line">Now ${hm}</div>`);
       nowDone = true;
@@ -281,7 +312,7 @@ function renderDirection(dir) {
   if (isToday && document.getElementById('panel-' + dir).classList.contains('active')) {
     scrollToNext(document.getElementById('panel-' + dir));
     const nextLeg = legs.find(l => l._next);
-    if (nextLeg) maybeStartSecTimer(nextLeg.depM); else clearSecTimer();
+    if (nextLeg) maybeStartSecTimer(effDepM(nextLeg)); else clearSecTimer();
   }
 }
 
@@ -346,6 +377,9 @@ function tickMinute() {
   if (dateStr !== todayStr()) return;
   renderDirection('out');
   renderDirection('ret');
+  // Also re-poll live data once a minute (refreshLiveOverlay no-ops itself
+  // when there's no API key, so this is harmless without one configured).
+  refreshLiveOverlay();
 }
 
 function scrollToNext(panelEl) {
@@ -384,6 +418,12 @@ function matchByTime(board, hhmm) {
   return board.trainServices.find(s => s.std === hhmm) || null;
 }
 
+function staleLiveLabel(routeId) {
+  const at = lastLiveSuccessAt[routeId];
+  const age = at != null ? formatAge(Date.now() - at) : '';
+  return `Showing last known live data (offline${age ? ', ' + age : ''})`;
+}
+
 async function refreshLiveOverlay() {
   const route = currentRoute();
   const dot = document.getElementById('live-dot');
@@ -404,17 +444,30 @@ async function refreshLiveOverlay() {
   }
 
   dot.className = 'live-dot stale';
-  label.textContent = 'Checking live data…';
+  label.textContent = liveEverSucceeded[route.id] ? 'Updating live data…' : 'Checking live data…';
 
+  // A fetch failure (offline, CORS, rate limit) must NOT wipe out delay/
+  // cancellation/platform info from the last successful fetch — the caller
+  // (e.g. someone on a train losing signal in a tunnel) still wants to see
+  // the last known state, just clearly marked as not current.
+  let ok = false;
   try {
-    if (route.change) {
-      await overlayConnectionLive(route, dateStr);
-    } else {
-      await overlayDirectLive(route, dateStr);
-    }
+    ok = route.change
+      ? await overlayConnectionLive(route, dateStr)
+      : await overlayDirectLive(route, dateStr);
+  } catch (e) {
+    ok = false;
+  }
+
+  if (ok) {
+    liveEverSucceeded[route.id] = true;
+    lastLiveSuccessAt[route.id] = Date.now();
     dot.className = 'live-dot on';
     label.textContent = 'Live platforms & delays';
-  } catch (e) {
+  } else if (liveEverSucceeded[route.id]) {
+    dot.className = 'live-dot stale';
+    label.textContent = staleLiveLabel(route.id);
+  } else {
     dot.className = 'live-dot';
     label.textContent = 'Scheduled times (live update failed)';
   }
@@ -425,15 +478,16 @@ async function refreshLiveOverlay() {
 
 async function overlayDirectLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
-  if (!data) return;
+  if (!data) return false;
   const outBoard = await fetchBoard(route.from, route.to, 'to');
   const retBoard = await fetchBoard(route.to, route.from, 'to');
   applyDirectOverlay(data.out, dateStr, outBoard);
   applyDirectOverlay(data.ret, dateStr, retBoard);
+  return !!(outBoard || retBoard);
 }
 
 function applyDirectOverlay(legs, dateStr, board) {
-  if (!board) return;
+  if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
     const svc = matchByTime(board, leg.dep);
@@ -445,30 +499,39 @@ function applyDirectOverlay(legs, dateStr, board) {
     leg._platformConfirmed = !!svc.platformIsConfirmed;
     leg._platformChanged = !!svc.platformIsChanged;
     if (svc.etd && /^\d{2}:\d{2}$/.test(svc.etd)) {
-      const [h, m] = svc.etd.split(':').map(Number);
-      leg._delayMins = Math.max(0, (h * 60 + m) - leg.depM);
+      leg._delayMins = Math.max(0, liveMinute(svc.etd) - leg.depM);
     } else {
       leg._delayMins = 0;
     }
+    leg._liveDepM = leg.depM + leg._delayMins;
   }
 }
 
 async function overlayConnectionLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
-  if (!data) return;
+  if (!data) return false;
   const outA = await fetchBoard(route.from, route.change, 'to');
   const outB = await fetchBoard(route.change, route.to, 'to');
   const retA = await fetchBoard(route.to, route.change, 'to');
   const retB = await fetchBoard(route.change, route.from, 'to');
   applyConnectionOverlay(data.out, dateStr, outA, outB);
   applyConnectionOverlay(data.ret, dateStr, retA, retB);
+  return !!(outA || outB || retA || retB);
 }
 
 function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
+  if (!boardA && !boardB) return; // both fetches failed — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
-    let liveDelay1 = 0;
-    let leg1Cancelled = false, leg2Cancelled = false;
+
+    // Default each sub-leg's state to whatever we already knew, so that a
+    // fetch failure on just one of the two boards this round doesn't erase
+    // known state for the other leg.
+    let leg1Cancelled = leg._cancelledLeg === 1;
+    let leg2Cancelled = leg._cancelledLeg === 2;
+    let liveDelay1 = leg._liveDepM != null ? leg._liveDepM - leg.depM : 0;
+    let liveDep2M = null;
+
     if (boardA) {
       const s1 = matchByTime(boardA, leg.dep);
       if (s1) {
@@ -478,12 +541,12 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
         leg._platform1Changed = !!s1.platformIsChanged;
         if (s1.etd && /^\d{2}:\d{2}$/.test(s1.etd)) {
           leg._liveDep = s1.etd;
-          const [h, m] = s1.etd.split(':').map(Number);
-          liveDelay1 = Math.max(0, (h * 60 + m) - leg.depM);
+          liveDelay1 = Math.max(0, liveMinute(s1.etd) - leg.depM);
+        } else {
+          liveDelay1 = 0;
         }
       }
     }
-    let liveDep2M = null;
     if (boardB) {
       const s2 = matchByTime(boardB, leg.changeDep);
       if (s2) {
@@ -492,13 +555,13 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
         leg._platform2Confirmed = !!s2.platformIsConfirmed;
         leg._platform2Changed = !!s2.platformIsChanged;
         if (s2.etd && /^\d{2}:\d{2}$/.test(s2.etd)) {
-          const [h, m] = s2.etd.split(':').map(Number);
-          liveDep2M = h * 60 + m;
+          liveDep2M = liveMinute(s2.etd);
         }
       }
     }
     leg._cancelled = leg1Cancelled || leg2Cancelled;
     leg._cancelledLeg = leg1Cancelled ? 1 : (leg2Cancelled ? 2 : 0);
+    leg._liveDepM = leg.depM + liveDelay1;
     // Project leg-1's live delay onto its scheduled arrival at the change
     // station (a reasonable approximation — delay typically carries through
     // to the next stop), then compare against leg-2's live or scheduled
@@ -555,6 +618,10 @@ inp.addEventListener('change', () => { clearSecTimer(); render(); });
 document.getElementById('btn-prev-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), -1); clearSecTimer(); render(); });
 document.getElementById('btn-next-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), 1); clearSecTimer(); render(); });
 document.getElementById('btn-now').addEventListener('click', () => { scrollToNext(document.querySelector('.panel.active')); });
+
+// Getting a signal back (e.g. surfacing from the Tube) should refresh live
+// data immediately rather than waiting for the next route/date switch.
+window.addEventListener('online', () => refreshLiveOverlay());
 
 // ── Init ────────────────────────────────────────────────────────────
 (async function init() {
