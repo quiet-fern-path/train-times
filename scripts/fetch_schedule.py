@@ -49,14 +49,16 @@ LOOKAHEAD_DAYS = 90
 BASE_URL = "https://data.rtt.io"
 DAY_START_HOUR = 3   # timetable day begins at 03:00
 
-# Starting request delay. Confirmed live against the API: entitlements carry
+# Fixed request delay. Confirmed live against the API: entitlements carry
 # limits of 30/minute, 750/hour, 9000/day, 30000/week (X-RateLimit-Limit-*
-# headers). 30/minute is the tightest per-request constraint (a 2s floor);
-# 2.5s leaves headroom under that without being as conservative as the
-# hourly-only backoff below would suggest on its own. Dynamic rate-limit
-# code in _adjust_delay adjusts this further based on the
-# X-RateLimit-Remaining-Hour/-Minute headers returned by the API.
-_request_delay = 2.5
+# headers). 2s keeps pace at the 30/minute ceiling (with real headroom once
+# request/response latency on top of the sleep is accounted for), and is
+# left flat rather than ramped down as the hourly budget runs low — a full
+# run's own call count (~720, see module docstring) sits under the 750/hour
+# cap, so pre-emptively slowing down before hitting either limit just costs
+# wall-clock time in the normal case. _adjust_delay instead pauses hard when
+# a budget is actually about to run out, rather than easing off gradually.
+_request_delay = 2.0
 
 RTT_REFRESH_TOKEN = os.environ["RTT_TOKEN"]
 
@@ -132,37 +134,43 @@ def day_window(tday):
 
 # ── API layer ─────────────────────────────────────────────────────────────────
 
-def _adjust_delay(resp):
-    """Slow down if the hourly budget is running low, and pause outright if
-    the minute budget (30/min — the tighter, more immediate limit) is about
-    to run out, rather than wait for a 429 to tell us."""
-    global _request_delay
+def _seconds_until_next_hour():
+    """RTT's hourly rate-limit window appears to reset on the wall-clock
+    hour, not on a rolling window measured from a run's first request —
+    observed live: remaining jumped back up near the 750 cap right after a
+    run's calls crossed a clock-hour boundary. That reset timing isn't
+    documented anywhere (no X-RateLimit-Reset-style header), so this is a
+    best-effort wait based on that observation, not a confirmed contract —
+    if it's wrong, the next request either succeeds early (harmless) or
+    gets a 429 whose Retry-After the retry loop in api_get() honours."""
+    now = datetime.now(timezone.utc)
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return max(1, int((next_hour - now).total_seconds()))
 
+
+def _adjust_delay(resp):
+    """Pause outright when a budget is actually about to run out, rather
+    than easing off gradually as it gets low. A full run's own call count
+    sits under the hourly cap (see module docstring), so this account's
+    remaining-hour is expected to track this script's own pace almost
+    exactly — pre-emptively slowing down before hitting either limit would
+    just cost wall-clock time for no benefit in that normal case."""
     remaining_minute = resp.headers.get("X-RateLimit-Remaining-Minute")
     if remaining_minute is not None and int(remaining_minute) <= 2:
         print(f"  Minute budget nearly exhausted ({remaining_minute} left) — pausing 20s")
         time.sleep(20)
 
     remaining_hour = resp.headers.get("X-RateLimit-Remaining-Hour")
-    if remaining_hour is None:
-        return
-    r = int(remaining_hour)
-    if r < 50:
-        new = 20.0
-    elif r < 150:
-        new = 8.0
-    else:
-        new = 2.5
-    if new != _request_delay:
-        print(f"  Hour budget remaining: {r} — adjusting delay to {new}s")
-        _request_delay = new
+    if remaining_hour is not None and int(remaining_hour) <= 0:
+        wait = _seconds_until_next_hour()
+        print(f"  Hour budget exhausted — pausing {wait}s for the next hour window")
+        time.sleep(wait)
 
 
 def api_get(params):
     """GET /gb-nr/location with automatic retry on 429. Returns services list.
     Called with only code/timeFrom/timeTo — never filterTo/filterFrom, see
     module docstring."""
-    global _request_delay
     while True:
         try:
             resp = requests.get(
