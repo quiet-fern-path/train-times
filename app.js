@@ -11,6 +11,9 @@ let secTimer = null;
 // whether a failed refresh reports "still showing last known live data" vs
 // "no live data yet" — see refreshLiveOverlay().
 const liveEverSucceeded = {};
+// routeId -> Date.now() of the last successful live fetch, used to show
+// "X min ago" alongside the stale/offline status.
+const lastLiveSuccessAt = {};
 
 // ── Time helpers ────────────────────────────────────────────────────
 // Timetable day starts at 03:00. Before 03:00 we're still on yesterday's day.
@@ -70,6 +73,13 @@ function durFmt(mins) {
     return r ? `${h}h ${r}m` : `${h} hr`;
   }
   return `${mins} min`;
+}
+function formatAge(ms) {
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  return hrs === 1 ? '1 hr ago' : `${hrs} hr ago`;
 }
 
 // ── Data loading ────────────────────────────────────────────────────
@@ -367,6 +377,13 @@ function tickMinute() {
   if (dateStr !== todayStr()) return;
   renderDirection('out');
   renderDirection('ret');
+  // Keep the "X min ago" in the stale-live label counting up even though
+  // this tick doesn't itself attempt a new fetch.
+  const route = currentRoute();
+  const label = document.getElementById('live-label');
+  if (route && label.textContent.startsWith('Showing last known live data')) {
+    label.textContent = staleLiveLabel(route.id);
+  }
 }
 
 function scrollToNext(panelEl) {
@@ -403,6 +420,12 @@ async function fetchBoard(crs, filterCrs, filterType) {
 function matchByTime(board, hhmm) {
   if (!board || !board.trainServices) return null;
   return board.trainServices.find(s => s.std === hhmm) || null;
+}
+
+function staleLiveLabel(routeId) {
+  const at = lastLiveSuccessAt[routeId];
+  const age = at != null ? formatAge(Date.now() - at) : '';
+  return `Showing last known live data (offline${age ? ', ' + age : ''})`;
 }
 
 async function refreshLiveOverlay() {
@@ -442,11 +465,12 @@ async function refreshLiveOverlay() {
 
   if (ok) {
     liveEverSucceeded[route.id] = true;
+    lastLiveSuccessAt[route.id] = Date.now();
     dot.className = 'live-dot on';
     label.textContent = 'Live platforms & delays';
   } else if (liveEverSucceeded[route.id]) {
     dot.className = 'live-dot stale';
-    label.textContent = 'Showing last known live data (offline)';
+    label.textContent = staleLiveLabel(route.id);
   } else {
     dot.className = 'live-dot';
     label.textContent = 'Scheduled times (live update failed)';
