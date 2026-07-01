@@ -217,8 +217,11 @@ function updateRouteTitle() {
 }
 
 // ── Card builders ───────────────────────────────────────────────────
-// ── Overtaking (direct routes only — connection routes compare pairs of
-// legs, a different problem not covered here) ───────────────────────
+// ── Overtaking. Works for both direct and connection legs: a connection
+// leg's top-level depM/arrM is already the whole-journey origin-departure/
+// final-arrival pair (fetch_connection() in fetch_schedule.py pairs leg-1s
+// with leg-2s at fetch time), so comparing depM/arrM is comparing full
+// journeys regardless of how many legs got them there. ───────────────
 function overtakers(leg, pool) {
   return pool.filter(o => o !== leg && !o._cancelled && o.depM > leg.depM && o.arrM != null && leg.arrM != null && o.arrM <= leg.arrM);
 }
@@ -278,7 +281,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
   </div>`;
 }
 
-function connectionCard(leg, route, dir, isToday, curM) {
+function connectionCard(leg, route, dir, isToday, curM, faster) {
   const effM = effDepM(leg);
   const isPast = isToday && effM < curM;
   const isNext = !isPast && leg._next;
@@ -290,10 +293,16 @@ function connectionCard(leg, route, dir, isToday, curM) {
 
   const nextHtml = `<div class="next-row"><span class="next-badge">Next</span><span class="next-mins">${isNext ? label : ''}</span></div>`;
   const isCancelled = !!leg._cancelled;
-  const cls = ['train-card', isPast ? 'is-past' : '', isNext ? 'is-next' : '', isNext && minsAway < 5 ? 'is-soon' : '', isCancelled ? 'is-cancelled' : ''].filter(Boolean).join(' ');
+  const isSlower = !!faster;
+  const cls = ['train-card', isPast ? 'is-past' : '', isNext ? 'is-next' : '', isNext && minsAway < 5 ? 'is-soon' : '', isCancelled ? 'is-cancelled' : '',
+    isSlower ? 'is-slower' : ''].filter(Boolean).join(' ');
 
   const cancelledTag = isCancelled
     ? `<div class="change-row"><span class="delay-tag">${leg._cancelledLeg === 2 ? toName + ' leg' : fromName + ' leg'} cancelled</span></div>`
+    : '';
+
+  const slowerHtml = isSlower
+    ? `<div class="change-row"><span class="sh-icon">&#10142;</span>Faster: <strong>${faster.dep}</strong> &rarr; <strong>${faster.arr || '?'}</strong> (${durFmt(faster.arrM != null ? faster.arrM - faster.depM : null)})</div>`
     : '';
 
   const link1 = leg.uid1 ? `<a class="rtt-link" href="https://www.realtimetrains.co.uk/service/gb-nr:${leg.uid1}/${leg.serviceDate1 || leg.date}/detailed" target="_blank" rel="noopener">Leg 1 on RTT &rarr;</a>` : '';
@@ -324,6 +333,7 @@ function connectionCard(leg, route, dir, isToday, curM) {
     <div class="change-row">Change at ${changeName}: arr ${leg.changeArr} &middot; dep ${leg.changeDep} &middot; ${leg.changeMins} min</div>
     ${cancelledTag}
     ${tightWarning}
+    ${slowerHtml}
     ${link1} ${link2}
   </div>`;
 }
@@ -347,21 +357,22 @@ function renderDirection(dir) {
     return;
   }
 
-  // Overtaking only applies to direct routes — a leg is "always beaten" if
-  // a later departure still arrives at the same time or earlier. Hide legs
-  // beaten by 2+ distinct trains; dim (but keep) ones beaten by exactly one.
+  // A leg is "always beaten" if a later departure still arrives at the same
+  // time or earlier. Hide legs beaten by 2+ distinct trains; dim (but keep)
+  // ones beaten by exactly one. Applies to connection legs too: each paired
+  // leg already carries whole-journey depM/arrM (origin dep, final dest arr —
+  // see fetch_connection() in fetch_schedule.py), so overtakers() compares
+  // full journeys the same way regardless of how many legs got them there.
   let visible = legs;
   const fasterMap = new Map();
   let slowerCount = 0;
-  if (!isConnection) {
-    legs.forEach(leg => {
-      const beaters = overtakers(leg, legs);
-      if (beaters.length === 1) fasterMap.set(leg, beaters[0]);
-      else if (beaters.length >= 2) fasterMap.set(leg, null);
-    });
-    visible = legs.filter(leg => !(fasterMap.has(leg) && fasterMap.get(leg) === null));
-    slowerCount = visible.filter(leg => fasterMap.has(leg)).length;
-  }
+  legs.forEach(leg => {
+    const beaters = overtakers(leg, legs);
+    if (beaters.length === 1) fasterMap.set(leg, beaters[0]);
+    else if (beaters.length >= 2) fasterMap.set(leg, null);
+  });
+  visible = legs.filter(leg => !(fasterMap.has(leg) && fasterMap.get(leg) === null));
+  slowerCount = visible.filter(leg => fasterMap.has(leg)).length;
 
   if (isToday) {
     const isSlowerLeg = l => fasterMap.has(l) && fasterMap.get(l) !== null;
@@ -383,7 +394,7 @@ function renderDirection(dir) {
       parts.push(`<div class="now-line">Now ${hm}</div>`);
       nowDone = true;
     }
-    parts.push(isConnection ? connectionCard(leg, route, dir, isToday, curM) : directCard(leg, route, dir, isToday, curM, fasterMap.get(leg)));
+    parts.push(isConnection ? connectionCard(leg, route, dir, isToday, curM, fasterMap.get(leg)) : directCard(leg, route, dir, isToday, curM, fasterMap.get(leg)));
   }
   if (isToday && !nowDone) {
     const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
