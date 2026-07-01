@@ -534,6 +534,84 @@ function matchByTime(board, hhmm) {
   return board.trainServices.find(s => s.std === hhmm) || null;
 }
 
+// ── Live data persistence (survive reload / tab switch, up to 1hr) ──
+// In-memory live state (leg._liveDepM etc., liveEverSucceeded,
+// lastLiveSuccessAt) is lost on every page load, so a refresh used to show
+// plain scheduled times until the next fetch completed even if a fetch had
+// just succeeded seconds earlier. This snapshots the live fields onto
+// localStorage after every successful fetch and replays them at init,
+// seeding liveEverSucceeded/lastLiveSuccessAt exactly as if that fetch had
+// happened in this page load — so refreshLiveOverlay()'s existing
+// stale-data fallback (see staleLiveLabel) takes over unchanged if the
+// following live fetch then fails. Expired after 1hr, same as the
+// underlying Darwin data would be useless by then anyway.
+const LIVE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
+// Listed explicitly (not a full leg spread) so schedule-only fields (dep,
+// platform, etc., which come fresh from schedule.json on every load) never
+// get frozen into the cache and overwrite newer schedule data on restore.
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM'];
+const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed'];
+// Direct legs are keyed by their RTT uid; connection legs have no single
+// uid (two services), so both are combined — matches how fetch_schedule.py
+// pairs them, and is stable across reloads since schedule.json is only
+// regenerated weekly.
+function legCacheKey(leg, isConnection) { return isConnection ? `${leg.uid1}|${leg.uid2}` : leg.uid; }
+
+function snapshotLegs(legs, isConnection) {
+  const fields = isConnection ? CONNECTION_LIVE_FIELDS : DIRECT_LIVE_FIELDS;
+  const out = {};
+  for (const leg of legs) {
+    if (leg._liveDepM == null) continue; // never actually matched against a live board
+    const key = legCacheKey(leg, isConnection);
+    if (!key) continue;
+    const snap = {};
+    for (const f of fields) if (leg[f] !== undefined) snap[f] = leg[f];
+    out[key] = snap;
+  }
+  return out;
+}
+function restoreLegs(legs, isConnection, cached) {
+  if (!cached) return;
+  for (const leg of legs) {
+    const snap = cached[legCacheKey(leg, isConnection)];
+    if (snap) Object.assign(leg, snap);
+  }
+}
+function saveLiveCache(route, dateStr) {
+  const data = SCHEDULE.routes[route.id];
+  if (!data) return;
+  const isConnection = !!route.change;
+  const payload = {
+    date: dateStr,
+    savedAt: Date.now(),
+    out: snapshotLegs(data.out || [], isConnection),
+    ret: snapshotLegs(data.ret || [], isConnection),
+  };
+  try {
+    localStorage.setItem(liveCacheKey(route.id), JSON.stringify(payload));
+  } catch (e) {
+    // localStorage full or unavailable (e.g. private browsing) — live data
+    // just won't survive a reload this time, nothing to surface to the user.
+  }
+}
+function restoreLiveCacheForRoute(route) {
+  let raw;
+  try { raw = localStorage.getItem(liveCacheKey(route.id)); } catch (e) { return; }
+  if (!raw) return;
+  let cached;
+  try { cached = JSON.parse(raw); } catch (e) { return; }
+  const age = Date.now() - (cached.savedAt || 0);
+  if (!(age >= 0) || age > LIVE_CACHE_MAX_AGE_MS || cached.date !== todayStr()) return;
+  const data = SCHEDULE.routes[route.id];
+  if (!data) return;
+  const isConnection = !!route.change;
+  restoreLegs(data.out || [], isConnection, cached.out);
+  restoreLegs(data.ret || [], isConnection, cached.ret);
+  liveEverSucceeded[route.id] = true;
+  lastLiveSuccessAt[route.id] = cached.savedAt;
+}
+
 function staleLiveLabel(routeId) {
   const at = lastLiveSuccessAt[routeId];
   const age = at != null ? formatAge(Date.now() - at) : '';
@@ -598,6 +676,7 @@ async function refreshLiveOverlay() {
     liveEverSucceeded[route.id] = true;
     lastLiveSuccessAt[route.id] = Date.now();
     setLiveStatus('on', 'Live platforms & delays');
+    saveLiveCache(route, dateStr);
   } else if (liveAuthError) {
     // Distinct from a generic/transient failure: Darwin rejected the key
     // itself, so retrying on its own won't help — the visitor needs to fix
@@ -829,6 +908,12 @@ window.addEventListener('online', () => refreshLiveOverlay());
   }
   restoreState(); // route/dir/date from the URL hash or localStorage, if any
   applyActiveDirUI();
+  // Replay any not-yet-expired live data cached from a previous page load
+  // (see saveLiveCache/restoreLiveCacheForRoute above) so a refresh shows
+  // last-known delays/platforms instantly instead of reverting to plain
+  // scheduled times until refreshLiveOverlay()'s fetch (triggered by the
+  // render() call below) completes.
+  ROUTES.forEach(restoreLiveCacheForRoute);
 
   new ResizeObserver(setHH).observe(hdr);
   setHH();

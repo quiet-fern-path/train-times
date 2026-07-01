@@ -283,3 +283,41 @@ the service worker and live-overlay behaviour are both meaningfully
 different in a real HTTPS context vs `file://` or `localhost`. If you add
 local tooling, keep it optional and don't make the repo depend on a build
 step — the whole point is that `index.html` works by being fetched as-is.
+
+### Testing the live overlay end-to-end from a Claude Code sandbox
+
+If a visitor shares a real Darwin API key in-session to ask for live
+verification, it's possible to actually exercise `fetchBoard()` against
+`api1.raildata.org.uk` from a real browser — not just `curl` — without
+adding anything to the repo. Recipe (confirmed working):
+
+1. Serve the repo root as-is: `python3 -m http.server 8123`. Plain HTTP
+   `localhost` was sufficient to exercise `fetch()`-based CORS against the
+   real Darwin API end-to-end (fetch from an `http://` page to an `https://`
+   API is not mixed-content-blocked — only the reverse direction is). This
+   was *not* used to verify service-worker-specific behaviour, so the
+   file-map's caution about `file://`/`localhost` differing from real HTTPS
+   still stands for anything SW-related.
+2. Drive it with Playwright against the pre-installed Chromium
+   (`/opt/pw-browsers/chromium-1194/chrome-linux/chrome`; install the
+   `playwright` npm package into a scratch dir, not the repo — the browser
+   binary is already there, `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` is already
+   set). Launch with these exact flags, or every external request either
+   hangs or gets `net::ERR_CONNECTION_CLOSED`:
+   - `--headless=new` — this build has removed old headless mode entirely.
+   - `--proxy-server=$HTTPS_PROXY --proxy-bypass-list=localhost;127.0.0.1;<local>`
+     as raw launch args, **not** Playwright's high-level `proxy: {...}`
+     option — that option's `bypass` field routed the local `http://`
+     server through the CONNECT-only proxy anyway and got `405`s back.
+   - `--ssl-version-max=tls1.2` — without this, **every** external HTTPS
+     request from this specific Chromium build gets silently reset
+     (`net::ERR_CONNECTION_CLOSED`, ~5s after the ClientHello, confirmed via
+     `--log-net-log`: `SSL_HANDSHAKE_ERROR` / `net_error: -100`, zero bytes
+     back) by this sandbox's TLS-inspecting egress proxy — even to plain
+     `https://example.com`, and even though `curl` through the exact same
+     `$HTTPS_PROXY` works fine for the same URL. Forcing TLS 1.2 avoids
+     whatever about this Chromium build's TLS 1.3 ClientHello the proxy
+     doesn't like. `curl` isn't a substitute test for this: it never
+     exercises the browser's CORS preflight/fetch path at all.
+3. Never write the API key into any file that gets committed — pass it via
+   an env var into a throwaway script under the scratch dir.
