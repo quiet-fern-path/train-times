@@ -195,6 +195,17 @@ function depTimeHtml(scheduled, live, isCancelled) {
   return `<div class="tval${isCancelled ? ' cancelled' : ''}${delayed ? ' delayed' : ''}">${was}${live || scheduled}</div>`;
 }
 
+// Darwin's real schema (confirmed against the published Darwin User Guide)
+// only exposes `platform` and `platformIsHidden` on a service — there is no
+// platformIsConfirmed/platformIsChanged boolean. A live-fetched platform IS
+// the confirmation (Darwin only reports it once known); "changed" is
+// derived by comparing it against the RTT-scheduled booked platform.
+function derivePlatformState(livePlatform, bookedPlatform) {
+  if (!livePlatform) return { confirmed: false, changed: false };
+  const changed = !!bookedPlatform && livePlatform !== bookedPlatform;
+  return { confirmed: !changed, changed };
+}
+
 // ── Route picker / tabs ─────────────────────────────────────────────
 function renderRoutePicker() {
   const el = document.getElementById('route-picker');
@@ -632,8 +643,9 @@ function applyDirectOverlay(legs, dateStr, board) {
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
     leg._liveDep = svc.etd && svc.etd !== 'On time' && svc.etd !== 'Cancelled' ? svc.etd : leg.dep;
     leg._platform = svc.platform || leg.platform;
-    leg._platformConfirmed = !!svc.platformIsConfirmed;
-    leg._platformChanged = !!svc.platformIsChanged;
+    const platformState = derivePlatformState(svc.platform, leg.platform);
+    leg._platformConfirmed = platformState.confirmed;
+    leg._platformChanged = platformState.changed;
     if (svc.etd && /^\d{2}:\d{2}$/.test(svc.etd)) {
       leg._delayMins = Math.max(0, liveMinute(svc.etd) - leg.depM);
     } else {
@@ -673,8 +685,9 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
       if (s1) {
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
-        leg._platform1Confirmed = !!s1.platformIsConfirmed;
-        leg._platform1Changed = !!s1.platformIsChanged;
+        const platform1State = derivePlatformState(s1.platform, leg.platform1);
+        leg._platform1Confirmed = platform1State.confirmed;
+        leg._platform1Changed = platform1State.changed;
         if (s1.etd && /^\d{2}:\d{2}$/.test(s1.etd)) {
           leg._liveDep = s1.etd;
           liveDelay1 = Math.max(0, liveMinute(s1.etd) - leg.depM);
@@ -688,8 +701,9 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
       if (s2) {
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
-        leg._platform2Confirmed = !!s2.platformIsConfirmed;
-        leg._platform2Changed = !!s2.platformIsChanged;
+        const platform2State = derivePlatformState(s2.platform, leg.platform2);
+        leg._platform2Confirmed = platform2State.confirmed;
+        leg._platform2Changed = platform2State.changed;
         if (s2.etd && /^\d{2}:\d{2}$/.test(s2.etd)) {
           liveDep2M = liveMinute(s2.etd);
         }
