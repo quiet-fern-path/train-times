@@ -1,6 +1,6 @@
 // Bump this string whenever the app shell itself changes shape
 // (not needed for routine data refreshes — those are handled below).
-const CACHE = 'timetables-v4';
+const CACHE = 'timetables-v5';
 
 self.addEventListener('install', () => self.skipWaiting());
 
@@ -20,6 +20,12 @@ self.addEventListener('activate', e => {
 // network, because there's nothing else to show.
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
+
+  // Only cache same-origin (app shell + schedule data). Cross-origin requests
+  // are the live Darwin API calls, which must always hit the network fresh —
+  // caching them would mean "reconnecting" silently serves stale delay/
+  // platform data instead of the live overlay's own fetch actually running.
+  if (new URL(e.request.url).origin !== self.location.origin) return;
 
   e.respondWith(
     caches.open(CACHE).then(async cache => {
