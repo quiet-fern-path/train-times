@@ -347,8 +347,27 @@ def fetch_legs(origin, destination, tday):
         # 03:00 day-start boundary (e.g. dep 02:24, arr 03:11) gets its depM
         # offset but not its arrM, leaving arrM < depM. Nudge it into the same
         # 1440+ range so duration/ordering/overtaking comparisons stay correct.
+        #
+        # But arr_m < depM isn't always a boundary crossing — a service that
+        # calls at destination *before* origin in its real running order (e.g.
+        # it arrives at origin from further out, then continues on past origin
+        # in the opposite direction from destination) will have a departure at
+        # "origin" and an arrival at "destination" that are real, but represent
+        # the wrong direction of travel, not a same-journey origin->destination
+        # hop. Confirmed against live data: e.g. a service arriving Reading
+        # 06:18, departing Reading 06:19 (continuing on to Twyford/Henley) has
+        # a genuine Twyford departure at 06:25 — joining that Twyford departure
+        # to the 06:18 Reading arrival (same uid) would wrongly claim a
+        # Twyford->Reading leg, when the service never actually travels that
+        # way. Only treat arr_m < depM as a boundary crossing when the
+        # departure itself is in the legitimate 00:00-02:59 range (depM already
+        # has dt_to_m's 1440+ offset applied); otherwise this is a
+        # wrong-direction join and the "leg" is bogus — drop it.
         if arr_m is not None and arr_m < dep["depM"]:
-            arr_m += 1440
+            if dep["depM"] >= 1440:
+                arr_m += 1440
+            else:
+                continue
         legs.append({
             "uid": uid,
             "serviceDate": dep["serviceDate"],
