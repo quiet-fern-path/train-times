@@ -329,6 +329,14 @@ def fetch_legs(origin, destination, tday):
         arr = arrs.get(uid)
         if arr is None:
             continue
+        arr_m = arr.get("arrM")
+        # dt_to_m() decides the 1440+ offset per-timestamp from hour alone, with
+        # no knowledge of the other end of the journey. A leg that crosses the
+        # 03:00 day-start boundary (e.g. dep 02:24, arr 03:11) gets its depM
+        # offset but not its arrM, leaving arrM < depM. Nudge it into the same
+        # 1440+ range so duration/ordering/overtaking comparisons stay correct.
+        if arr_m is not None and arr_m < dep["depM"]:
+            arr_m += 1440
         legs.append({
             "uid": uid,
             "serviceDate": dep["serviceDate"],
@@ -336,7 +344,7 @@ def fetch_legs(origin, destination, tday):
             "dep": dep["dep"],
             "depM": dep["depM"],
             "arr": arr.get("arr"),
-            "arrM": arr.get("arrM"),
+            "arrM": arr_m,
             "platform": dep["platform"],
             "platformConfirmed": dep["platformConfirmed"],
             "toc": dep["toc"],
