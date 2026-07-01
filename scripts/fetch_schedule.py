@@ -116,6 +116,18 @@ def api_get(params):
             time.sleep(wait)
             continue
 
+        if resp.status_code == 401:
+            # Not a transient condition like 429/empty-result — every
+            # subsequent call will fail identically, so retrying would just
+            # burn the whole run (and the Action's time budget) producing
+            # nothing. Fail fast with a clear diagnosis instead.
+            raise SystemExit(
+                "RTT API returned 401 Unauthorized. RTT_TOKEN is missing, "
+                "invalid, or expired — check the repo secret at "
+                "api-portal.rtt.io and update it. Aborting rather than "
+                "continuing to hit every remaining endpoint with a bad token."
+            )
+
         if resp.status_code == 204:
             # Valid empty response — no services in this window.
             _adjust_delay(resp)
