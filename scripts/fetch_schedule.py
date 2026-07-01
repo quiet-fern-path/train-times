@@ -20,11 +20,21 @@ sorting within a day is correct. The client mirrors this convention in
 its todayStr() and nowM() helpers.
 
 API endpoint: GET /gb-nr/location
-  code=RDG&filterTo=PAD      → departure times at RDG for trains calling PAD
-  code=PAD&filterFrom=RDG    → arrival times at PAD for trains from RDG
+  code=RDG    → every service calling at RDG for the day, unfiltered
 
-Two calls per leg per day — one for departure at origin, one for arrival
-at destination — matched by scheduleMetadata.identity.
+We deliberately do NOT use filterTo/filterFrom here. RTT's response
+schema only reports temporalData for the single queried "code" location
+(there's no field anywhere with the full calling pattern of a service —
+confirmed against the API spec), so filterTo/filterFrom only narrows which
+services are included; it doesn't add information that isn't derivable
+another way. Since legs are already built by joining a departure list and
+an arrival list on scheduleMetadata.identity, that join works identically
+against unfiltered per-station boards. Fetching one unfiltered board per
+(station, day) and caching it (see fetch_station_day) means every route
+sharing a station reuses the same call instead of each route querying
+that station separately per destination — for the 5 routes configured
+today, that's 8 distinct stations instead of 12 origin/destination pairs,
+roughly a 3x reduction in total API calls.
 """
 
 import json
@@ -38,9 +48,14 @@ LOOKAHEAD_DAYS = 90
 BASE_URL = "https://data.rtt.io"
 DAY_START_HOUR = 3   # timetable day begins at 03:00
 
-# Starting request delay. Dynamic rate-limit code adjusts this based on the
-# X-RateLimit-Remaining-Hour header returned by the API.
-_request_delay = 5.0
+# Starting request delay. Confirmed live against the API: entitlements carry
+# limits of 30/minute, 750/hour, 9000/day, 30000/week (X-RateLimit-Limit-*
+# headers). 30/minute is the tightest per-request constraint (a 2s floor);
+# 2.5s leaves headroom under that without being as conservative as the
+# hourly-only backoff below would suggest on its own. Dynamic rate-limit
+# code in _adjust_delay adjusts this further based on the
+# X-RateLimit-Remaining-Hour/-Minute headers returned by the API.
+_request_delay = 2.5
 
 RTT_REFRESH_TOKEN = os.environ["RTT_TOKEN"]
 
@@ -117,25 +132,35 @@ def day_window(tday):
 # ── API layer ─────────────────────────────────────────────────────────────────
 
 def _adjust_delay(resp):
-    """Slow down if the hourly budget is running low."""
+    """Slow down if the hourly budget is running low, and pause outright if
+    the minute budget (30/min — the tighter, more immediate limit) is about
+    to run out, rather than wait for a 429 to tell us."""
     global _request_delay
-    remaining = resp.headers.get("X-RateLimit-Remaining-Hour")
-    if remaining is None:
+
+    remaining_minute = resp.headers.get("X-RateLimit-Remaining-Minute")
+    if remaining_minute is not None and int(remaining_minute) <= 2:
+        print(f"  Minute budget nearly exhausted ({remaining_minute} left) — pausing 20s")
+        time.sleep(20)
+
+    remaining_hour = resp.headers.get("X-RateLimit-Remaining-Hour")
+    if remaining_hour is None:
         return
-    r = int(remaining)
+    r = int(remaining_hour)
     if r < 50:
-        new = 30.0
+        new = 20.0
     elif r < 150:
-        new = 10.0
+        new = 8.0
     else:
-        new = 5.0
+        new = 2.5
     if new != _request_delay:
         print(f"  Hour budget remaining: {r} — adjusting delay to {new}s")
         _request_delay = new
 
 
 def api_get(params):
-    """GET /gb-nr/location with automatic retry on 429. Returns services list."""
+    """GET /gb-nr/location with automatic retry on 429. Returns services list.
+    Called with only code/timeFrom/timeTo — never filterTo/filterFrom, see
+    module docstring."""
     global _request_delay
     while True:
         try:
@@ -253,35 +278,57 @@ def parse_arr(svc):
     }
 
 
-# ── Core fetch: one station pair, one day ─────────────────────────────────────
+# ── Core fetch: one station, one day (cached) ─────────────────────────────────
+
+_station_day_cache = {}
+
+
+def fetch_station_day(station, tday):
+    """Fetch the full, unfiltered board at `station` for one timetable day,
+    and parse it into (deps, arrs) dicts keyed by service uid. Cached per
+    (station, day): every route whose origin or destination is this station
+    on this day reuses the same single API call rather than each route
+    querying it separately with its own filterTo/filterFrom."""
+    key = (station, tday)
+    if key in _station_day_cache:
+        return _station_day_cache[key]
+
+    time_from, time_to = day_window(tday)
+    svcs = api_get({"code": station, "timeFrom": time_from, "timeTo": time_to})
+
+    deps, arrs = {}, {}
+    for svc in svcs:
+        d = parse_dep(svc)
+        if d and d["uid"]:
+            deps[d["uid"]] = d
+        a = parse_arr(svc)
+        if a and a["uid"]:
+            arrs[a["uid"]] = a
+
+    result = (deps, arrs)
+    _station_day_cache[key] = result
+    return result
+
 
 def fetch_legs(origin, destination, tday):
-    """Fetch all legs from origin to destination for one timetable day.
-    Makes two API calls (dep at origin, arr at destination), merges by uid.
+    """Build legs from origin to destination for one timetable day by
+    joining origin's departure index against destination's arrival index on
+    service uid (both from fetch_station_day). A uid must appear in both —
+    unlike the old filterTo/filterFrom-scoped queries, an unfiltered
+    station's departure index contains every service leaving that station,
+    so an inner join (not "arrival info if we have it") is what actually
+    confirms the service calls at destination.
     Returns a list of leg dicts with date = tday.isoformat()."""
-    time_from, time_to = day_window(tday)
     day_label = tday.isoformat()
 
-    dep_svcs = api_get({"code": origin, "filterTo": destination,
-                        "timeFrom": time_from, "timeTo": time_to})
-    arr_svcs = api_get({"code": destination, "filterFrom": origin,
-                        "timeFrom": time_from, "timeTo": time_to})
-
-    deps = {}
-    for svc in dep_svcs:
-        p = parse_dep(svc)
-        if p and p["uid"]:
-            deps[p["uid"]] = p
-
-    arrs = {}
-    for svc in arr_svcs:
-        p = parse_arr(svc)
-        if p and p["uid"]:
-            arrs[p["uid"]] = p
+    deps, _ = fetch_station_day(origin, tday)
+    _, arrs = fetch_station_day(destination, tday)
 
     legs = []
     for uid, dep in deps.items():
-        arr = arrs.get(uid, {})
+        arr = arrs.get(uid)
+        if arr is None:
+            continue
         legs.append({
             "uid": uid,
             "serviceDate": dep["serviceDate"],

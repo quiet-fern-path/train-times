@@ -40,9 +40,13 @@ different auth models, and different failure-degradation requirements.
 
 ## Two separate credentials — don't mix them up
 
-- **RTT Bearer token**: GitHub repo secret (`RTT_TOKEN`). Used only by
+- **RTT refresh token**: GitHub repo secret (`RTT_TOKEN`). Used only by
   `fetch_schedule.py` inside the Action. Register at `api-portal.rtt.io`.
-  Server-side, never reaches a browser.
+  Server-side, never reaches a browser. This is a long-lived *refresh*
+  token, not a Bearer token usable directly against `data.rtt.io` — it must
+  be exchanged for a short-lived (~20 min) access token via
+  `GET /api/get_access_token` first. See `_headers()` in
+  `fetch_schedule.py`, which does this exchange on demand.
 - **Darwin consumer key**: pasted by each visitor into the settings panel
   (⚙ icon), stored in their own `localStorage` under `darwinApiKey`. Never
   stored in the repo, never sent anywhere except directly from that
@@ -87,9 +91,19 @@ The script uses the new-generation API, not the old `api.rtt.io` endpoint.
 Key differences:
 
 - Base URL: `https://data.rtt.io`
-- Auth: `Authorization: Bearer {RTT_TOKEN}` header
-- Endpoint: `GET /gb-nr/location` with query params (`code`, `filterTo`,
-  `filterFrom`, `timeFrom`, `timeTo`)
+- Auth: two-step. `RTT_TOKEN` is a refresh token; exchange it via
+  `GET /api/get_access_token` (sent as `Authorization: Bearer {RTT_TOKEN}`)
+  for a short-lived access token (`{token, entitlements, validUntil}`),
+  then send *that* as `Authorization: Bearer {token}` on data calls. The
+  access token is only valid ~20 minutes, far shorter than a full run, so
+  `_headers()` refreshes it on demand rather than once at startup.
+- Endpoint: `GET /gb-nr/location` with query params `code`, `timeFrom`,
+  `timeTo` — **no `filterTo`/`filterFrom`**. The response schema only
+  carries `temporalData` for the queried `code` location (confirmed
+  against the API spec — there's no field anywhere with a service's full
+  calling pattern), so those filters only narrow which services come back;
+  they don't add anything a uid join can't already get from an unfiltered
+  query. Don't reintroduce them as a "simplification" — see below.
 - Times: ISO 8601 datetimes, not HHMM strings
 - Platforms: `locationMetadata.platform.planned` / `.actual` objects
 - Cancellation: `temporalData.displayAs === "CANCELLED"` or
@@ -97,14 +111,28 @@ Key differences:
 - Service UID: `scheduleMetadata.identity` (used in RTT deep links)
 - Service date for links: `scheduleMetadata.departureDate`
 
-Two calls per leg per day:
-1. `code=ORIGIN&filterTo=DEST` → departure time at origin
-2. `code=DEST&filterFrom=ORIGIN` → arrival time at destination
+One unfiltered call per (station, day), cached in `_station_day_cache` and
+shared across every route touching that station — `fetch_station_day()`
+parses each station's full board once into a departure index and an
+arrival index (both keyed by uid). `fetch_legs(origin, destination, tday)`
+then does an **inner join** on uid between origin's departures and
+destination's arrivals: a uid must appear in both to become a leg, since
+an unfiltered departure list contains services going everywhere, not just
+towards that destination. For the 5 routes configured today this means 8
+distinct stations fetched once each per day instead of 12 origin/destination
+pairs fetched separately (~2x fewer calls than one-call-per-pair, ~3x fewer
+than the original two-calls-per-leg design) — don't go back to per-route
+filtered queries as a "simplification," it multiplies calls for any station
+shared by more than one route.
 
-Matched by `scheduleMetadata.identity`. The rate-limit handling in `api_get()`
-reads `X-RateLimit-Remaining-Hour` and backs off dynamically; it also retries
-on 429 using the `Retry-After` header. Don't remove this — the Action makes
-~2,000 calls per run.
+Matched by `scheduleMetadata.identity`. The rate-limit handling in
+`_adjust_delay()` reads both `X-RateLimit-Remaining-Minute` (pauses outright
+if ≤2 left — 30/min is the tightest, most immediate cap) and
+`X-RateLimit-Remaining-Hour` (backs off the steady-state delay); `api_get()`
+also retries on 429 using the `Retry-After` header. Confirmed live against
+the API: entitlements carry limits of 30/minute, 750/hour, 9000/day,
+30000/week. Don't remove this — a full run makes ~720 calls (8 stations ×
+90 days), close to the hourly cap on its own.
 
 ## Caching strategy — stale-while-revalidate, not network-first
 
@@ -178,16 +206,18 @@ so the following are from docs and inference, not tested against live responses:
   inferred from the SOAP equivalents. If platforms show but never update to
   confirmed/changed, `console.log` the raw `fetchBoard()` response and check
   the actual field names.
-- **RTT arrival times** — the new API's `filterFrom` destination query
-  (`code=PAD&filterFrom=RDG`) is documented and should return arrival times
-  at PAD. Verify on the first Action run that `arr`/`arrM` are populated for
-  most legs; if they're consistently `null`, the arrival query isn't matching
-  services correctly.
-- **RTT rate limits for the new API** — the actual numeric limits aren't
-  stated in the spec, only the header names. The dynamic backoff in `api_get()`
-  reads `X-RateLimit-Remaining-Hour` and adjusts automatically; check the
-  Action logs on the first run to see what values come back and whether the
-  run completes in a reasonable time.
+
+The following were originally unverified assumptions and have since been
+confirmed against the live API:
+
+- **Auth exchange, uid-join, and `arr`/`arrM` population** — the two-step
+  refresh→access token exchange, the unfiltered-per-station-then-join
+  approach in `fetch_station_day`/`fetch_legs`, and `arr`/`arrM` being
+  populated for the great majority of legs were all confirmed against real
+  `data.rtt.io` responses.
+- **RTT rate limits for the new API** — confirmed live: 30/minute,
+  750/hour, 9000/day, 30000/week (`X-RateLimit-Limit-*` headers). The
+  dynamic backoff in `_adjust_delay()` is tuned against these real numbers.
 
 ## Known limitations, not bugs
 
