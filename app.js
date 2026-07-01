@@ -174,12 +174,16 @@ function scrollToNextIfToday() {
 
 // ── Platform rendering ──────────────────────────────────────────────
 // state: 'none' | 'planned' | 'confirmed' | 'changed'
-function platformHtml(platform, confirmed, changed, bookedPlatform) {
+function platformHtml(platform, confirmed, changed, bookedPlatform, hidden) {
   if (!platform) return '';
   if (changed) {
     const was = bookedPlatform ? ` <span style="font-weight:400">(was ${bookedPlatform})</span>` : '';
     return `<div class="platform changed">Plat ${platform}${was}</div>`;
   }
+  // platformIsHidden means Darwin has a live platform but flags it advisory-
+  // only, not for public display as confirmed — same "don't trust this yet"
+  // cue as the scheduled-only case below, just worded to match its source.
+  if (hidden) return `<div class="platform hidden">Plat ${platform} (unconfirmed)</div>`;
   if (confirmed) return `<div class="platform confirmed">Plat ${platform}</div>`;
   return `<div class="platform planned">Plat ${platform} (planned)</div>`;
 }
@@ -193,6 +197,17 @@ function depTimeHtml(scheduled, live, isCancelled) {
   const delayed = !isCancelled && !!live && live !== scheduled;
   const was = delayed ? `<span class="was-time">${scheduled}</span>` : '';
   return `<div class="tval${isCancelled ? ' cancelled' : ''}${delayed ? ' delayed' : ''}">${was}${live || scheduled}</div>`;
+}
+
+// Darwin's real schema (confirmed against the published Darwin User Guide)
+// only exposes `platform` and `platformIsHidden` on a service — there is no
+// platformIsConfirmed/platformIsChanged boolean. A live-fetched platform IS
+// the confirmation (Darwin only reports it once known); "changed" is
+// derived by comparing it against the RTT-scheduled booked platform.
+function derivePlatformState(livePlatform, bookedPlatform, hidden) {
+  if (!livePlatform) return { confirmed: false, changed: false, hidden: false };
+  const changed = !!bookedPlatform && livePlatform !== bookedPlatform;
+  return { confirmed: !changed, changed, hidden: !!hidden };
 }
 
 // ── Route picker / tabs ─────────────────────────────────────────────
@@ -264,7 +279,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
       <div class="tblock">
         ${depTimeHtml(leg.dep, leg._liveDep, isCancelled)}
         <div class="tlabel">${fromName}</div>
-        ${platformHtml(leg._platform || leg.platform, leg._platformConfirmed ?? leg.platformConfirmed, leg._platformChanged, leg.platform)}
+        ${platformHtml(leg._platform || leg.platform, leg._platformConfirmed ?? leg.platformConfirmed, leg._platformChanged, leg.platform, leg._platformHidden)}
       </div>
       <div class="track">
         <div class="rail"><div class="rdot"></div><div class="rline"></div><div class="rdot"></div></div>
@@ -318,7 +333,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
       <div class="tblock">
         ${depTimeHtml(leg.dep, leg._liveDep, false)}
         <div class="tlabel">${fromName}</div>
-        ${platformHtml(leg._platform1 || leg.platform1, leg._platform1Confirmed ?? leg.platform1Confirmed, leg._platform1Changed, leg.platform1)}
+        ${platformHtml(leg._platform1 || leg.platform1, leg._platform1Confirmed ?? leg.platform1Confirmed, leg._platform1Changed, leg.platform1, leg._platform1Hidden)}
       </div>
       <div class="track">
         <div class="rail"><div class="rdot"></div><div class="rline"></div><div class="rdot"></div></div>
@@ -327,7 +342,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
       <div class="tblock">
         <div class="tval">${leg._liveArr || leg.arr}</div>
         <div class="tlabel">${toName}</div>
-        ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2)}
+        ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2, leg._platform2Hidden)}
       </div>
     </div>
     <div class="change-row">Change at ${changeName}: arr ${leg.changeArr} &middot; dep ${leg.changeDep} &middot; ${leg.changeMins} min</div>
@@ -632,8 +647,10 @@ function applyDirectOverlay(legs, dateStr, board) {
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
     leg._liveDep = svc.etd && svc.etd !== 'On time' && svc.etd !== 'Cancelled' ? svc.etd : leg.dep;
     leg._platform = svc.platform || leg.platform;
-    leg._platformConfirmed = !!svc.platformIsConfirmed;
-    leg._platformChanged = !!svc.platformIsChanged;
+    const platformState = derivePlatformState(svc.platform, leg.platform, svc.platformIsHidden);
+    leg._platformConfirmed = platformState.confirmed;
+    leg._platformChanged = platformState.changed;
+    leg._platformHidden = platformState.hidden;
     if (svc.etd && /^\d{2}:\d{2}$/.test(svc.etd)) {
       leg._delayMins = Math.max(0, liveMinute(svc.etd) - leg.depM);
     } else {
@@ -673,8 +690,10 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
       if (s1) {
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
-        leg._platform1Confirmed = !!s1.platformIsConfirmed;
-        leg._platform1Changed = !!s1.platformIsChanged;
+        const platform1State = derivePlatformState(s1.platform, leg.platform1, s1.platformIsHidden);
+        leg._platform1Confirmed = platform1State.confirmed;
+        leg._platform1Changed = platform1State.changed;
+        leg._platform1Hidden = platform1State.hidden;
         if (s1.etd && /^\d{2}:\d{2}$/.test(s1.etd)) {
           leg._liveDep = s1.etd;
           liveDelay1 = Math.max(0, liveMinute(s1.etd) - leg.depM);
@@ -688,8 +707,10 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
       if (s2) {
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
-        leg._platform2Confirmed = !!s2.platformIsConfirmed;
-        leg._platform2Changed = !!s2.platformIsChanged;
+        const platform2State = derivePlatformState(s2.platform, leg.platform2, s2.platformIsHidden);
+        leg._platform2Confirmed = platform2State.confirmed;
+        leg._platform2Changed = platform2State.changed;
+        leg._platform2Hidden = platform2State.hidden;
         if (s2.etd && /^\d{2}:\d{2}$/.test(s2.etd)) {
           liveDep2M = liveMinute(s2.etd);
         }

@@ -209,12 +209,9 @@ reintroduce a `!isConnection` gate around it.
 ## Unverified assumptions — check these against real data, don't assume
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
-so the following are from docs and inference, not tested against live responses:
-
-- **Darwin REST field names** `platformIsConfirmed` / `platformIsChanged` —
-  inferred from the SOAP equivalents. If platforms show but never update to
-  confirmed/changed, `console.log` the raw `fetchBoard()` response and check
-  the actual field names.
+so the following are from docs and inference, not tested against live responses.
+There is currently nothing outstanding in this category — see below for items
+that were checked, including one that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
@@ -231,6 +228,26 @@ confirmed against the live API:
   `_seconds_until_next_hour()`'s wall-clock-hour assumption is inferred from
   observed behaviour, not documented, and falls back to `api_get()`'s
   429/`Retry-After` handling if it's wrong.
+- **Darwin REST field names `platformIsConfirmed` / `platformIsChanged`
+  don't exist** — this was flagged here as an unverified guess (inferred
+  from SOAP equivalents that don't actually exist either) and turned out to
+  be wrong: the published Darwin User Guide schema for a service item only
+  has `platform` and `platformIsHidden`. Because `svc.platformIsConfirmed`
+  and `svc.platformIsChanged` were always `undefined`, every live-matched
+  platform rendered as `(planned)` forever, never `confirmed`/`changed`,
+  even for services minutes away. Fixed via `derivePlatformState()` in
+  `app.js`: a live-fetched platform *is* the confirmation (Darwin only
+  reports one once it's known); "changed" is derived by comparing it
+  against the RTT-scheduled booked platform (`leg.platform`/`platform1`/
+  `platform2`) instead of a nonexistent boolean. Don't reintroduce
+  `platformIsConfirmed`/`platformIsChanged` reads from the Darwin response.
+  `platformIsHidden` *is* real (per the same User Guide): true means Darwin
+  has a live platform but flags it advisory-only, not for public display as
+  confirmed. `derivePlatformState()` passes it through as `hidden`, and
+  `platformHtml()` still shows the platform number but labels it
+  `(unconfirmed)` with its own `.platform.hidden` style — distinct from the
+  grey `.planned` state (no live data at all yet), since it's a different
+  situation (Darwin has data but says don't trust it yet).
 
 ## Known limitations, not bugs
 
