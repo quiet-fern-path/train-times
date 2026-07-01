@@ -170,18 +170,21 @@ them cached.
 
 `routes.json`'s `change` field (null vs a CRS code) determines which code
 path a route takes through `app.js`. Direct routes use `directCard()` /
-`overtakers()` / `applyDirectOverlay()`. Connection routes (currently only
-`rdg-hoh`, Reading↔Henley via Twyford) use `connectionCard()` /
+`applyDirectOverlay()`. Connection routes (currently only `rdg-hoh`,
+Reading↔Henley via Twyford) use `connectionCard()` /
 `applyConnectionOverlay()`, and `fetch_schedule.py` pre-pairs legs at fetch
 time using `minConnectionMins` from the route config — the client never
 does connection-pairing itself, only live-delay projection onto an
 already-paired leg.
 
-**Overtaking only applies to direct routes.** A connection route's
-"fastest" comparison would mean comparing different leg-1/leg-2 pairings
-against each other, which is a different problem that hasn't been built.
-Don't extend `overtakers()` to connection routes without designing that
-properly first — it's not a small generalization.
+**`overtakers()` applies to both direct and connection legs.** A paired
+connection leg's top-level `depM`/`arrM` is already the whole-journey
+origin-departure/final-arrival pair (`fetch_connection()` in
+`fetch_schedule.py` picks one leg-2 per leg-1 at fetch time), so comparing
+`depM`/`arrM` across connection legs compares full journeys exactly like it
+does for direct legs — it doesn't need to know how many legs got them
+there, or care that two connection legs might share the same leg-2. Don't
+reintroduce a `!isConnection` gate around it.
 
 ## Known-correct-on-purpose things that look like bugs
 
