@@ -377,13 +377,9 @@ function tickMinute() {
   if (dateStr !== todayStr()) return;
   renderDirection('out');
   renderDirection('ret');
-  // Keep the "X min ago" in the stale-live label counting up even though
-  // this tick doesn't itself attempt a new fetch.
-  const route = currentRoute();
-  const label = document.getElementById('live-label');
-  if (route && label.textContent.startsWith('Showing last known live data')) {
-    label.textContent = staleLiveLabel(route.id);
-  }
+  // Also re-poll live data once a minute (refreshLiveOverlay no-ops itself
+  // when there's no API key, so this is harmless without one configured).
+  refreshLiveOverlay();
 }
 
 function scrollToNext(panelEl) {
