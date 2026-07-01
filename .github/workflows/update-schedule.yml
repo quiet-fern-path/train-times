@@ -5,7 +5,16 @@ on:
     # Every Monday at 04:00 UTC. GitHub may delay scheduled runs slightly
     # under load — that's fine, this only needs to run roughly weekly.
     - cron: '0 4 * * 1'
-  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+  workflow_dispatch:      # lets you trigger a manual run from the Actions tab
+    inputs:
+      routes:
+        description: >-
+          Optional comma-separated route ids (from routes.json) to refetch,
+          e.g. "rdg-oxf,rdg-mai". Only queries the stations those routes
+          need and merges into the existing schedule, leaving other routes
+          untouched. Leave blank for the normal full run.
+        required: false
+        default: ''
   push:
     branches: [main]
     paths:
@@ -31,7 +40,13 @@ jobs:
       - name: Fetch latest schedule
         env:
           RTT_TOKEN: ${{ secrets.RTT_TOKEN }}
-        run: python scripts/fetch_schedule.py
+          ROUTES: ${{ github.event.inputs.routes }}
+        run: |
+          if [ -n "$ROUTES" ]; then
+            python scripts/fetch_schedule.py --routes "$ROUTES"
+          else
+            python scripts/fetch_schedule.py
+          fi
 
       - name: Commit updated schedule
         run: |

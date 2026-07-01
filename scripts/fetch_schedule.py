@@ -37,6 +37,7 @@ today, that's 8 distinct stations instead of 12 origin/destination pairs,
 roughly a 3x reduction in total API calls.
 """
 
+import argparse
 import json
 import os
 import time
@@ -273,6 +274,7 @@ def parse_arr(svc):
 
     return {
         "uid": meta.get("identity"),
+        "serviceDate": meta.get("departureDate"),
         "arr": dt_to_hhmm(arr_dt),
         "arrM": dt_to_m(arr_dt),
     }
@@ -285,10 +287,20 @@ _station_day_cache = {}
 
 def fetch_station_day(station, tday):
     """Fetch the full, unfiltered board at `station` for one timetable day,
-    and parse it into (deps, arrs) dicts keyed by service uid. Cached per
-    (station, day): every route whose origin or destination is this station
-    on this day reuses the same single API call rather than each route
-    querying it separately with its own filterTo/filterFrom."""
+    and parse it into (deps, arrs) dicts keyed by (uid, serviceDate). Cached
+    per (station, day): every route whose origin or destination is this
+    station on this day reuses the same single API call rather than each
+    route querying it separately with its own filterTo/filterFrom.
+
+    Keying on uid alone is not safe: `scheduleMetadata.identity` (e.g.
+    "Y15289") is a headcode-style code that TOCs recycle across different
+    calendar days, and day_window()'s ~24h query spans parts of two
+    calendar dates. Without serviceDate in the key, an unrelated service on
+    the other calendar date that happens to reuse the same identity would
+    silently overwrite (or get joined with) the correct one in fetch_legs,
+    producing a bogus ~24h "leg". serviceDate (scheduleMetadata.departureDate)
+    is constant for every call of a single service instance, so it's the
+    right disambiguator without affecting genuine same-instance joins."""
     key = (station, tday)
     if key in _station_day_cache:
         return _station_day_cache[key]
@@ -300,10 +312,10 @@ def fetch_station_day(station, tday):
     for svc in svcs:
         d = parse_dep(svc)
         if d and d["uid"]:
-            deps[d["uid"]] = d
+            deps[(d["uid"], d["serviceDate"])] = d
         a = parse_arr(svc)
         if a and a["uid"]:
-            arrs[a["uid"]] = a
+            arrs[(a["uid"], a["serviceDate"])] = a
 
     result = (deps, arrs)
     _station_day_cache[key] = result
@@ -313,8 +325,8 @@ def fetch_station_day(station, tday):
 def fetch_legs(origin, destination, tday):
     """Build legs from origin to destination for one timetable day by
     joining origin's departure index against destination's arrival index on
-    service uid (both from fetch_station_day). A uid must appear in both —
-    unlike the old filterTo/filterFrom-scoped queries, an unfiltered
+    (uid, serviceDate) (both from fetch_station_day). A key must appear in
+    both — unlike the old filterTo/filterFrom-scoped queries, an unfiltered
     station's departure index contains every service leaving that station,
     so an inner join (not "arrival info if we have it") is what actually
     confirms the service calls at destination.
@@ -325,8 +337,8 @@ def fetch_legs(origin, destination, tday):
     _, arrs = fetch_station_day(destination, tday)
 
     legs = []
-    for uid, dep in deps.items():
-        arr = arrs.get(uid)
+    for (uid, service_date), dep in deps.items():
+        arr = arrs.get((uid, service_date))
         if arr is None:
             continue
         arr_m = arr.get("arrM")
@@ -423,15 +435,43 @@ def fetch_connection(origin, change, destination, min_conn_mins, days):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--routes",
+        help="Comma-separated route ids (from routes.json) to refetch, e.g. "
+             "'rdg-oxf,rdg-mai'. Only queries the stations those routes need "
+             "and merges the result into the existing data/schedule.json, "
+             "leaving other routes' data untouched — use this for a cheap "
+             "targeted refresh instead of the full every-route run. Omit "
+             "for the normal full run (all routes, full overwrite).",
+    )
+    args = parser.parse_args()
+    route_filter = (
+        {r.strip() for r in args.routes.split(",") if r.strip()}
+        if args.routes else None
+    )
+
     with open("routes.json") as f:
         routes = json.load(f)
 
+    if route_filter is not None:
+        unknown = route_filter - {route["id"] for route in routes}
+        if unknown:
+            raise SystemExit(f"Unknown route id(s) in --routes: {', '.join(sorted(unknown))}")
+        routes = [route for route in routes if route["id"] in route_filter]
+
     # Timetable days are calendar dates — the day starts at 03:00 on that date.
     days = [date.today() + timedelta(days=i) for i in range(LOOKAHEAD_DAYS)]
-    result = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "routes": {},
-    }
+
+    # A scoped run (--routes) merges into whatever's already on disk instead
+    # of overwriting every route, so the other routes' last-known-good data
+    # survives a targeted refetch of just the broken ones.
+    if route_filter is not None and os.path.exists("data/schedule.json"):
+        with open("data/schedule.json") as f:
+            result = json.load(f)
+        result.setdefault("routes", {})
+    else:
+        result = {"routes": {}}
 
     for route in routes:
         rid = route["id"]
@@ -447,6 +487,8 @@ def main():
         out_c = len(result["routes"][rid]["out"])
         ret_c = len(result["routes"][rid]["ret"])
         print(f"  {out_c} outward legs, {ret_c} return legs")
+
+    result["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     os.makedirs("data", exist_ok=True)
     with open("data/schedule.json", "w") as f:
