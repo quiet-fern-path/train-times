@@ -82,6 +82,7 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .platform.planned{color:#9ca3af;font-style:italic;font-weight:500}
 .platform.confirmed{color:var(--text)}
 .platform.changed{color:var(--red)}
+.platform.hidden{color:#b45309;font-style:italic;font-weight:500}
 .track{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px}
 .rail{display:flex;align-items:center;width:100%}
 .rdot{width:7px;height:7px;border-radius:50%;background:#d1d5db;flex-shrink:0}

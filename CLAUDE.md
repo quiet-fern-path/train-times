@@ -241,6 +241,13 @@ confirmed against the live API:
   against the RTT-scheduled booked platform (`leg.platform`/`platform1`/
   `platform2`) instead of a nonexistent boolean. Don't reintroduce
   `platformIsConfirmed`/`platformIsChanged` reads from the Darwin response.
+  `platformIsHidden` *is* real (per the same User Guide): true means Darwin
+  has a live platform but flags it advisory-only, not for public display as
+  confirmed. `derivePlatformState()` passes it through as `hidden`, and
+  `platformHtml()` still shows the platform number but labels it
+  `(unconfirmed)` with its own `.platform.hidden` style — distinct from the
+  grey `.planned` state (no live data at all yet), since it's a different
+  situation (Darwin has data but says don't trust it yet).
 
 ## Known limitations, not bugs
 
