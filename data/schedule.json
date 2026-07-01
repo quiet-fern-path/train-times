@@ -1,0 +1,11 @@
+{
+  "generated_at": "2026-06-30T00:00:00Z",
+  "is_seed_placeholder": true,
+  "routes": {
+    "rdg-pad": { "out": [], "ret": [] },
+    "rdg-oxf": { "out": [], "ret": [] },
+    "rdg-mai": { "out": [], "ret": [] },
+    "rdg-hoh": { "out": [], "ret": [] },
+    "kgx-cbg": { "out": [], "ret": [] }
+  }
+}

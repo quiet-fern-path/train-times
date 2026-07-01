@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Train Times</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="site-header" id="hdr">
+  <div class="hrow">
+    <div class="route-title" id="route-title">Loading…</div>
+    <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
+    <button id="btn-now" class="icon-btn btn-now" disabled title="Jump to current time">Now</button>
+  </div>
+  <div class="route-picker" id="route-picker"></div>
+  <div class="date-nav" style="display:flex;align-items:center;gap:6px;margin-top:6px">
+    <button class="icon-btn" id="btn-prev-day">&#8592;</button>
+    <input type="date" id="vdate" style="font-size:16px;padding:4px 8px;border:1px solid rgba(255,255,255,.18);border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-family:inherit;color-scheme:dark;flex:1;min-width:0">
+    <button class="icon-btn" id="btn-next-day">&#8594;</button>
+  </div>
+</header>
+
+<div class="tab-bar" role="tablist">
+  <button class="tab active" role="tab" aria-selected="true" id="tab-out" data-dir="out">Outward</button>
+  <button class="tab" role="tab" aria-selected="false" id="tab-ret" data-dir="ret">Return</button>
+</div>
+
+<main>
+  <div class="status-bar" id="status-bar">
+    <span class="live-dot" id="live-dot"></span>
+    <span id="live-label">Scheduled times</span>
+    <span id="slower-count"></span>
+    <span id="schedule-age"></span>
+  </div>
+  <div class="panel active" id="panel-out"><div class="train-list" id="list-out"></div></div>
+  <div class="panel" id="panel-ret"><div class="train-list" id="list-ret"></div></div>
+</main>
+
+<div class="settings-overlay" id="settings-overlay">
+  <div class="settings-sheet">
+    <h2>Live updates</h2>
+    <p>Paste your own free Darwin (National Rail) consumer key to see live platforms, delays and cancellations layered onto the scheduled times. Without a key the app still works fully offline using scheduled times only.</p>
+    <label for="api-key-input">Consumer key (x-apikey)</label>
+    <input id="api-key-input" type="text" autocomplete="off" autocapitalize="off" placeholder="Paste your key here">
+    <p>Get a free key at <strong>raildata.org.uk</strong> — register, subscribe to the "Live Departure Board" product, then copy the consumer key from its Specification tab. Stored only on this device.</p>
+    <div class="row">
+      <button class="btn-close" id="btn-settings-close">Close</button>
+      <button class="btn-save" id="btn-settings-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js')
+    .then(() => navigator.serviceWorker.ready)
+    .then(async () => {
+      const keys = await caches.keys();
+      const key = keys.find(k => k.startsWith('timetables-'));
+      if (!key) return;
+      const cache = await caches.open(key);
+      // Bootstrap-cache this page plus the static data files, in case the
+      // very first navigation raced ahead of the service worker activating.
+      const urls = [location.href, './styles.css', './app.js', './routes.json', './stations.json', './data/schedule.json'];
+      for (const url of urls) {
+        if (await cache.match(url)) continue;
+        try {
+          const r = await fetch(url);
+          if (r.ok) cache.put(url, r);
+        } catch (e) { /* offline on first visit — nothing to do */ }
+      }
+    })
+    .catch(() => {});
+}
+</script>
+</body>
+</html>

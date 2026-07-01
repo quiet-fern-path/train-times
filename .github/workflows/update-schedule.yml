@@ -1,0 +1,42 @@
+name: Update train schedule
+
+on:
+  schedule:
+    # Every Monday at 04:00 UTC. GitHub may delay scheduled runs slightly
+    # under load — that's fine, this only needs to run roughly weekly.
+    - cron: '0 4 * * 1'
+  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - 'routes.json'
+      - 'stations.json'   # included for completeness, though this file alone never changes what's fetched
+
+permissions:
+  contents: write
+
+jobs:
+  update-schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Fetch latest schedule
+        env:
+          RTT_TOKEN: ${{ secrets.RTT_TOKEN }}
+        run: python scripts/fetch_schedule.py
+
+      - name: Commit updated schedule
+        run: |
+          git config user.name "schedule-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/schedule.json
+          git diff --cached --quiet || git commit -m "Update schedule data ($(date -u +%F))"
+          git push
