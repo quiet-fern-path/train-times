@@ -4,6 +4,13 @@ RealTimeTrains API (new generation, data.rtt.io, Bearer token auth)
 for every route in routes.json and writes schedule.json.
 
 Auth: set RTT_TOKEN in GitHub repo secrets. Register at api-portal.rtt.io.
+RTT_TOKEN is a long-lived *refresh* token, not usable directly as a Bearer
+token against data.rtt.io — it must be exchanged for a short-lived access
+token via GET /api/get_access_token (sent as `Authorization: Bearer
+<refresh token>`), which returns {token, validUntil, entitlements}. The
+access token is only valid ~20 minutes, far shorter than a full
+90-day-lookahead run, so it's refreshed on demand rather than once at
+startup — see _headers().
 
 Day convention: each timetable day runs 03:00–02:59, not midnight–midnight,
 to capture late-night trains correctly. A service at 01:30 on calendar
@@ -23,7 +30,7 @@ at destination — matched by scheduleMetadata.identity.
 import json
 import os
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -35,8 +42,41 @@ DAY_START_HOUR = 3   # timetable day begins at 03:00
 # X-RateLimit-Remaining-Hour header returned by the API.
 _request_delay = 5.0
 
-RTT_TOKEN = os.environ["RTT_TOKEN"]
-_HEADERS = {"Authorization": f"Bearer {RTT_TOKEN}"}
+RTT_REFRESH_TOKEN = os.environ["RTT_TOKEN"]
+
+_access_token = None
+_access_token_expiry = None  # tz-aware datetime, from validUntil
+
+
+def _fetch_access_token():
+    """Exchange the refresh token for a short-lived access token."""
+    global _access_token, _access_token_expiry
+    resp = requests.get(
+        f"{BASE_URL}/api/get_access_token",
+        headers={"Authorization": f"Bearer {RTT_REFRESH_TOKEN}"},
+        timeout=30,
+    )
+    if resp.status_code == 401:
+        raise SystemExit(
+            "RTT refresh token rejected (401 from /api/get_access_token). "
+            "RTT_TOKEN is invalid or expired — check the repo secret "
+            "against the token shown at api-portal.rtt.io."
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    _access_token = data["token"]
+    _access_token_expiry = datetime.fromisoformat(data["validUntil"])
+
+
+def _headers():
+    """Bearer header for data.rtt.io calls, refreshing the access token
+    if it's missing or about to expire."""
+    if (
+        _access_token is None
+        or datetime.now(timezone.utc) >= _access_token_expiry - timedelta(seconds=60)
+    ):
+        _fetch_access_token()
+    return {"Authorization": f"Bearer {_access_token}"}
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -102,7 +142,7 @@ def api_get(params):
             resp = requests.get(
                 f"{BASE_URL}/gb-nr/location",
                 params=params,
-                headers=_HEADERS,
+                headers=_headers(),
                 timeout=30,
             )
         except requests.RequestException as e:
@@ -115,6 +155,22 @@ def api_get(params):
             print(f"  429 rate-limited — sleeping {wait}s")
             time.sleep(wait)
             continue
+
+        if resp.status_code == 401:
+            # Not a transient condition like 429/empty-result — every
+            # subsequent call will fail identically, so retrying would just
+            # burn the whole run (and the Action's time budget) producing
+            # nothing. Fail fast with a clear diagnosis instead. _headers()
+            # already refreshes the access token proactively before expiry,
+            # so a 401 here means the access token's entitlements don't
+            # cover this endpoint, not a routine expiry.
+            raise SystemExit(
+                "RTT API returned 401 Unauthorized from /gb-nr/location "
+                "despite a freshly-issued access token — check the "
+                "entitlements on the RTT_TOKEN refresh token at "
+                "api-portal.rtt.io. Aborting rather than continuing to hit "
+                "every remaining endpoint with a bad token."
+            )
 
         if resp.status_code == 204:
             # Valid empty response — no services in this window.
