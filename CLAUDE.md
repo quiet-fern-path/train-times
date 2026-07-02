@@ -178,6 +178,21 @@ time using `minConnectionMins` from the route config — the client never
 does connection-pairing itself, only live-delay projection onto an
 already-paired leg.
 
+**Live data at the change station itself** (not just the origin/destination
+legs either side of it) comes from a third live-board fetch per direction in
+`overlayConnectionLive()`: a `GetArrBoardWithDetails` query *at* `route.change`,
+filtered `from` the leg's origin, matched against `leg.changeArr` (`sta`).
+This gives a real live arrival time/platform for leg-1 at the change station,
+which `applyConnectionOverlay()` prefers over the older fallback of projecting
+leg-1's origin delay forward onto its scheduled change-station arrival — that
+projection is now only used when the arrival-board fetch fails or doesn't
+match. There's no scheduled arrival platform at the change station to compare
+against (`fetch_schedule.py` never records one), so the change-row's platform
+badge (`inlinePlatformHtml()`) only ever shows "confirmed" or "(unconfirmed)"
+(from `platformIsHidden`) — never "changed", unlike the origin/destination
+platform badges. See the "Unverified assumptions" section for the parts of
+this that haven't been checked against a live payload yet.
+
 **`overtakers()` applies to both direct and connection legs.** A paired
 connection leg's top-level `depM`/`arrM` is already the whole-journey
 origin-departure/final-arrival pair (`fetch_connection()` in
@@ -211,8 +226,22 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-There is currently nothing outstanding in this category — see below for items
-that were checked, including one that turned out to be wrong.
+
+- **`GetArrBoardWithDetails` response shape** (used in `overlayConnectionLive`/
+  `applyConnectionOverlay` for live arrival data at the change station) is
+  assumed to mirror `GetDepBoardWithDetails`'s: a top-level `trainServices[]`
+  array, with `sta`/`eta` in place of `std`/`etd`, plus the same `platform`,
+  `platformIsHidden`, and `isCancelled` fields per service. This is standard,
+  long-stable OpenLDBWS behaviour (unchanged for years across the classic and
+  Rail Data Marketplace-hosted versions of the API), but hasn't been confirmed
+  against a live payload from *this* account/product. If a live key is ever
+  available in-session (see "Testing the live overlay end-to-end" below), the
+  first thing to check is that `sta`/`eta` are the actual field names and that
+  `eta` uses the same `"On time"`/`"Delayed"`/`"Cancelled"`/HH:MM convention as
+  `etd` — `applyConnectionOverlay()`'s live-arrival branch silently no-ops
+  (falling back to the delay-projection estimate) if any of this is wrong, so
+  a bad assumption here wouldn't throw, just quietly never populate
+  `leg._liveChangeArr`/`leg._changeArrPlatform`.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
