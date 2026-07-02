@@ -206,19 +206,6 @@ function inlineLiveTime(scheduled, live) {
   return `<span style="text-decoration:line-through;color:var(--muted);margin-right:3px">${scheduled}</span>${live}`;
 }
 
-// A `<span>` variant of platformHtml's confirmed/hidden styling, for
-// embedding a platform badge inline in running text (change-row) rather
-// than stacked block-level under a time value (tblock) — platformHtml's
-// `<div>` would otherwise become its own flex line inside change-row's
-// flex-wrap layout. No "changed" state here: there's no scheduled arrival
-// platform at a change station to compare a live one against.
-function inlinePlatformHtml(platform, hidden) {
-  if (!platform) return '';
-  return hidden
-    ? ` <span class="platform hidden">Plat ${platform} (unconfirmed)</span>`
-    : ` <span class="platform confirmed">Plat ${platform}</span>`;
-}
-
 // Darwin's real schema (confirmed against the published Darwin User Guide)
 // only exposes `platform` and `platformIsHidden` on a service — there is no
 // platformIsConfirmed/platformIsChanged boolean. A live-fetched platform IS
@@ -347,15 +334,13 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
     ? `<div class="change-row"><span class="delay-tag">Tight connection: ${leg._liveChangeMins} min</span></div>`
     : '';
 
-  // Live arrival time/platform at the change station come from a live
-  // arrival-board query there (see overlayConnectionLive/applyConnectionOverlay)
-  // — there's no scheduled arrival platform to compare against (fetch_schedule.py
-  // never records one), so a live value always renders as "confirmed" rather
-  // than "changed". Live departure time reuses the same departure-board fetch
-  // that already drives leg2's platform badge above.
+  // Live arrival time at the change station comes from leg-1's own
+  // subsequentCallingPoints entry for it (see applyConnectionOverlay) — no
+  // platform, since calling points don't carry one. Live departure time
+  // reuses the same departure-board fetch that already drives leg2's
+  // platform badge above.
   const changeArrText = inlineLiveTime(leg.changeArr, leg._liveChangeArr);
   const changeDepText = inlineLiveTime(leg.changeDep, leg._liveChangeDep);
-  const changeArrPlat = inlinePlatformHtml(leg._changeArrPlatform, leg._changeArrPlatformHidden);
 
   return `<div class="${cls}" data-depm="${effM}">
     ${nextHtml}
@@ -375,7 +360,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
         ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2, leg._platform2Hidden)}
       </div>
     </div>
-    <div class="change-row">Change at ${changeName}: arr ${changeArrText}${changeArrPlat} &middot; dep ${changeDepText} &middot; ${leg.changeMins} min</div>
+    <div class="change-row">Change at ${changeName}: arr ${changeArrText} &middot; dep ${changeDepText} &middot; ${leg.changeMins} min</div>
     ${cancelledTag}
     ${tightWarning}
     ${slowerHtml}
@@ -529,17 +514,10 @@ function scrollToNext(panelEl) {
 // ── Live overlay (Darwin / LDBWS via Rail Data Marketplace) ─────────
 function apiKey() { return localStorage.getItem('darwinApiKey') || ''; }
 
-// op defaults to the departure board; pass 'GetArrBoardWithDetails' to query
-// arrivals instead (used at the change station on connection routes — see
-// overlayConnectionLive). Both operations share the same request shape
-// (filterCrs/filterType/numRows) and, per OpenLDBWS's stable public schema,
-// a response shaped the same way (trainServices[]), just with sta/eta in
-// place of std/etd — see the "unverified assumptions" note in CLAUDE.md.
-async function fetchBoard(crs, filterCrs, filterType, op) {
+async function fetchBoard(crs, filterCrs, filterType) {
   const key = apiKey();
   if (!key) return null;
-  const opName = op || 'GetDepBoardWithDetails';
-  let url = `https://api1.raildata.org.uk/1010-live-departure-board-dep/LDBWS/api/20220120/${opName}/${crs}`;
+  let url = `https://api1.raildata.org.uk/1010-live-departure-board-dep/LDBWS/api/20220120/GetDepBoardWithDetails/${crs}`;
   const params = new URLSearchParams();
   if (filterCrs) { params.set('filterCrs', filterCrs); params.set('filterType', filterType || 'to'); }
   params.set('numRows', '20');
@@ -548,20 +526,20 @@ async function fetchBoard(crs, filterCrs, filterType, op) {
     const r = await fetch(url, { headers: { 'x-apikey': key } });
     if (r.status === 401 || r.status === 403) {
       liveAuthError = true;
-      liveErrorDetails.push(`GET ${crs} ${opName} -> HTTP ${r.status} ${r.statusText || ''}`.trim());
+      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}`.trim());
       return null;
     }
     if (!r.ok) {
       let bodySnippet = '';
       try { bodySnippet = (await r.text()).slice(0, 300); } catch (e2) { /* body already consumed or unreadable */ }
-      liveErrorDetails.push(`GET ${crs} ${opName} -> HTTP ${r.status} ${r.statusText || ''}${bodySnippet ? '\n  ' + bodySnippet : ''}`.trim());
+      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}${bodySnippet ? '\n  ' + bodySnippet : ''}`.trim());
       return null;
     }
     return await r.json();
   } catch (e) {
     // offline, or CORS/network failure — fall back to scheduled silently,
     // but keep the detail for the error panel in case it's not obvious.
-    liveErrorDetails.push(`GET ${crs} ${opName} -> ${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`);
+    liveErrorDetails.push(`GET ${crs} board -> ${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`);
     return null;
   }
 }
@@ -585,6 +563,24 @@ function matchByTime(board, hhmm, toc) {
   return candidates[0];
 }
 
+// A departure board's matched service carries subsequentCallingPoints — the
+// full list of stops the service makes after the queried station, each with
+// its own st (scheduled)/et (estimated, "On time"/"Delayed"/"Cancelled"/
+// HH:MM — same convention as std/etd) — but no platform field (confirmed
+// live: platform is only ever present on the queried station's own board
+// entry, never on a calling point). Used to read a real live arrival
+// estimate at the change station straight off leg-1's own departure-board
+// match, without a second API call. subsequentCallingPoints is an array of
+// call-point *lists* (plural portions, e.g. a service that divides) rather
+// than one flat list, so every list needs searching.
+function findCallingPoint(svc, crs) {
+  for (const group of svc.subsequentCallingPoints || []) {
+    const found = (group.callingPoint || []).find(p => p.crs === crs);
+    if (found) return found;
+  }
+  return null;
+}
+
 // ── Live data persistence (survive reload / tab switch, up to 1hr) ──
 // In-memory live state (leg._liveDepM etc., liveEverSucceeded,
 // lastLiveSuccessAt) is lost on every page load, so a refresh used to show
@@ -602,7 +598,7 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
 const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM'];
-const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_changeArrPlatform', '_changeArrPlatformHidden'];
+const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -794,29 +790,27 @@ async function overlayConnectionLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
   if (!data) return false;
   const outA = await fetchBoard(route.from, route.change, 'to');
-  const outArr = await fetchBoard(route.change, route.from, 'from', 'GetArrBoardWithDetails');
   const outB = await fetchBoard(route.change, route.to, 'to');
   const retA = await fetchBoard(route.to, route.change, 'to');
-  const retArr = await fetchBoard(route.change, route.to, 'from', 'GetArrBoardWithDetails');
   const retB = await fetchBoard(route.change, route.from, 'to');
-  applyConnectionOverlay(data.out, dateStr, outA, outArr, outB);
-  applyConnectionOverlay(data.ret, dateStr, retA, retArr, retB);
-  return !!(outA || outArr || outB || retA || retArr || retB);
+  applyConnectionOverlay(data.out, dateStr, outA, outB, route.change);
+  applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change);
+  return !!(outA || outB || retA || retB);
 }
 
-function applyConnectionOverlay(legs, dateStr, boardA, boardArr, boardB) {
-  if (!boardA && !boardArr && !boardB) return; // every fetch failed — leave legs' existing live state untouched
+function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs) {
+  if (!boardA && !boardB) return; // both fetches failed — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
 
     // Default each sub-leg's state to whatever we already knew, so that a
-    // fetch failure on just one of the boards this round doesn't erase
-    // known state derived from the others.
+    // fetch failure on just one of the two boards this round doesn't erase
+    // known state for the other leg.
     let leg1Cancelled = leg._cancelledLeg === 1;
     let leg2Cancelled = leg._cancelledLeg === 2;
     let liveDelay1 = leg._liveDepM != null ? leg._liveDepM - leg.depM : 0;
     let liveDep2M = null;
-    let liveArr1M = null; // real live arrival estimate at the change station, when boardArr matches
+    let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
 
     if (boardA) {
       const s1 = matchByTime(boardA, leg.dep, leg.toc1);
@@ -833,27 +827,23 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardArr, boardB) {
         } else {
           liveDelay1 = 0;
         }
-      }
-    }
-    if (boardArr) {
-      // Real live arrival time/platform at the change station itself,
-      // matched by leg-1's scheduled arrival — more accurate than projecting
-      // leg-1's origin delay forward (see the fallback below), and the only
-      // source for a live arrival platform: fetch_schedule.py only ever
-      // records leg-1's *origin* departure platform, never an arrival
-      // platform at the change station, since RTT's arrival query doesn't
-      // carry one either.
-      const s1arr = matchByTime(boardArr, leg.changeArr, 'sta');
-      if (s1arr) {
-        if (s1arr.isCancelled || s1arr.eta === 'Cancelled') leg1Cancelled = true;
-        leg._changeArrPlatform = s1arr.platform || null;
-        leg._changeArrPlatformHidden = derivePlatformState(s1arr.platform, null, s1arr.platformIsHidden).hidden;
-        if (s1arr.eta && /^\d{2}:\d{2}$/.test(s1arr.eta)) {
-          leg._liveChangeArr = s1arr.eta;
-          liveArr1M = liveMinute(s1arr.eta);
-        } else if (s1arr.eta === 'On time') {
-          leg._liveChangeArr = leg.changeArr;
-          liveArr1M = leg.changeArrM;
+        // Real live arrival estimate at the change station, read straight off
+        // this same service's subsequentCallingPoints — more accurate than
+        // projecting leg-1's origin delay forward (see the fallback below).
+        // No separate arrival-board query: GetArrBoardWithDetails at the
+        // change station returned HTTP 500 in live testing (see CLAUDE.md),
+        // and calling points carry no platform field anyway, so there's
+        // never a live arrival platform to show here, only a time.
+        const changePoint = findCallingPoint(s1, changeCrs);
+        if (changePoint) {
+          if (changePoint.isCancelled) leg1Cancelled = true;
+          if (changePoint.et && /^\d{2}:\d{2}$/.test(changePoint.et)) {
+            leg._liveChangeArr = changePoint.et;
+            liveArr1M = liveMinute(changePoint.et);
+          } else if (changePoint.et === 'On time') {
+            leg._liveChangeArr = leg.changeArr;
+            liveArr1M = leg.changeArrM;
+          }
         }
       }
     }
@@ -877,10 +867,11 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardArr, boardB) {
     leg._cancelled = leg1Cancelled || leg2Cancelled;
     leg._cancelledLeg = leg1Cancelled ? 1 : (leg2Cancelled ? 2 : 0);
     leg._liveDepM = leg.depM + liveDelay1;
-    // Prefer boardArr's real live arrival estimate at the change station;
+    // Prefer the change-station calling point's real live arrival estimate;
     // only fall back to projecting leg-1's origin delay forward (a
     // reasonable approximation — delay typically carries through to the
-    // next stop) when that board's fetch failed or didn't match this leg.
+    // next stop) when that calling point wasn't found (e.g. boardA's fetch
+    // failed, or didn't match this leg at all).
     if (leg.changeArrM != null) {
       const estimatedArr = liveArr1M != null ? liveArr1M : leg.changeArrM + liveDelay1;
       const dep2M = liveDep2M != null ? liveDep2M : leg.changeArrM + leg.changeMins;

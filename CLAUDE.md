@@ -179,19 +179,25 @@ does connection-pairing itself, only live-delay projection onto an
 already-paired leg.
 
 **Live data at the change station itself** (not just the origin/destination
-legs either side of it) comes from a third live-board fetch per direction in
-`overlayConnectionLive()`: a `GetArrBoardWithDetails` query *at* `route.change`,
-filtered `from` the leg's origin, matched against `leg.changeArr` (`sta`).
-This gives a real live arrival time/platform for leg-1 at the change station,
-which `applyConnectionOverlay()` prefers over the older fallback of projecting
-leg-1's origin delay forward onto its scheduled change-station arrival — that
-projection is now only used when the arrival-board fetch fails or doesn't
-match. There's no scheduled arrival platform at the change station to compare
-against (`fetch_schedule.py` never records one), so the change-row's platform
-badge (`inlinePlatformHtml()`) only ever shows "confirmed" or "(unconfirmed)"
-(from `platformIsHidden`) — never "changed", unlike the origin/destination
-platform badges. See the "Unverified assumptions" section for the parts of
-this that haven't been checked against a live payload yet.
+legs either side of it) comes from leg-1's own departure-board match in
+`applyConnectionOverlay()`, via `findCallingPoint()`: every `GetDepBoardWithDetails`
+service carries `subsequentCallingPoints[].callingPoint[]`, one entry per
+stop the service makes after the queried station, each with its own
+`st`/`et` (confirmed live — see below). Matching the entry whose `crs`
+equals `route.change` gives a real live arrival estimate for leg-1 at the
+change station, which `applyConnectionOverlay()` prefers over the older
+fallback of projecting leg-1's origin delay forward onto its scheduled
+change-station arrival — that projection is now only used when the calling
+point isn't found (e.g. the leg-1 departure-board fetch itself failed or
+didn't match). Calling points carry no `platform` field (confirmed live),
+so there's no live arrival *platform* at the change station, only a time —
+don't try to add one without a different data source.
+
+A `GetArrBoardWithDetails` query directly *at* the change station was tried
+first as a more obvious-looking source for this and **returned HTTP 500**
+against the real API — don't reintroduce it. `subsequentCallingPoints` on
+the departure board already fetched for leg-1 is the only route to this
+data — and it's a bonus over adding a call, not an extra one.
 
 **`overtakers()` applies to both direct and connection legs.** A paired
 connection leg's top-level `depM`/`arrM` is already the whole-journey
@@ -226,25 +232,31 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-
-- **`GetArrBoardWithDetails` response shape** (used in `overlayConnectionLive`/
-  `applyConnectionOverlay` for live arrival data at the change station) is
-  assumed to mirror `GetDepBoardWithDetails`'s: a top-level `trainServices[]`
-  array, with `sta`/`eta` in place of `std`/`etd`, plus the same `platform`,
-  `platformIsHidden`, and `isCancelled` fields per service. This is standard,
-  long-stable OpenLDBWS behaviour (unchanged for years across the classic and
-  Rail Data Marketplace-hosted versions of the API), but hasn't been confirmed
-  against a live payload from *this* account/product. If a live key is ever
-  available in-session (see "Testing the live overlay end-to-end" below), the
-  first thing to check is that `sta`/`eta` are the actual field names and that
-  `eta` uses the same `"On time"`/`"Delayed"`/`"Cancelled"`/HH:MM convention as
-  `etd` — `applyConnectionOverlay()`'s live-arrival branch silently no-ops
-  (falling back to the delay-projection estimate) if any of this is wrong, so
-  a bad assumption here wouldn't throw, just quietly never populate
-  `leg._liveChangeArr`/`leg._changeArrPlatform`.
+There is currently nothing outstanding in this category — see below for items
+that were checked, including two that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
+
+- **`GetArrBoardWithDetails` at the change station doesn't work — HTTP 500**
+  every time it was tried live (`GET .../GetArrBoardWithDetails/TWY?filterCrs=RDG&filterType=from`),
+  regardless of which station/direction. Whatever the cause (product
+  entitlement, param shape, or the operation just not being wired up on this
+  account), don't add it back as "the obvious way" to get live data at the
+  change station. What actually works, confirmed live: every
+  `GetDepBoardWithDetails` match already carries `subsequentCallingPoints[].
+  callingPoint[]`, one entry per remaining stop, each with its own `st`
+  (scheduled) / `et` (estimated — confirmed live using the same `"On time"`/
+  HH:MM convention as `etd`) and `isCancelled`, but **no `platform` field**
+  (confirmed absent on every calling point sampled — platform only ever
+  appears on the queried station's own top-level board entry). `findCallingPoint()`
+  in `app.js` searches leg-1's own matched service for the entry whose `crs`
+  equals `route.change`, which is how `leg._liveChangeArr` gets populated —
+  no extra API call, and no live arrival platform is possible this way.
+- **`subsequentCallingPoints` is an array of call-point *lists*** (each with
+  its own `callingPoint[]`), not one flat list — confirmed structurally live,
+  consistent with it modeling per-portion calling patterns for services that
+  divide. `findCallingPoint()` searches every list, not just the first.
 
 - **Auth exchange, uid-join, and `arr`/`arrM` population** — the two-step
   refresh→access token exchange, the unfiltered-per-station-then-join
