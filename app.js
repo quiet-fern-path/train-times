@@ -111,6 +111,41 @@ async function loadAll() {
   activeRouteId = ROUTES[0].id;
 }
 
+// ── Live data hot-reload ────────────────────────────────────────────
+// sw.js's background stale-while-revalidate refresh (see its fetch handler)
+// posts a message here when it discovers the network copy of a data file
+// actually differs from what was cached (compared by header, not body — see
+// responseChanged() there, since schedule.json can be tens of MB). Without
+// this, a schedule update was invisible until the *next* full page load
+// after the one that triggered the background refetch. Reloading just the
+// changed file and re-rendering in place means it shows up on this load,
+// with no manual refresh needed.
+const DATA_RELOAD_HANDLERS = {
+  [new URL('./data/schedule.json', location.href).href]: async () => {
+    SCHEDULE = await loadJSON('./data/schedule.json');
+  },
+  [new URL('./routes.json', location.href).href]: async () => {
+    ROUTES = await loadJSON('./routes.json');
+    if (!ROUTES.some(r => r.id === activeRouteId)) activeRouteId = ROUTES[0].id;
+  },
+  [new URL('./stations.json', location.href).href]: async () => {
+    STATIONS = await loadJSON('./stations.json');
+  },
+};
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', async (event) => {
+    const handler = event.data && event.data.type === 'content-updated' && DATA_RELOAD_HANDLERS[event.data.url];
+    if (!handler) return;
+    try {
+      await handler();
+      render();
+    } catch (e) {
+      // Reload attempt failed (e.g. went offline mid-fetch) — harmless, the
+      // next background revalidation will notify again if it's still stale.
+    }
+  });
+}
+
 function currentRoute() {
   return ROUTES.find(r => r.id === activeRouteId);
 }

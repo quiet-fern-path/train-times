@@ -158,11 +158,25 @@ THEN fall back to cache) feels broken on slow/flaky connections because the
 "wait for it to fail" step can take many seconds even though a perfectly
 good cached copy exists.
 
-**Implication**: a schedule update is never visible on the load that
-triggered the background refetch — only on the load after that. This is
-fine for data that changes a few times a year; don't "fix" it by adding a
-cache-busting query string or similar, you'll just bring back the slow-load
-problem.
+**A schedule update used to be invisible on the load that triggered the
+background refetch, only showing up on the load after that** — annoying
+enough in practice (a real visitor reported it as "missing trains" that
+took a manual double-refresh to fix) that it's now fixed properly: `sw.js`
+compares the background fetch's response against what was cached, by
+header only (`etag`/`last-modified`/`content-length` — **never the body**,
+since `data/schedule.json` alone is tens of MB and a body diff on every
+background refresh would be real, needless cost). If they differ, it
+`postMessage`s every open client; `app.js`'s `DATA_RELOAD_HANDLERS` listener
+reloads just the changed JSON file and re-renders, in place, no reload
+needed. Don't "fix" the remaining network wait by adding a cache-busting
+query string or similar — that reintroduces the slow-load problem this
+strategy exists to avoid; comparing headers on the background fetch already
+gets the same freshness without it. This same-page hot-reload is
+intentionally scoped to the JSON data files only (`data/schedule.json`,
+`routes.json`, `stations.json`) — `app.js`/`styles.css`/`index.html` changes
+are still only picked up on next navigation via the `CACHE` version bump,
+since swapping running JS/CSS under a live page is a materially riskier
+problem than swapping a JSON blob a render loop already re-reads.
 
 The bootstrap-cache script inline in `index.html` (after the SW
 registration) exists for a separate reason: the very first page load can
