@@ -115,16 +115,24 @@ Key differences:
 One unfiltered call per (station, day), cached in `_station_day_cache` and
 shared across every route touching that station — `fetch_station_day()`
 parses each station's full board once into a departure index and an
-arrival index (both keyed by uid). `fetch_legs(origin, destination, tday)`
-then does an **inner join** on uid between origin's departures and
-destination's arrivals: a uid must appear in both to become a leg, since
-an unfiltered departure list contains services going everywhere, not just
-towards that destination. For the 5 routes configured today this means 8
-distinct stations fetched once each per day instead of 12 origin/destination
-pairs fetched separately (~2x fewer calls than one-call-per-pair, ~3x fewer
-than the original two-calls-per-leg design) — don't go back to per-route
-filtered queries as a "simplification," it multiplies calls for any station
-shared by more than one route.
+arrival index, both keyed by `(uid, serviceDate)` with **lists** of
+occurrences as values, not single dicts — an identity can legitimately call
+at the same station more than once on the same serviceDate (e.g. an
+out-and-back working), and collapsing to one occurrence per key let a
+departure get silently paired with a leftover arrival from a different,
+earlier calling of the same identity (see `_resolve_arrival()`'s docstring
+and the "known-correct-on-purpose" note below — this is a real bug that
+shipped, not a hypothetical). `fetch_legs(origin, destination, tday)` then
+does an **inner join** on `(uid, serviceDate)` between origin's departures
+and destination's arrivals, resolving each departure against its candidate
+arrivals via `_resolve_arrival()`: a key must appear in both to become a
+leg, since an unfiltered departure list contains services going everywhere,
+not just towards that destination. For the 5 routes configured today this
+means 8 distinct stations fetched once each per day instead of 12
+origin/destination pairs fetched separately (~2x fewer calls than
+one-call-per-pair, ~3x fewer than the original two-calls-per-leg design) —
+don't go back to per-route filtered queries as a "simplification," it
+multiplies calls for any station shared by more than one route.
 
 Matched by `scheduleMetadata.identity`. The rate-limit handling in
 `_adjust_delay()` reads both `X-RateLimit-Remaining-Minute` (pauses 20s
@@ -241,6 +249,22 @@ reintroduce a `!isConnection` gate around it.
   legs**, falling back to a slower one only if nothing else qualifies. Two
   separate `.find()` calls, intentionally, not one clever combined filter —
   keep them separate for readability when modifying.
+- **`fetch_station_day()` indexes departures/arrivals as lists keyed by
+  `(uid, serviceDate)`, not single dicts.** This was a real bug: an identity
+  that calls at a station more than once on the same serviceDate (an
+  out-and-back working) would have all but its last occurrence silently
+  overwritten, so `fetch_legs` could pair a fresh departure with a stale
+  arrival left over from an earlier, unrelated calling of the same identity
+  — producing a "leg" whose arrival lands before its departure. Downstream,
+  `dt_to_m`'s boundary nudge (arr before dep ⇒ assume day-boundary
+  crossing) turned that into an apparent ~24h journey, which client-side
+  `overtakers()` then read as beaten by every real train after it — hiding
+  a whole afternoon of trains from the app (confirmed: this shipped in the
+  `rdg-hoh` return data for 2026-07-02 and produced a real ~10h gap with no
+  trains shown between ~07:35 and ~17:01). `_resolve_arrival()` fixes this
+  by picking, per departure, the earliest candidate arrival that actually
+  follows it — don't collapse `fetch_station_day`'s index back to
+  last-write-wins single dicts.
 
 ## Unverified assumptions — check these against real data, don't assume
 

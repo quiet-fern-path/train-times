@@ -305,10 +305,11 @@ _station_day_cache = {}
 
 def fetch_station_day(station, tday):
     """Fetch the full, unfiltered board at `station` for one timetable day,
-    and parse it into (deps, arrs) dicts keyed by (uid, serviceDate). Cached
-    per (station, day): every route whose origin or destination is this
-    station on this day reuses the same single API call rather than each
-    route querying it separately with its own filterTo/filterFrom.
+    and parse it into (deps, arrs) dicts keyed by (uid, serviceDate), each
+    value a *list* of occurrences. Cached per (station, day): every route
+    whose origin or destination is this station on this day reuses the same
+    single API call rather than each route querying it separately with its
+    own filterTo/filterFrom.
 
     Keying on uid alone is not safe: `scheduleMetadata.identity` (e.g.
     "Y15289") is a headcode-style code that TOCs recycle across different
@@ -318,7 +319,20 @@ def fetch_station_day(station, tday):
     silently overwrite (or get joined with) the correct one in fetch_legs,
     producing a bogus ~24h "leg". serviceDate (scheduleMetadata.departureDate)
     is constant for every call of a single service instance, so it's the
-    right disambiguator without affecting genuine same-instance joins."""
+    right disambiguator without affecting genuine same-instance joins.
+
+    Values are lists, not single dicts, because an identity can legitimately
+    call at the same station more than once on the same serviceDate — e.g. an
+    out-and-back working on the Twyford/Henley branch. A single-dict
+    last-write-wins map would silently drop all but the final occurrence,
+    and a later join could then pair a departure from one calling with an
+    arrival left over from an unrelated earlier calling of the same
+    identity, producing a "leg" whose arrival is before its departure
+    (confirmed as the actual cause of a real ~10h gap of missing trains in
+    the app: overtakers() saw every leg in that stretch as ~24h long via the
+    dt_to_m boundary nudge below and hid them all as "beaten"). Keeping every
+    occurrence and letting fetch_legs pick the correct pairing per departure
+    fixes that without assuming an identity never repeats in a day."""
     key = (station, tday)
     if key in _station_day_cache:
         return _station_day_cache[key]
@@ -330,36 +344,37 @@ def fetch_station_day(station, tday):
     for svc in svcs:
         d = parse_dep(svc)
         if d and d["uid"]:
-            deps[(d["uid"], d["serviceDate"])] = d
+            deps.setdefault((d["uid"], d["serviceDate"]), []).append(d)
         a = parse_arr(svc)
         if a and a["uid"]:
-            arrs[(a["uid"], a["serviceDate"])] = a
+            arrs.setdefault((a["uid"], a["serviceDate"]), []).append(a)
 
     result = (deps, arrs)
     _station_day_cache[key] = result
     return result
 
 
-def fetch_legs(origin, destination, tday):
-    """Build legs from origin to destination for one timetable day by
-    joining origin's departure index against destination's arrival index on
-    (uid, serviceDate) (both from fetch_station_day). A key must appear in
-    both — unlike the old filterTo/filterFrom-scoped queries, an unfiltered
-    station's departure index contains every service leaving that station,
-    so an inner join (not "arrival info if we have it") is what actually
-    confirms the service calls at destination.
-    Returns a list of leg dicts with date = tday.isoformat()."""
-    day_label = tday.isoformat()
+def _resolve_arrival(dep, arr_candidates):
+    """Pick the arrival occurrence (from possibly several same-identity
+    callings at the destination that day) that actually follows this
+    specific departure, returning its (possibly boundary-nudged) arrM, or
+    None if none of the candidates represent a real onward journey from
+    this departure.
 
-    deps, _ = fetch_station_day(origin, tday)
-    _, arrs = fetch_station_day(destination, tday)
-
-    legs = []
-    for (uid, service_date), dep in deps.items():
-        arr = arrs.get((uid, service_date))
-        if arr is None:
-            continue
+    An identity can legitimately call at a station more than once on the
+    same serviceDate (e.g. an out-and-back working), so `arr_candidates` may
+    contain arrivals belonging to a *different* calling of the same
+    identity, not this journey's destination. Picking the wrong one used to
+    pair a departure with a leftover/earlier arrival, producing a "leg"
+    whose arrival lands before its departure — which downstream code reads
+    as an ~24h-long journey (see the boundary-nudge comment below) and hides
+    every real train in between as "beaten" by it. Choosing the earliest
+    candidate that genuinely follows this departure avoids that."""
+    best = None
+    for arr in arr_candidates:
         arr_m = arr.get("arrM")
+        if arr_m is None:
+            continue
         # dt_to_m() decides the 1440+ offset per-timestamp from hour alone, with
         # no knowledge of the other end of the journey. A leg that crosses the
         # 03:00 day-start boundary (e.g. dep 02:24, arr 03:11) gets its depM
@@ -369,35 +384,70 @@ def fetch_legs(origin, destination, tday):
         # But arr_m < depM isn't always a boundary crossing — a service that
         # calls at destination *before* origin in its real running order (e.g.
         # it arrives at origin from further out, then continues on past origin
-        # in the opposite direction from destination) will have a departure at
-        # "origin" and an arrival at "destination" that are real, but represent
-        # the wrong direction of travel, not a same-journey origin->destination
-        # hop. Confirmed against live data: e.g. a service arriving Reading
-        # 06:18, departing Reading 06:19 (continuing on to Twyford/Henley) has
-        # a genuine Twyford departure at 06:25 — joining that Twyford departure
-        # to the 06:18 Reading arrival (same uid) would wrongly claim a
-        # Twyford->Reading leg, when the service never actually travels that
-        # way. Only treat arr_m < depM as a boundary crossing when the
-        # departure itself is in the legitimate 00:00-02:59 range (depM already
-        # has dt_to_m's 1440+ offset applied); otherwise this is a
-        # wrong-direction join and the "leg" is bogus — drop it.
-        if arr_m is not None and arr_m < dep["depM"]:
+        # in the opposite direction from destination), or a leftover arrival
+        # from an earlier calling of a repeated identity, will have a
+        # departure and an arrival that are each real, but don't belong to the
+        # same journey. Confirmed against live data: e.g. a service arriving
+        # Reading 06:18, departing Reading 06:19 (continuing on to
+        # Twyford/Henley) has a genuine Twyford departure at 06:25 — joining
+        # that Twyford departure to the 06:18 Reading arrival (same uid) would
+        # wrongly claim a Twyford->Reading leg, when the service never
+        # actually travels that way. Only treat arr_m < depM as a boundary
+        # crossing when the departure itself is in the legitimate 00:00-02:59
+        # range (depM already has dt_to_m's 1440+ offset applied); otherwise
+        # this candidate isn't this journey's arrival — skip it.
+        if arr_m < dep["depM"]:
             if dep["depM"] >= 1440:
                 arr_m += 1440
             else:
                 continue
-        legs.append({
-            "uid": uid,
-            "serviceDate": dep["serviceDate"],
-            "date": day_label,
-            "dep": dep["dep"],
-            "depM": dep["depM"],
-            "arr": arr.get("arr"),
-            "arrM": arr_m,
-            "platform": dep["platform"],
-            "platformConfirmed": dep["platformConfirmed"],
-            "toc": dep["toc"],
-        })
+        if best is None or arr_m < best[0]:
+            best = (arr_m, arr)
+    return best
+
+
+def fetch_legs(origin, destination, tday):
+    """Build legs from origin to destination for one timetable day by
+    joining origin's departure occurrences against destination's arrival
+    occurrences on (uid, serviceDate) (both from fetch_station_day). A key
+    must appear in both — unlike the old filterTo/filterFrom-scoped queries,
+    an unfiltered station's departure index contains every service leaving
+    that station, so an inner join (not "arrival info if we have it") is
+    what actually confirms the service calls at destination.
+
+    Each key maps to a *list* of occurrences (see fetch_station_day), since
+    an identity can call at a station more than once on the same
+    serviceDate; _resolve_arrival() picks the arrival that actually follows
+    each specific departure rather than assuming a 1:1 pairing.
+
+    Returns a list of leg dicts with date = tday.isoformat()."""
+    day_label = tday.isoformat()
+
+    deps, _ = fetch_station_day(origin, tday)
+    _, arrs = fetch_station_day(destination, tday)
+
+    legs = []
+    for (uid, service_date), dep_list in deps.items():
+        arr_candidates = arrs.get((uid, service_date))
+        if not arr_candidates:
+            continue
+        for dep in dep_list:
+            resolved = _resolve_arrival(dep, arr_candidates)
+            if resolved is None:
+                continue
+            arr_m, arr = resolved
+            legs.append({
+                "uid": uid,
+                "serviceDate": dep["serviceDate"],
+                "date": day_label,
+                "dep": dep["dep"],
+                "depM": dep["depM"],
+                "arr": arr.get("arr"),
+                "arrM": arr_m,
+                "platform": dep["platform"],
+                "platformConfirmed": dep["platformConfirmed"],
+                "toc": dep["toc"],
+            })
 
     return sorted(legs, key=lambda l: l["depM"])
 
