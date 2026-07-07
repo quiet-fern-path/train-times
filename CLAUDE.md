@@ -35,8 +35,9 @@ different auth models, and different failure-degradation requirements.
 | `routes.json` | Route config: `{id, name, from, to, change, minConnectionMins}`. Edit this to add/change routes — no other code changes needed for a direct route. |
 | `stations.json` | CRS code → display name. Add an entry whenever you add a station to `routes.json`. |
 | `data/schedule.json` | Generated output. Don't hand-edit — it's overwritten by the Action every run. Ships with an empty-arrays placeholder (`is_seed_placeholder: true`) until the Action runs for real. |
-| `scripts/fetch_schedule.py` | Runs in the Action. Queries RTT, writes `data/schedule.json`. |
-| `.github/workflows/update-schedule.yml` | Weekly cron (Mondays 04:00 UTC) + manual trigger. |
+| `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
+| `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
+| `.github/workflows/refresh-platforms.yml` | Cheap platform-only fetch: daily cron (03:10 UTC) + manual trigger. Runs `fetch_schedule.py --platforms-only` — see below. |
 
 ## Two separate credentials — don't mix them up
 
@@ -248,6 +249,36 @@ confirmed against the live API:
   `(unconfirmed)` with its own `.platform.hidden` style — distinct from the
   grey `.planned` state (no live data at all yet), since it's a different
   situation (Darwin has data but says don't trust it yet).
+- **Darwin REST field name `operatorCode` on a departure-board service
+  item** — used in `matchByTime()` (`app.js`) to disambiguate two services
+  sharing a scheduled departure minute (e.g. GWR vs. Elizabeth line at
+  Paddington-Reading), compared against RTT's `toc`/`toc1`/`toc2` in
+  schedule.json. Confirmed live: a real `GetDepBoardWithDetails` call for
+  PAD→RDG returned `operatorCode: "GW"` for Great Western Railway services
+  and `operatorCode: "XR"` for Elizabeth line services, matching RTT's `toc`
+  values for the same operators exactly.
+- **RTT `locationMetadata.platform.planned` is only populated for the
+  calendar day a query is made, not for days further ahead** — confirmed
+  live: a same-day `/gb-nr/location` query for PAD returned a planned
+  platform on 1167/1167 services, while an identical query 7 days ahead
+  returned one on 0/1215. Not a bug in `fetch_schedule.py`'s parsing; RTT
+  itself doesn't have real WTT-booked platform allocations for these
+  stations that far out.
+- **`locationMetadata.platform.forecast` is real and populated for advance
+  dates, despite the API spec documenting it as "not currently used".**
+  Confirmed live: the same 7-day-ahead PAD query that returned zero
+  `planned` values returned `forecast` on 439/439 services, and the two
+  fields are mutually exclusive — whichever one is set, the other is null
+  for that service at that point in time. `parse_dep()` in
+  `fetch_schedule.py` now falls back to `forecast` when `planned` is
+  null, which is the only way to get any platform at all for most of the
+  90-day lookahead given the Action only runs weekly. This is very likely
+  a predicted/statistical platform (based on how that schedule pattern
+  usually runs) rather than a confirmed WTT booking, so treat it as
+  informational, not authoritative — Darwin's live overlay on the day is
+  still the source of truth and will override it via the normal
+  confirmed/changed logic in `derivePlatformState()` if the real platform
+  differs.
 
 ## Known limitations, not bugs
 
@@ -256,11 +287,59 @@ confirmed against the live API:
   in the day may simply never get live data — they stay correctly in
   scheduled-only state, this isn't an error case to handle, just a ceiling
   on live-data freshness for dense routes.
-- Live↔schedule matching is by scheduled departure time string. Two
-  services on the same route sharing an exact scheduled minute would
-  collide (first match wins). Not currently an issue for any of the five
-  configured routes; would need a sturdier match key (e.g. TOC + time) if
-  a future route had this property.
+- Live↔schedule matching is by scheduled departure time string, disambiguated
+  by TOC (`operatorCode` from the Darwin board vs. `toc`/`toc1`/`toc2` from
+  RTT in schedule.json) when more than one service shares an exact scheduled
+  minute — see `matchByTime()` in `app.js`. This was a real bug on
+  `rdg-pad`: Paddington-Reading has both GWR and Elizabeth line services, and
+  two of them booked at the same minute (e.g. 18:48 ex-Paddington) used to
+  collide, with the live overlay for whichever the board listed second
+  landing on the wrong leg. If neither candidate's `operatorCode` matches
+  (missing field, or an unmapped TOC), it still falls back to first-match,
+  same as before — so this doesn't add a new failure mode, only fixes the
+  known one for the routes where TOC is populated.
+- **The `platform` field in `schedule.json` is a mix of two different RTT
+  fields depending on how far out the leg is** — `planned` (a real
+  WTT-booked platform) for legs on the calendar day the Action happened to
+  run on, and `forecast` (RTT's own predicted platform, despite its API
+  spec entry saying "not currently used") for every other day out to the
+  90-day lookahead. See `parse_dep()` in `fetch_schedule.py` and the RTT
+  entries above. `platformConfirmed` is only ever true for the `planned`
+  case (`actual` populated), so the client can't currently tell these two
+  sources apart from `schedule.json` alone — a `forecast`-sourced platform
+  should be read as "expected, not guaranteed" even though it renders the
+  same as a booked one. Darwin's live overlay on the day still overrides it
+  as normal if the real platform differs. `refresh-platforms.yml` (see
+  below) upgrades most of *today's* legs from `forecast` to real `planned`
+  each morning, but every other day in the lookahead still only has the
+  `forecast` guess until its own day arrives.
+
+## Daily platform-only refresh (`refresh-platforms.yml`)
+
+RTT only has a real, WTT-booked `planned` platform for the calendar day a
+query is made — confirmed live (see above): 100% populated same-day, 0%
+populated a week ahead. Since the full fetch (`update-schedule.yml`) only
+runs weekly, that means only the single day it happened to run on would
+ever get a real booked platform, and everything else would sit on the
+`forecast` guess for its entire 90-day approach.
+
+`fetch_schedule.py --platforms-only` (invoked daily at 03:10 UTC by
+`refresh-platforms.yml`) fixes this cheaply: it fetches *only* today's
+window (one calendar day) for the 8 unique stations these routes touch —
+about 8 RTT calls total, negligible against the 30/min, 750/hour, 9000/day
+budget — then walks the existing `data/schedule.json` and updates just the
+`platform`/`platformConfirmed` fields (`platform1`/`platform2` for
+connections) of legs matching today's date, matched by `(uid, serviceDate)`
+via `merge_platforms_for_today()`.
+
+This deliberately does **not** reuse the `--routes` flag's merge, which
+replaces a route's entire `out`/`ret` array — doing that with only today's
+~20-30 legs fetched would silently delete the other 89 days of forecast
+data for that route. `merge_platforms_for_today()` updates matching legs
+in place instead, leaving every other field and every other day's legs
+untouched. Both workflows share the `rtt-schedule-fetch` concurrency group
+so they can never race the same RTT budget or `data/schedule.json` commit
+at once.
 
 ## Adding a route
 

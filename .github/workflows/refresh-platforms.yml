@@ -1,0 +1,61 @@
+name: Refresh today's platforms
+
+on:
+  schedule:
+    # Daily shortly after the 03:00 timetable-day boundary. GitHub may delay
+    # scheduled runs slightly under load — that's fine, this only needs to
+    # run roughly once a day, and RTT's planned platform for a service is
+    # stable for hours before/after this, not a fixed instant.
+    - cron: '10 3 * * *'
+  workflow_dispatch:      # lets you trigger a manual run from the Actions tab
+    inputs:
+      routes:
+        description: >-
+          Optional comma-separated route ids (from routes.json) to refresh,
+          e.g. "rdg-oxf,rdg-mai". Leave blank to refresh all routes.
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# Shares a concurrency group with the full weekly fetch (update-schedule.yml)
+# — both read-modify-write data/schedule.json and share the same RTT_TOKEN
+# rate-limit budget, so they must never run at the same time. cancel-in-
+# progress stays false so a queued run waits instead of killing (and
+# wasting the API calls of) whichever run is already in flight.
+concurrency:
+  group: rtt-schedule-fetch
+  cancel-in-progress: false
+
+jobs:
+  refresh-platforms:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Refresh today's platform data
+        env:
+          RTT_TOKEN: ${{ secrets.RTT_TOKEN }}
+          ROUTES: ${{ github.event.inputs.routes }}
+        run: |
+          if [ -n "$ROUTES" ]; then
+            python scripts/fetch_schedule.py --platforms-only --routes "$ROUTES"
+          else
+            python scripts/fetch_schedule.py --platforms-only
+          fi
+
+      - name: Commit updated platforms
+        run: |
+          git config user.name "schedule-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/schedule.json
+          git diff --cached --quiet || git commit -m "Refresh today's platforms ($(date -u +%F))"
+          git push
