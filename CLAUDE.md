@@ -199,6 +199,20 @@ against the real API — don't reintroduce it. `subsequentCallingPoints` on
 the departure board already fetched for leg-1 is the only route to this
 data — and it's a bonus over adding a call, not an extra one.
 
+**The same `findCallingPoint()` technique also drives the final destination's
+live arrival time** (`leg._liveArr`), for both direct legs (`applyDirectOverlay`,
+matched against `route.to`/`route.from`) and a connection leg's leg-2
+(`applyConnectionOverlay`, matched against the same `destCrs`). Both
+`overlayDirectLive`/`overlayConnectionLive`'s boards are already fetched with
+`filterType: 'to'` targeting the destination, so the matched service is
+guaranteed to call there — again no extra API call. This closed a real gap:
+`directCard`/`connectionCard` already read `leg._liveArr || leg.arr` for the
+destination time, but nothing ever set `_liveArr` before this, so every
+"arrival" shown was scheduled-only regardless of live delays. Confirmed live
+against a genuinely delayed RDG→PAD service (86 minutes late, on-time
+departure) — the delay only showed up via the destination calling point, not
+the origin board, which is exactly the case this was missing.
+
 **`overtakers()` applies to both direct and connection legs.** A paired
 connection leg's top-level `depM`/`arrM` is already the whole-journey
 origin-departure/final-arrival pair (`fetch_connection()` in

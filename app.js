@@ -260,8 +260,6 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 
   const nextHtml = `<div class="next-row"><span class="next-badge">Next</span><span class="next-mins">${isNext ? label : ''}</span></div>`;
 
-  const arrTime = leg._liveArr || leg.arr;
-
   const delayTag = leg._delayMins > 0
     ? `<span class="delay-tag">${leg._delayMins} min late</span>`
     : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
@@ -293,7 +291,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
       </div>
       <div class="tblock">
-        <div class="tval${isCancelled ? ' cancelled' : ''}">${arrTime || '?'}</div>
+        ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
         <div class="tlabel">${toName}</div>
       </div>
     </div>
@@ -355,7 +353,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
       </div>
       <div class="tblock">
-        <div class="tval">${leg._liveArr || leg.arr}</div>
+        ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
         <div class="tlabel">${toName}</div>
         ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2, leg._platform2Hidden)}
       </div>
@@ -597,8 +595,8 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM'];
-const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM', '_liveArr'];
+const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -758,12 +756,12 @@ async function overlayDirectLive(route, dateStr) {
   if (!data) return false;
   const outBoard = await fetchBoard(route.from, route.to, 'to');
   const retBoard = await fetchBoard(route.to, route.from, 'to');
-  applyDirectOverlay(data.out, dateStr, outBoard);
-  applyDirectOverlay(data.ret, dateStr, retBoard);
+  applyDirectOverlay(data.out, dateStr, outBoard, route.to);
+  applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
   return !!(outBoard || retBoard);
 }
 
-function applyDirectOverlay(legs, dateStr, board) {
+function applyDirectOverlay(legs, dateStr, board, destCrs) {
   if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
@@ -783,6 +781,22 @@ function applyDirectOverlay(legs, dateStr, board) {
       leg._delayMins = 0;
     }
     leg._liveDepM = leg.depM + leg._delayMins;
+
+    // Live arrival estimate at the destination, read straight off this same
+    // service's subsequentCallingPoints — the board was already fetched
+    // filtered `to` destCrs, so the matched service is guaranteed to call
+    // there. Same technique as the change-station arrival (see
+    // findCallingPoint/CLAUDE.md): no extra API call, no platform (calling
+    // points don't carry one).
+    const destPoint = findCallingPoint(svc, destCrs);
+    if (destPoint) {
+      if (destPoint.isCancelled) leg._cancelled = true;
+      if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) {
+        leg._liveArr = destPoint.et;
+      } else if (destPoint.et === 'On time') {
+        leg._liveArr = leg.arr;
+      }
+    }
   }
 }
 
@@ -793,12 +807,12 @@ async function overlayConnectionLive(route, dateStr) {
   const outB = await fetchBoard(route.change, route.to, 'to');
   const retA = await fetchBoard(route.to, route.change, 'to');
   const retB = await fetchBoard(route.change, route.from, 'to');
-  applyConnectionOverlay(data.out, dateStr, outA, outB, route.change);
-  applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change);
+  applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to);
+  applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
   return !!(outA || outB || retA || retB);
 }
 
-function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs) {
+function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCrs) {
   if (!boardA && !boardB) return; // both fetches failed — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
@@ -861,6 +875,18 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs) {
           liveDep2M = liveMinute(s2.etd);
         } else if (s2.etd === 'On time') {
           leg._liveChangeDep = leg.changeDep;
+        }
+        // Live arrival estimate at the final destination, read straight off
+        // this same service's subsequentCallingPoints — same technique as
+        // the change-station arrival above, no extra API call.
+        const destPoint = findCallingPoint(s2, destCrs);
+        if (destPoint) {
+          if (destPoint.isCancelled) leg2Cancelled = true;
+          if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) {
+            leg._liveArr = destPoint.et;
+          } else if (destPoint.et === 'On time') {
+            leg._liveArr = leg.arr;
+          }
         }
       }
     }
