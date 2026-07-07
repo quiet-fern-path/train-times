@@ -469,6 +469,100 @@ def fetch_connection(origin, change, destination, min_conn_mins, days):
     }
 
 
+# ── Cheap daily platform-only refresh ──────────────────────────────────────────
+
+def merge_platforms_for_today(routes):
+    """Fetch just today's window (one calendar day) for the stations these
+    routes touch, and update only the platform fields of already-committed
+    legs in data/schedule.json for that date — not a full re-fetch.
+
+    RTT's `planned` (real WTT-booked) platform is only populated for the
+    calendar day a query is made — confirmed live: 100% populated same-day
+    vs 0% a week ahead (see CLAUDE.md's "Unverified assumptions" section).
+    Since the full fetch only runs weekly, most days sit with a
+    `forecast`-sourced platform (a prediction, not a booking) until the day
+    itself arrives. This lets a cheap (~8 calls total, one per unique
+    station) daily job upgrade that day's legs to the real booked platform
+    each morning, without redoing the full 90-day/~720-call fetch.
+
+    Matches existing legs by (uid, serviceDate) — not uid alone, since RTT
+    recycles identities across different calendar dates (see
+    fetch_station_day's docstring) — and only ever writes platform/
+    platformConfirmed (platform1/2 for connections), leaving every other
+    field and every other day's legs on disk untouched. Deliberately does
+    NOT reuse the --routes flag's whole-route merge (which replaces an
+    entire out/ret array) — that would wipe out the other 89 days' data
+    for any route this touched."""
+    if not os.path.exists("data/schedule.json"):
+        print("No existing data/schedule.json — skipping platform-only refresh (run a full fetch first).")
+        return
+
+    with open("data/schedule.json") as f:
+        result = json.load(f)
+
+    today = date.today()
+    days = [today]
+    updated = 0
+
+    for route in routes:
+        rid = route["id"]
+        existing = result.get("routes", {}).get(rid)
+        if existing is None:
+            continue  # route not fetched yet — a full run will pick it up
+
+        print(f"\nRefreshing today's platforms for {rid} ({route['from']} ↔ {route['to']})…")
+
+        if route.get("change"):
+            fresh = fetch_connection(
+                route["from"], route["change"], route["to"],
+                route.get("minConnectionMins", 5), days,
+            )
+            for direction in ("out", "ret"):
+                fresh_by_key = {
+                    (l["uid1"], l["serviceDate1"], l["uid2"], l["serviceDate2"]): l
+                    for l in fresh[direction]
+                }
+                for leg in existing.get(direction, []):
+                    key = (leg.get("uid1"), leg.get("serviceDate1"),
+                           leg.get("uid2"), leg.get("serviceDate2"))
+                    fl = fresh_by_key.get(key)
+                    if fl is None:
+                        continue
+                    if (leg.get("platform1") != fl["platform1"]
+                            or leg.get("platform1Confirmed") != fl["platform1Confirmed"]
+                            or leg.get("platform2") != fl["platform2"]
+                            or leg.get("platform2Confirmed") != fl["platform2Confirmed"]):
+                        leg["platform1"] = fl["platform1"]
+                        leg["platform1Confirmed"] = fl["platform1Confirmed"]
+                        leg["platform2"] = fl["platform2"]
+                        leg["platform2Confirmed"] = fl["platform2Confirmed"]
+                        updated += 1
+        else:
+            fresh = fetch_direct(route["from"], route["to"], days)
+            for direction in ("out", "ret"):
+                fresh_by_key = {(l["uid"], l["serviceDate"]): l for l in fresh[direction]}
+                for leg in existing.get(direction, []):
+                    key = (leg.get("uid"), leg.get("serviceDate"))
+                    fl = fresh_by_key.get(key)
+                    if fl is None:
+                        continue
+                    if (leg.get("platform") != fl["platform"]
+                            or leg.get("platformConfirmed") != fl["platformConfirmed"]):
+                        leg["platform"] = fl["platform"]
+                        leg["platformConfirmed"] = fl["platformConfirmed"]
+                        updated += 1
+
+    print(f"\nUpdated platform data for {updated} leg(s) on {today.isoformat()}.")
+
+    result["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    os.makedirs("data", exist_ok=True)
+    with open("data/schedule.json", "w") as f:
+        json.dump(result, f, separators=(",", ":"))
+
+    print("Done.")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -481,6 +575,16 @@ def main():
              "leaving other routes' data untouched — use this for a cheap "
              "targeted refresh instead of the full every-route run. Omit "
              "for the normal full run (all routes, full overwrite).",
+    )
+    parser.add_argument(
+        "--platforms-only",
+        action="store_true",
+        help="Cheap daily mode: fetch only today's window (~8 calls total, "
+             "one per unique station) and update just the platform/"
+             "platformConfirmed fields of today's already-committed legs in "
+             "data/schedule.json, leaving every other field and every other "
+             "day untouched. Combine with --routes to restrict which routes "
+             "are refreshed. Requires data/schedule.json to already exist.",
     )
     args = parser.parse_args()
     route_filter = (
@@ -496,6 +600,10 @@ def main():
         if unknown:
             raise SystemExit(f"Unknown route id(s) in --routes: {', '.join(sorted(unknown))}")
         routes = [route for route in routes if route["id"] in route_filter]
+
+    if args.platforms_only:
+        merge_platforms_for_today(routes)
+        return
 
     # Timetable days are calendar dates — the day starts at 03:00 on that date.
     days = [date.today() + timedelta(days=i) for i in range(LOOKAHEAD_DAYS)]

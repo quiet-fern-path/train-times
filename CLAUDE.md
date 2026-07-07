@@ -35,8 +35,9 @@ different auth models, and different failure-degradation requirements.
 | `routes.json` | Route config: `{id, name, from, to, change, minConnectionMins}`. Edit this to add/change routes — no other code changes needed for a direct route. |
 | `stations.json` | CRS code → display name. Add an entry whenever you add a station to `routes.json`. |
 | `data/schedule.json` | Generated output. Don't hand-edit — it's overwritten by the Action every run. Ships with an empty-arrays placeholder (`is_seed_placeholder: true`) until the Action runs for real. |
-| `scripts/fetch_schedule.py` | Runs in the Action. Queries RTT, writes `data/schedule.json`. |
-| `.github/workflows/update-schedule.yml` | Weekly cron (Mondays 04:00 UTC) + manual trigger. |
+| `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
+| `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
+| `.github/workflows/refresh-platforms.yml` | Cheap platform-only fetch: daily cron (03:10 UTC) + manual trigger. Runs `fetch_schedule.py --platforms-only` — see below. |
 
 ## Two separate credentials — don't mix them up
 
@@ -308,7 +309,37 @@ confirmed against the live API:
   sources apart from `schedule.json` alone — a `forecast`-sourced platform
   should be read as "expected, not guaranteed" even though it renders the
   same as a booked one. Darwin's live overlay on the day still overrides it
-  as normal if the real platform differs.
+  as normal if the real platform differs. `refresh-platforms.yml` (see
+  below) upgrades most of *today's* legs from `forecast` to real `planned`
+  each morning, but every other day in the lookahead still only has the
+  `forecast` guess until its own day arrives.
+
+## Daily platform-only refresh (`refresh-platforms.yml`)
+
+RTT only has a real, WTT-booked `planned` platform for the calendar day a
+query is made — confirmed live (see above): 100% populated same-day, 0%
+populated a week ahead. Since the full fetch (`update-schedule.yml`) only
+runs weekly, that means only the single day it happened to run on would
+ever get a real booked platform, and everything else would sit on the
+`forecast` guess for its entire 90-day approach.
+
+`fetch_schedule.py --platforms-only` (invoked daily at 03:10 UTC by
+`refresh-platforms.yml`) fixes this cheaply: it fetches *only* today's
+window (one calendar day) for the 8 unique stations these routes touch —
+about 8 RTT calls total, negligible against the 30/min, 750/hour, 9000/day
+budget — then walks the existing `data/schedule.json` and updates just the
+`platform`/`platformConfirmed` fields (`platform1`/`platform2` for
+connections) of legs matching today's date, matched by `(uid, serviceDate)`
+via `merge_platforms_for_today()`.
+
+This deliberately does **not** reuse the `--routes` flag's merge, which
+replaces a route's entire `out`/`ret` array — doing that with only today's
+~20-30 legs fetched would silently delete the other 89 days of forecast
+data for that route. `merge_platforms_for_today()` updates matching legs
+in place instead, leaving every other field and every other day's legs
+untouched. Both workflows share the `rtt-schedule-fetch` concurrency group
+so they can never race the same RTT budget or `data/schedule.json` commit
+at once.
 
 ## Adding a route
 
