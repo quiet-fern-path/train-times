@@ -210,8 +210,25 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-There is currently nothing outstanding in this category — see below for items
-that were checked, including one that turned out to be wrong.
+
+**Outstanding:**
+
+- **Darwin REST field name `operatorCode` on a departure-board service
+  item** — used in `matchByTime()` (`app.js`) to disambiguate two services
+  sharing a scheduled departure minute (e.g. GWR vs. Elizabeth line at
+  Paddington-Reading), compared against RTT's `toc`/`toc1`/`toc2` in
+  schedule.json. This is the documented OpenLDBWS field name (companion to
+  `operator`, the full name string), but — like `platformIsConfirmed`/
+  `platformIsChanged` below — hasn't been confirmed against a live REST
+  payload from this repo's sandbox. If it's wrong (missing, or a different
+  casing/ATOC mapping than RTT's), `matchByTime()` falls back to
+  first-match-wins, i.e. exactly today's pre-fix behaviour — so an
+  incorrect guess here doesn't make anything worse, it just fails to fix
+  the collision. Verify with a real Darwin response before trusting the
+  disambiguation to actually work.
+
+See below for items that were previously unverified and have since been
+checked, including one that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
@@ -256,11 +273,17 @@ confirmed against the live API:
   in the day may simply never get live data — they stay correctly in
   scheduled-only state, this isn't an error case to handle, just a ceiling
   on live-data freshness for dense routes.
-- Live↔schedule matching is by scheduled departure time string. Two
-  services on the same route sharing an exact scheduled minute would
-  collide (first match wins). Not currently an issue for any of the five
-  configured routes; would need a sturdier match key (e.g. TOC + time) if
-  a future route had this property.
+- Live↔schedule matching is by scheduled departure time string, disambiguated
+  by TOC (`operatorCode` from the Darwin board vs. `toc`/`toc1`/`toc2` from
+  RTT in schedule.json) when more than one service shares an exact scheduled
+  minute — see `matchByTime()` in `app.js`. This was a real bug on
+  `rdg-pad`: Paddington-Reading has both GWR and Elizabeth line services, and
+  two of them booked at the same minute (e.g. 18:48 ex-Paddington) used to
+  collide, with the live overlay for whichever the board listed second
+  landing on the wrong leg. If neither candidate's `operatorCode` matches
+  (missing field, or an unmapped TOC), it still falls back to first-match,
+  same as before — so this doesn't add a new failure mode, only fixes the
+  known one for the routes where TOC is populated.
 
 ## Adding a route
 

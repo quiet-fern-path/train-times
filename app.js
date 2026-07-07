@@ -529,9 +529,23 @@ async function fetchBoard(crs, filterCrs, filterType) {
   }
 }
 
-function matchByTime(board, hhmm) {
+// Two services can share an exact scheduled departure minute (e.g. a GWR and
+// an Elizabeth line train both booked at 18:48 Paddington-Reading) — std
+// alone doesn't disambiguate them. When `toc` (the RTT-sourced ATOC operator
+// code, e.g. "GW"/"XR") is given and more than one candidate shares hhmm,
+// prefer the one whose Darwin operatorCode matches it. Falls back to
+// first-match-wins (the pre-existing behaviour) when there's no toc to
+// compare against or none of the candidates' operatorCode matches it, so a
+// missing/differently-cased operator code degrades no worse than before.
+function matchByTime(board, hhmm, toc) {
   if (!board || !board.trainServices) return null;
-  return board.trainServices.find(s => s.std === hhmm) || null;
+  const candidates = board.trainServices.filter(s => s.std === hhmm);
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1 && toc) {
+    const byToc = candidates.find(s => s.operatorCode === toc);
+    if (byToc) return byToc;
+  }
+  return candidates[0];
 }
 
 // ── Live data persistence (survive reload / tab switch, up to 1hr) ──
@@ -720,7 +734,7 @@ function applyDirectOverlay(legs, dateStr, board) {
   if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
-    const svc = matchByTime(board, leg.dep);
+    const svc = matchByTime(board, leg.dep, leg.toc);
     if (!svc) continue;
     leg._liveChecked = true;
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
@@ -765,7 +779,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
     let liveDep2M = null;
 
     if (boardA) {
-      const s1 = matchByTime(boardA, leg.dep);
+      const s1 = matchByTime(boardA, leg.dep, leg.toc1);
       if (s1) {
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
@@ -782,7 +796,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
       }
     }
     if (boardB) {
-      const s2 = matchByTime(boardB, leg.changeDep);
+      const s2 = matchByTime(boardB, leg.changeDep, leg.toc2);
       if (s2) {
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
