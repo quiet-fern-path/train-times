@@ -210,25 +210,8 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-
-**Outstanding:**
-
-- **Darwin REST field name `operatorCode` on a departure-board service
-  item** — used in `matchByTime()` (`app.js`) to disambiguate two services
-  sharing a scheduled departure minute (e.g. GWR vs. Elizabeth line at
-  Paddington-Reading), compared against RTT's `toc`/`toc1`/`toc2` in
-  schedule.json. This is the documented OpenLDBWS field name (companion to
-  `operator`, the full name string), but — like `platformIsConfirmed`/
-  `platformIsChanged` below — hasn't been confirmed against a live REST
-  payload from this repo's sandbox. If it's wrong (missing, or a different
-  casing/ATOC mapping than RTT's), `matchByTime()` falls back to
-  first-match-wins, i.e. exactly today's pre-fix behaviour — so an
-  incorrect guess here doesn't make anything worse, it just fails to fix
-  the collision. Verify with a real Darwin response before trusting the
-  disambiguation to actually work.
-
-See below for items that were previously unverified and have since been
-checked, including one that turned out to be wrong.
+There is currently nothing outstanding in this category — see below for items
+that were checked, including one that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
@@ -265,6 +248,24 @@ confirmed against the live API:
   `(unconfirmed)` with its own `.platform.hidden` style — distinct from the
   grey `.planned` state (no live data at all yet), since it's a different
   situation (Darwin has data but says don't trust it yet).
+- **Darwin REST field name `operatorCode` on a departure-board service
+  item** — used in `matchByTime()` (`app.js`) to disambiguate two services
+  sharing a scheduled departure minute (e.g. GWR vs. Elizabeth line at
+  Paddington-Reading), compared against RTT's `toc`/`toc1`/`toc2` in
+  schedule.json. Confirmed live: a real `GetDepBoardWithDetails` call for
+  PAD→RDG returned `operatorCode: "GW"` for Great Western Railway services
+  and `operatorCode: "XR"` for Elizabeth line services, matching RTT's `toc`
+  values for the same operators exactly.
+- **RTT `locationMetadata.platform.planned` is only populated for the
+  calendar day a query is made, not for days further ahead** — confirmed
+  live: a same-day `/gb-nr/location` query for PAD returned a planned
+  platform on 1167/1167 services, while an identical query 7 days ahead
+  returned one on 0/1215. This is why `schedule.json`'s `platform` field is
+  non-null only for the single calendar day the weekly Action happened to
+  run on, and `null` for every other day in the 90-day lookahead — see the
+  "planned platform mostly missing" entry under Known limitations below.
+  Not a bug in `fetch_schedule.py`'s parsing; RTT itself doesn't have
+  advance platform allocations for these stations that far out.
 
 ## Known limitations, not bugs
 
@@ -284,6 +285,18 @@ confirmed against the live API:
   (missing field, or an unmapped TOC), it still falls back to first-match,
   same as before — so this doesn't add a new failure mode, only fixes the
   known one for the routes where TOC is populated.
+- **Planned (scheduled) platform is `null` in `schedule.json` for almost
+  every leg, on almost every day.** RTT only has a `locationMetadata.
+  platform.planned` value for services on the calendar day a query is
+  made — confirmed live (see the RTT entry above): 100% populated same-day,
+  0% populated a week ahead. Since the Action fetches its full 90-day
+  lookahead once a week, only the single day it happened to run on gets a
+  real planned platform in the committed `schedule.json`; every other day
+  is `null` until a visitor's own live overlay (Darwin, if they've set an
+  API key) fills it in as each service gets close to departure. This
+  affects every route identically, not just one — don't chase it as a
+  route-specific bug, and don't "fix" it by trying to backfill or interpolate
+  a platform for future days; RTT genuinely doesn't know it yet.
 
 ## Adding a route
 
