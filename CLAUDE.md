@@ -260,12 +260,24 @@ confirmed against the live API:
   calendar day a query is made, not for days further ahead** — confirmed
   live: a same-day `/gb-nr/location` query for PAD returned a planned
   platform on 1167/1167 services, while an identical query 7 days ahead
-  returned one on 0/1215. This is why `schedule.json`'s `platform` field is
-  non-null only for the single calendar day the weekly Action happened to
-  run on, and `null` for every other day in the 90-day lookahead — see the
-  "planned platform mostly missing" entry under Known limitations below.
-  Not a bug in `fetch_schedule.py`'s parsing; RTT itself doesn't have
-  advance platform allocations for these stations that far out.
+  returned one on 0/1215. Not a bug in `fetch_schedule.py`'s parsing; RTT
+  itself doesn't have real WTT-booked platform allocations for these
+  stations that far out.
+- **`locationMetadata.platform.forecast` is real and populated for advance
+  dates, despite the API spec documenting it as "not currently used".**
+  Confirmed live: the same 7-day-ahead PAD query that returned zero
+  `planned` values returned `forecast` on 439/439 services, and the two
+  fields are mutually exclusive — whichever one is set, the other is null
+  for that service at that point in time. `parse_dep()` in
+  `fetch_schedule.py` now falls back to `forecast` when `planned` is
+  null, which is the only way to get any platform at all for most of the
+  90-day lookahead given the Action only runs weekly. This is very likely
+  a predicted/statistical platform (based on how that schedule pattern
+  usually runs) rather than a confirmed WTT booking, so treat it as
+  informational, not authoritative — Darwin's live overlay on the day is
+  still the source of truth and will override it via the normal
+  confirmed/changed logic in `derivePlatformState()` if the real platform
+  differs.
 
 ## Known limitations, not bugs
 
@@ -285,18 +297,18 @@ confirmed against the live API:
   (missing field, or an unmapped TOC), it still falls back to first-match,
   same as before — so this doesn't add a new failure mode, only fixes the
   known one for the routes where TOC is populated.
-- **Planned (scheduled) platform is `null` in `schedule.json` for almost
-  every leg, on almost every day.** RTT only has a `locationMetadata.
-  platform.planned` value for services on the calendar day a query is
-  made — confirmed live (see the RTT entry above): 100% populated same-day,
-  0% populated a week ahead. Since the Action fetches its full 90-day
-  lookahead once a week, only the single day it happened to run on gets a
-  real planned platform in the committed `schedule.json`; every other day
-  is `null` until a visitor's own live overlay (Darwin, if they've set an
-  API key) fills it in as each service gets close to departure. This
-  affects every route identically, not just one — don't chase it as a
-  route-specific bug, and don't "fix" it by trying to backfill or interpolate
-  a platform for future days; RTT genuinely doesn't know it yet.
+- **The `platform` field in `schedule.json` is a mix of two different RTT
+  fields depending on how far out the leg is** — `planned` (a real
+  WTT-booked platform) for legs on the calendar day the Action happened to
+  run on, and `forecast` (RTT's own predicted platform, despite its API
+  spec entry saying "not currently used") for every other day out to the
+  90-day lookahead. See `parse_dep()` in `fetch_schedule.py` and the RTT
+  entries above. `platformConfirmed` is only ever true for the `planned`
+  case (`actual` populated), so the client can't currently tell these two
+  sources apart from `schedule.json` alone — a `forecast`-sourced platform
+  should be read as "expected, not guaranteed" even though it renders the
+  same as a booked one. Darwin's live overlay on the day still overrides it
+  as normal if the real platform differs.
 
 ## Adding a route
 

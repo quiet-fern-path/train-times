@@ -255,6 +255,16 @@ def parse_dep(svc):
     platform_obj = loc_meta.get("platform") or {}
     planned = platform_obj.get("planned")
     actual = platform_obj.get("actual")
+    # The API spec documents "forecast" as "not currently used", but live
+    # data shows otherwise: it's populated with a predicted platform for
+    # services far enough ahead that the WTT-booked `planned` value isn't
+    # decided yet, and the two are mutually exclusive (confirmed live: a
+    # week-ahead query returned forecast on 439/439 services vs planned on
+    # 0/439). Since this script runs weekly and `planned` is null for every
+    # date except the one it happens to run on, falling back to `forecast`
+    # is the only way to surface any platform at all for most of the
+    # 90-day lookahead.
+    platform = planned if planned is not None else platform_obj.get("forecast")
 
     return {
         "uid": meta.get("identity"),
@@ -262,7 +272,7 @@ def parse_dep(svc):
         "toc": (meta.get("operator") or {}).get("code"),
         "dep": dt_to_hhmm(dep_dt),
         "depM": dt_to_m(dep_dt),
-        "platform": planned,
+        "platform": platform,
         "platformConfirmed": actual is not None,
     }
 
