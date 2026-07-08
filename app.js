@@ -199,6 +199,13 @@ function depTimeHtml(scheduled, live, isCancelled) {
   return `<div class="tval${isCancelled ? ' cancelled' : ''}${delayed ? ' delayed' : ''}">${was}${live || scheduled}</div>`;
 }
 
+// Same struck-through-scheduled-time treatment as depTimeHtml, but inline
+// (for the change-row's compact "arr X · dep Y" text, not the big tval block).
+function inlineLiveTime(scheduled, live) {
+  if (!live || live === scheduled) return scheduled;
+  return `<span style="text-decoration:line-through;color:var(--muted);margin-right:3px">${scheduled}</span>${live}`;
+}
+
 // Darwin's real schema (confirmed against the published Darwin User Guide)
 // only exposes `platform` and `platformIsHidden` on a service — there is no
 // platformIsConfirmed/platformIsChanged boolean. A live-fetched platform IS
@@ -253,8 +260,6 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 
   const nextHtml = `<div class="next-row"><span class="next-badge">Next</span><span class="next-mins">${isNext ? label : ''}</span></div>`;
 
-  const arrTime = leg._liveArr || leg.arr;
-
   const delayTag = leg._delayMins > 0
     ? `<span class="delay-tag">${leg._delayMins} min late</span>`
     : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
@@ -286,7 +291,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
       </div>
       <div class="tblock">
-        <div class="tval${isCancelled ? ' cancelled' : ''}">${arrTime || '?'}</div>
+        ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
         <div class="tlabel">${toName}</div>
       </div>
     </div>
@@ -327,6 +332,14 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
     ? `<div class="change-row"><span class="delay-tag">Tight connection: ${leg._liveChangeMins} min</span></div>`
     : '';
 
+  // Live arrival time at the change station comes from leg-1's own
+  // subsequentCallingPoints entry for it (see applyConnectionOverlay) — no
+  // platform, since calling points don't carry one. Live departure time
+  // reuses the same departure-board fetch that already drives leg2's
+  // platform badge above.
+  const changeArrText = inlineLiveTime(leg.changeArr, leg._liveChangeArr);
+  const changeDepText = inlineLiveTime(leg.changeDep, leg._liveChangeDep);
+
   return `<div class="${cls}" data-depm="${effM}">
     ${nextHtml}
     <div class="journey">
@@ -340,12 +353,12 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
       </div>
       <div class="tblock">
-        <div class="tval">${leg._liveArr || leg.arr}</div>
+        ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
         <div class="tlabel">${toName}</div>
         ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2, leg._platform2Hidden)}
       </div>
     </div>
-    <div class="change-row">Change at ${changeName}: arr ${leg.changeArr} &middot; dep ${leg.changeDep} &middot; ${leg.changeMins} min</div>
+    <div class="change-row">Change at ${changeName}: arr ${changeArrText} &middot; dep ${changeDepText} &middot; ${leg.changeMins} min</div>
     ${cancelledTag}
     ${tightWarning}
     ${slowerHtml}
@@ -548,6 +561,24 @@ function matchByTime(board, hhmm, toc) {
   return candidates[0];
 }
 
+// A departure board's matched service carries subsequentCallingPoints — the
+// full list of stops the service makes after the queried station, each with
+// its own st (scheduled)/et (estimated, "On time"/"Delayed"/"Cancelled"/
+// HH:MM — same convention as std/etd) — but no platform field (confirmed
+// live: platform is only ever present on the queried station's own board
+// entry, never on a calling point). Used to read a real live arrival
+// estimate at the change station straight off leg-1's own departure-board
+// match, without a second API call. subsequentCallingPoints is an array of
+// call-point *lists* (plural portions, e.g. a service that divides) rather
+// than one flat list, so every list needs searching.
+function findCallingPoint(svc, crs) {
+  for (const group of svc.subsequentCallingPoints || []) {
+    const found = (group.callingPoint || []).find(p => p.crs === crs);
+    if (found) return found;
+  }
+  return null;
+}
+
 // ── Live data persistence (survive reload / tab switch, up to 1hr) ──
 // In-memory live state (leg._liveDepM etc., liveEverSucceeded,
 // lastLiveSuccessAt) is lost on every page load, so a refresh used to show
@@ -564,8 +595,8 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM'];
-const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM', '_liveArr'];
+const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -725,12 +756,12 @@ async function overlayDirectLive(route, dateStr) {
   if (!data) return false;
   const outBoard = await fetchBoard(route.from, route.to, 'to');
   const retBoard = await fetchBoard(route.to, route.from, 'to');
-  applyDirectOverlay(data.out, dateStr, outBoard);
-  applyDirectOverlay(data.ret, dateStr, retBoard);
+  applyDirectOverlay(data.out, dateStr, outBoard, route.to);
+  applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
   return !!(outBoard || retBoard);
 }
 
-function applyDirectOverlay(legs, dateStr, board) {
+function applyDirectOverlay(legs, dateStr, board, destCrs) {
   if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
@@ -750,6 +781,22 @@ function applyDirectOverlay(legs, dateStr, board) {
       leg._delayMins = 0;
     }
     leg._liveDepM = leg.depM + leg._delayMins;
+
+    // Live arrival estimate at the destination, read straight off this same
+    // service's subsequentCallingPoints — the board was already fetched
+    // filtered `to` destCrs, so the matched service is guaranteed to call
+    // there. Same technique as the change-station arrival (see
+    // findCallingPoint/CLAUDE.md): no extra API call, no platform (calling
+    // points don't carry one).
+    const destPoint = findCallingPoint(svc, destCrs);
+    if (destPoint) {
+      if (destPoint.isCancelled) leg._cancelled = true;
+      if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) {
+        leg._liveArr = destPoint.et;
+      } else if (destPoint.et === 'On time') {
+        leg._liveArr = leg.arr;
+      }
+    }
   }
 }
 
@@ -760,12 +807,12 @@ async function overlayConnectionLive(route, dateStr) {
   const outB = await fetchBoard(route.change, route.to, 'to');
   const retA = await fetchBoard(route.to, route.change, 'to');
   const retB = await fetchBoard(route.change, route.from, 'to');
-  applyConnectionOverlay(data.out, dateStr, outA, outB);
-  applyConnectionOverlay(data.ret, dateStr, retA, retB);
+  applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to);
+  applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
   return !!(outA || outB || retA || retB);
 }
 
-function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
+function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCrs) {
   if (!boardA && !boardB) return; // both fetches failed — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
@@ -777,6 +824,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
     let leg2Cancelled = leg._cancelledLeg === 2;
     let liveDelay1 = leg._liveDepM != null ? leg._liveDepM - leg.depM : 0;
     let liveDep2M = null;
+    let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
 
     if (boardA) {
       const s1 = matchByTime(boardA, leg.dep, leg.toc1);
@@ -793,6 +841,24 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
         } else {
           liveDelay1 = 0;
         }
+        // Real live arrival estimate at the change station, read straight off
+        // this same service's subsequentCallingPoints — more accurate than
+        // projecting leg-1's origin delay forward (see the fallback below).
+        // No separate arrival-board query: GetArrBoardWithDetails at the
+        // change station returned HTTP 500 in live testing (see CLAUDE.md),
+        // and calling points carry no platform field anyway, so there's
+        // never a live arrival platform to show here, only a time.
+        const changePoint = findCallingPoint(s1, changeCrs);
+        if (changePoint) {
+          if (changePoint.isCancelled) leg1Cancelled = true;
+          if (changePoint.et && /^\d{2}:\d{2}$/.test(changePoint.et)) {
+            leg._liveChangeArr = changePoint.et;
+            liveArr1M = liveMinute(changePoint.et);
+          } else if (changePoint.et === 'On time') {
+            leg._liveChangeArr = leg.changeArr;
+            liveArr1M = leg.changeArrM;
+          }
+        }
       }
     }
     if (boardB) {
@@ -805,19 +871,35 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB) {
         leg._platform2Changed = platform2State.changed;
         leg._platform2Hidden = platform2State.hidden;
         if (s2.etd && /^\d{2}:\d{2}$/.test(s2.etd)) {
+          leg._liveChangeDep = s2.etd;
           liveDep2M = liveMinute(s2.etd);
+        } else if (s2.etd === 'On time') {
+          leg._liveChangeDep = leg.changeDep;
+        }
+        // Live arrival estimate at the final destination, read straight off
+        // this same service's subsequentCallingPoints — same technique as
+        // the change-station arrival above, no extra API call.
+        const destPoint = findCallingPoint(s2, destCrs);
+        if (destPoint) {
+          if (destPoint.isCancelled) leg2Cancelled = true;
+          if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) {
+            leg._liveArr = destPoint.et;
+          } else if (destPoint.et === 'On time') {
+            leg._liveArr = leg.arr;
+          }
         }
       }
     }
     leg._cancelled = leg1Cancelled || leg2Cancelled;
     leg._cancelledLeg = leg1Cancelled ? 1 : (leg2Cancelled ? 2 : 0);
     leg._liveDepM = leg.depM + liveDelay1;
-    // Project leg-1's live delay onto its scheduled arrival at the change
-    // station (a reasonable approximation — delay typically carries through
-    // to the next stop), then compare against leg-2's live or scheduled
-    // departure to see whether the connection is actually still comfortable.
+    // Prefer the change-station calling point's real live arrival estimate;
+    // only fall back to projecting leg-1's origin delay forward (a
+    // reasonable approximation — delay typically carries through to the
+    // next stop) when that calling point wasn't found (e.g. boardA's fetch
+    // failed, or didn't match this leg at all).
     if (leg.changeArrM != null) {
-      const estimatedArr = leg.changeArrM + liveDelay1;
+      const estimatedArr = liveArr1M != null ? liveArr1M : leg.changeArrM + liveDelay1;
       const dep2M = liveDep2M != null ? liveDep2M : leg.changeArrM + leg.changeMins;
       leg._liveChangeMins = dep2M - estimatedArr;
     }

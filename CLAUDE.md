@@ -178,6 +178,41 @@ time using `minConnectionMins` from the route config — the client never
 does connection-pairing itself, only live-delay projection onto an
 already-paired leg.
 
+**Live data at the change station itself** (not just the origin/destination
+legs either side of it) comes from leg-1's own departure-board match in
+`applyConnectionOverlay()`, via `findCallingPoint()`: every `GetDepBoardWithDetails`
+service carries `subsequentCallingPoints[].callingPoint[]`, one entry per
+stop the service makes after the queried station, each with its own
+`st`/`et` (confirmed live — see below). Matching the entry whose `crs`
+equals `route.change` gives a real live arrival estimate for leg-1 at the
+change station, which `applyConnectionOverlay()` prefers over the older
+fallback of projecting leg-1's origin delay forward onto its scheduled
+change-station arrival — that projection is now only used when the calling
+point isn't found (e.g. the leg-1 departure-board fetch itself failed or
+didn't match). Calling points carry no `platform` field (confirmed live),
+so there's no live arrival *platform* at the change station, only a time —
+don't try to add one without a different data source.
+
+A `GetArrBoardWithDetails` query directly *at* the change station was tried
+first as a more obvious-looking source for this and **returned HTTP 500**
+against the real API — don't reintroduce it. `subsequentCallingPoints` on
+the departure board already fetched for leg-1 is the only route to this
+data — and it's a bonus over adding a call, not an extra one.
+
+**The same `findCallingPoint()` technique also drives the final destination's
+live arrival time** (`leg._liveArr`), for both direct legs (`applyDirectOverlay`,
+matched against `route.to`/`route.from`) and a connection leg's leg-2
+(`applyConnectionOverlay`, matched against the same `destCrs`). Both
+`overlayDirectLive`/`overlayConnectionLive`'s boards are already fetched with
+`filterType: 'to'` targeting the destination, so the matched service is
+guaranteed to call there — again no extra API call. This closed a real gap:
+`directCard`/`connectionCard` already read `leg._liveArr || leg.arr` for the
+destination time, but nothing ever set `_liveArr` before this, so every
+"arrival" shown was scheduled-only regardless of live delays. Confirmed live
+against a genuinely delayed RDG→PAD service (86 minutes late, on-time
+departure) — the delay only showed up via the destination calling point, not
+the origin board, which is exactly the case this was missing.
+
 **`overtakers()` applies to both direct and connection legs.** A paired
 connection leg's top-level `depM`/`arrM` is already the whole-journey
 origin-departure/final-arrival pair (`fetch_connection()` in
@@ -212,10 +247,30 @@ reintroduce a `!isConnection` gate around it.
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
 There is currently nothing outstanding in this category — see below for items
-that were checked, including one that turned out to be wrong.
+that were checked, including two that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
+
+- **`GetArrBoardWithDetails` at the change station doesn't work — HTTP 500**
+  every time it was tried live (`GET .../GetArrBoardWithDetails/TWY?filterCrs=RDG&filterType=from`),
+  regardless of which station/direction. Whatever the cause (product
+  entitlement, param shape, or the operation just not being wired up on this
+  account), don't add it back as "the obvious way" to get live data at the
+  change station. What actually works, confirmed live: every
+  `GetDepBoardWithDetails` match already carries `subsequentCallingPoints[].
+  callingPoint[]`, one entry per remaining stop, each with its own `st`
+  (scheduled) / `et` (estimated — confirmed live using the same `"On time"`/
+  HH:MM convention as `etd`) and `isCancelled`, but **no `platform` field**
+  (confirmed absent on every calling point sampled — platform only ever
+  appears on the queried station's own top-level board entry). `findCallingPoint()`
+  in `app.js` searches leg-1's own matched service for the entry whose `crs`
+  equals `route.change`, which is how `leg._liveChangeArr` gets populated —
+  no extra API call, and no live arrival platform is possible this way.
+- **`subsequentCallingPoints` is an array of call-point *lists*** (each with
+  its own `callingPoint[]`), not one flat list — confirmed structurally live,
+  consistent with it modeling per-portion calling patterns for services that
+  divide. `findCallingPoint()` searches every list, not just the first.
 
 - **Auth exchange, uid-join, and `arr`/`arrM` population** — the two-step
   refresh→access token exchange, the unfiltered-per-station-then-join
