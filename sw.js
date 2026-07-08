@@ -13,11 +13,44 @@ self.addEventListener('activate', e => {
   self.clients.claim();
 });
 
+// A cached response differs from a freshly-fetched one for the same URL.
+// Compared via ETag/Last-Modified/Content-Length headers only — never the
+// body — so this stays cheap even for data/schedule.json, which is tens of
+// MB (90 days lookahead across 6 routes). If neither response carries any
+// of those headers, assume it changed: a spurious re-render is harmless,
+// silently missing a real update is the bug this exists to prevent.
+function responseChanged(oldResp, newResp) {
+  const oldEtag = oldResp.headers.get('etag');
+  const newEtag = newResp.headers.get('etag');
+  if (oldEtag || newEtag) return oldEtag !== newEtag;
+  const oldMod = oldResp.headers.get('last-modified');
+  const newMod = newResp.headers.get('last-modified');
+  if (oldMod || newMod) return oldMod !== newMod;
+  const oldLen = oldResp.headers.get('content-length');
+  const newLen = newResp.headers.get('content-length');
+  if (oldLen || newLen) return oldLen !== newLen;
+  return true;
+}
+
+function notifyClientsOfUpdate(url) {
+  self.clients.matchAll({ includeUncontrolled: true }).then(clients => {
+    for (const client of clients) client.postMessage({ type: 'content-updated', url });
+  });
+}
+
 // Stale-while-revalidate: if a cached copy exists, return it INSTANTLY —
 // no network round trip on the critical path at all. A background fetch
 // still runs to refresh the cache, but the page never waits on it.
 // Only a true first-ever visit (nothing cached yet) has to wait for the
 // network, because there's nothing else to show.
+//
+// The background refresh alone used to mean an update was invisible until
+// the *next* load after the one that triggered it (see CLAUDE.md). Now,
+// when the background fetch reveals the content actually changed, every
+// open client is notified (see notifyClientsOfUpdate/responseChanged above)
+// so app.js can swap in the fresh data and re-render immediately — no
+// manual reload needed. Deliberately header-based, not a body diff: this
+// must stay cheap regardless of how big schedule.json gets.
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
 
@@ -33,7 +66,12 @@ self.addEventListener('fetch', e => {
 
       const networkUpdate = fetch(e.request)
         .then(response => {
-          if (response.ok) cache.put(e.request, response.clone());
+          if (response.ok) {
+            if (cached && responseChanged(cached, response)) {
+              notifyClientsOfUpdate(e.request.url);
+            }
+            cache.put(e.request, response.clone());
+          }
           return response;
         })
         .catch(() => null);

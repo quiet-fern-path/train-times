@@ -38,6 +38,9 @@ different auth models, and different failure-degradation requirements.
 | `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
 | `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
 | `.github/workflows/refresh-platforms.yml` | Cheap platform-only fetch: daily cron (03:10 UTC) + manual trigger. Runs `fetch_schedule.py --platforms-only` — see below. |
+| `scripts/test_fetch_schedule.py` | Python test suite (stdlib `unittest`) — see "Automated tests" below. |
+| `test/*.test.js`, `test/loadApp.js`, `test/loadSw.js` | JS test suite (Node's built-in `node:test`) — see "Automated tests" below. |
+| `.github/workflows/test.yml` | Runs both test suites on every push/PR. |
 
 ## Two separate credentials — don't mix them up
 
@@ -115,16 +118,24 @@ Key differences:
 One unfiltered call per (station, day), cached in `_station_day_cache` and
 shared across every route touching that station — `fetch_station_day()`
 parses each station's full board once into a departure index and an
-arrival index (both keyed by uid). `fetch_legs(origin, destination, tday)`
-then does an **inner join** on uid between origin's departures and
-destination's arrivals: a uid must appear in both to become a leg, since
-an unfiltered departure list contains services going everywhere, not just
-towards that destination. For the 5 routes configured today this means 8
-distinct stations fetched once each per day instead of 12 origin/destination
-pairs fetched separately (~2x fewer calls than one-call-per-pair, ~3x fewer
-than the original two-calls-per-leg design) — don't go back to per-route
-filtered queries as a "simplification," it multiplies calls for any station
-shared by more than one route.
+arrival index, both keyed by `(uid, serviceDate)` with **lists** of
+occurrences as values, not single dicts — an identity can legitimately call
+at the same station more than once on the same serviceDate (e.g. an
+out-and-back working), and collapsing to one occurrence per key let a
+departure get silently paired with a leftover arrival from a different,
+earlier calling of the same identity (see `_resolve_arrival()`'s docstring
+and the "known-correct-on-purpose" note below — this is a real bug that
+shipped, not a hypothetical). `fetch_legs(origin, destination, tday)` then
+does an **inner join** on `(uid, serviceDate)` between origin's departures
+and destination's arrivals, resolving each departure against its candidate
+arrivals via `_resolve_arrival()`: a key must appear in both to become a
+leg, since an unfiltered departure list contains services going everywhere,
+not just towards that destination. For the 5 routes configured today this
+means 8 distinct stations fetched once each per day instead of 12
+origin/destination pairs fetched separately (~2x fewer calls than
+one-call-per-pair, ~3x fewer than the original two-calls-per-leg design) —
+don't go back to per-route filtered queries as a "simplification," it
+multiplies calls for any station shared by more than one route.
 
 Matched by `scheduleMetadata.identity`. The rate-limit handling in
 `_adjust_delay()` reads both `X-RateLimit-Remaining-Minute` (pauses 20s
@@ -150,11 +161,25 @@ THEN fall back to cache) feels broken on slow/flaky connections because the
 "wait for it to fail" step can take many seconds even though a perfectly
 good cached copy exists.
 
-**Implication**: a schedule update is never visible on the load that
-triggered the background refetch — only on the load after that. This is
-fine for data that changes a few times a year; don't "fix" it by adding a
-cache-busting query string or similar, you'll just bring back the slow-load
-problem.
+**A schedule update used to be invisible on the load that triggered the
+background refetch, only showing up on the load after that** — annoying
+enough in practice (a real visitor reported it as "missing trains" that
+took a manual double-refresh to fix) that it's now fixed properly: `sw.js`
+compares the background fetch's response against what was cached, by
+header only (`etag`/`last-modified`/`content-length` — **never the body**,
+since `data/schedule.json` alone is tens of MB and a body diff on every
+background refresh would be real, needless cost). If they differ, it
+`postMessage`s every open client; `app.js`'s `DATA_RELOAD_HANDLERS` listener
+reloads just the changed JSON file and re-renders, in place, no reload
+needed. Don't "fix" the remaining network wait by adding a cache-busting
+query string or similar — that reintroduces the slow-load problem this
+strategy exists to avoid; comparing headers on the background fetch already
+gets the same freshness without it. This same-page hot-reload is
+intentionally scoped to the JSON data files only (`data/schedule.json`,
+`routes.json`, `stations.json`) — `app.js`/`styles.css`/`index.html` changes
+are still only picked up on next navigation via the `CACHE` version bump,
+since swapping running JS/CSS under a live page is a materially riskier
+problem than swapping a JSON blob a render loop already re-reads.
 
 The bootstrap-cache script inline in `index.html` (after the SW
 registration) exists for a separate reason: the very first page load can
@@ -241,6 +266,22 @@ reintroduce a `!isConnection` gate around it.
   legs**, falling back to a slower one only if nothing else qualifies. Two
   separate `.find()` calls, intentionally, not one clever combined filter —
   keep them separate for readability when modifying.
+- **`fetch_station_day()` indexes departures/arrivals as lists keyed by
+  `(uid, serviceDate)`, not single dicts.** This was a real bug: an identity
+  that calls at a station more than once on the same serviceDate (an
+  out-and-back working) would have all but its last occurrence silently
+  overwritten, so `fetch_legs` could pair a fresh departure with a stale
+  arrival left over from an earlier, unrelated calling of the same identity
+  — producing a "leg" whose arrival lands before its departure. Downstream,
+  `dt_to_m`'s boundary nudge (arr before dep ⇒ assume day-boundary
+  crossing) turned that into an apparent ~24h journey, which client-side
+  `overtakers()` then read as beaten by every real train after it — hiding
+  a whole afternoon of trains from the app (confirmed: this shipped in the
+  `rdg-hoh` return data for 2026-07-02 and produced a real ~10h gap with no
+  trains shown between ~07:35 and ~17:01). `_resolve_arrival()` fixes this
+  by picking, per departure, the earliest candidate arrival that actually
+  follows it — don't collapse `fetch_station_day`'s index back to
+  last-write-wins single dicts.
 
 ## Unverified assumptions — check these against real data, don't assume
 
@@ -417,6 +458,58 @@ the service worker and live-overlay behaviour are both meaningfully
 different in a real HTTPS context vs `file://` or `localhost`. If you add
 local tooling, keep it optional and don't make the repo depend on a build
 step — the whole point is that `index.html` works by being fetched as-is.
+
+### Automated tests
+
+There's a real, CI-enforced test suite (`.github/workflows/test.yml`, runs
+on every push/PR) covering the pure logic in both `scripts/fetch_schedule.py`
+and `app.js`/`sw.js` — the parts of this codebase that have actually shipped
+real, silent bugs before (3am day-boundary math, RTT identity-recycling
+joins, connection pairing, overtaking, live-overlay delay/cancellation
+projection, the SW's stale-while-revalidate change detection). It's
+optional local tooling per the rule above — no dependency is required to
+run the app itself, only to run the tests.
+
+- **Python** (`scripts/test_fetch_schedule.py`, stdlib `unittest` + `mock`,
+  zero extra dependencies beyond `scripts/requirements.txt`): every RTT API
+  call is mocked, so no network or real `RTT_TOKEN` is needed. Run with
+  `python3 scripts/test_fetch_schedule.py` or
+  `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+- **JS** (`test/*.test.js`, Node's built-in `node:test` — no npm
+  dependencies at all, deliberately, to keep with the no-build-step rule
+  above): `app.js` and `sw.js` are classic (non-module) scripts, so
+  `test/loadApp.js`/`test/loadSw.js` load them into a fresh Node `vm`
+  context against a minimal hand-rolled `document`/`window`/`self` stub
+  (not jsdom — see those files' header comments for why this works and
+  what it deliberately doesn't cover) and read back their top-level
+  `function`-declared identifiers to test directly. `loadApp()` also
+  accepts a fixed `now` to test the 3am day-boundary logic deterministically.
+  Run with `node --test` (bare — a path argument like `node --test test/`
+  does *not* do directory discovery the way you'd expect; the CI workflow
+  and `npm test` both use the bare form) or `npm test`.
+- `loadApp()`'s `document.getElementById()` stub returns the *same* element
+  instance for a given id every call (a real DOM does too), with a real
+  Set-backed `classList` and a capturing `addEventListener` — not a no-op
+  stub — so tests can observe state a function mutated (e.g.
+  `setLiveStatus()` toggling a class) or trigger a listener app.js's
+  top-level code registered (e.g. a click handler) via the test-only
+  `el._trigger(type, event)` hook. The registry itself is exposed as
+  `ctx.__elements` (a `Map`) for tests to reach in with
+  `ctx.__elements.get('some-id')`.
+- Cross-realm gotcha if you add more object-returning function tests: a
+  plain object/array a vm-loaded function *constructs and returns* has that
+  vm context's `Object.prototype`, not the test file's — `assert.deepEqual`
+  under `node:assert/strict` checks prototype identity and will fail on
+  structurally-identical data for this reason alone. Round-trip through the
+  `plain()` helper in the test files before comparing (see its comment).
+  Objects the test file constructs and merely *passes into* a vm function
+  (e.g. `overtakers()`'s pool of legs) don't have this problem — they keep
+  the test file's own realm.
+
+What's deliberately **not** covered here, because it needs a real browser/
+real HTTPS and can't be meaningfully mocked: the service worker's actual
+fetch-interception/caching behavior end-to-end, and the Darwin live-overlay
+fetch — see the manual recipe below for the latter.
 
 ### Testing the live overlay end-to-end from a Claude Code sandbox
 
