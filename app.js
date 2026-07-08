@@ -642,6 +642,9 @@ function setLiveStatus(state, text) {
   label.textContent = text;
   hdr.classList.remove('live-on', 'live-stale', 'live-error');
   if (state !== 'off') hdr.classList.add('live-' + state);
+  // No key saved: the whole status bar doubles as a shortcut to Settings
+  // (see the status-bar click handler below) — flag it as such visually.
+  document.getElementById('status-bar').classList.toggle('clickable', state === 'off');
 }
 
 function updateLiveErrorIndicator() {
@@ -659,7 +662,7 @@ async function refreshLiveOverlay() {
   updateLiveErrorIndicator();
 
   if (!apiKey()) {
-    setLiveStatus('off', 'Scheduled times');
+    setLiveStatus('off', 'Scheduled times only — tap ⚙ for live platforms & delays');
     return;
   }
 
@@ -844,9 +847,16 @@ document.querySelectorAll('.tab').forEach(btn => {
 });
 
 // ── Settings panel ──────────────────────────────────────────────────
-document.getElementById('btn-settings').addEventListener('click', () => {
+function openSettings() {
   document.getElementById('api-key-input').value = apiKey();
   document.getElementById('settings-overlay').classList.add('open');
+}
+document.getElementById('btn-settings').addEventListener('click', openSettings);
+// Lets visitors act on the "tap ⚙ for live updates" status-bar hint (shown
+// when no key is saved, e.g. after clearing site data) without hunting for
+// the small gear icon.
+document.getElementById('status-bar').addEventListener('click', () => {
+  if (!apiKey()) openSettings();
 });
 document.getElementById('btn-settings-close').addEventListener('click', () => {
   document.getElementById('settings-overlay').classList.remove('open');
