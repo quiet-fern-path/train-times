@@ -489,3 +489,61 @@ describe('legCacheKey() — direct vs connection legs keyed differently for the 
     assert.equal(ctx.legCacheKey({ uid1: 'A1', uid2: 'B1' }, true), 'A1|B1');
   });
 });
+
+describe('setLiveStatus() — status bar reflects live-data state, including the missing-key case', () => {
+  // Regression for a real bug: a visitor without a saved key (e.g. after
+  // clearing site data) saw no live overlay and no visible explanation
+  // anywhere — the status bar existed but wasn't flagged as actionable.
+  test('the "off" (no key) state marks the status bar clickable', () => {
+    const ctx = loadApp();
+    ctx.setLiveStatus('off', 'Scheduled times only — tap ⚙ for live platforms & delays');
+    assert.equal(ctx.__elements.get('status-bar').classList.contains('clickable'), true);
+  });
+
+  test('every other state leaves the status bar non-clickable', () => {
+    const ctx = loadApp();
+    for (const state of ['on', 'stale', 'error']) {
+      ctx.setLiveStatus(state, 'text');
+      assert.equal(ctx.__elements.get('status-bar').classList.contains('clickable'), false, `state=${state}`);
+    }
+  });
+
+  test('sets the live-dot class and live-label text', () => {
+    const ctx = loadApp();
+    ctx.setLiveStatus('stale', 'Showing last known live data');
+    assert.equal(ctx.__elements.get('live-dot').className, 'live-dot stale');
+    assert.equal(ctx.__elements.get('live-label').textContent, 'Showing last known live data');
+  });
+
+  test('the "off" state clears the dot\'s state class and the header\'s live-* classes', () => {
+    const ctx = loadApp();
+    ctx.setLiveStatus('error', 'text'); // start from a non-off state
+    ctx.setLiveStatus('off', 'Scheduled times');
+    assert.equal(ctx.__elements.get('live-dot').className, 'live-dot');
+    assert.equal(ctx.__elements.get('hdr').classList.contains('live-error'), false);
+  });
+});
+
+describe('openSettings() and the status-bar click-to-settings shortcut', () => {
+  test('openSettings() populates the key input and opens the settings overlay', () => {
+    const ctx = loadApp();
+    ctx.localStorage.setItem('darwinApiKey', 'my-key');
+    ctx.openSettings();
+    assert.equal(ctx.__elements.get('api-key-input').value, 'my-key');
+    assert.equal(ctx.__elements.get('settings-overlay').classList.contains('open'), true);
+  });
+
+  test('clicking the status bar opens Settings only when no key is saved', () => {
+    const ctx = loadApp();
+    ctx.__elements.get('status-bar')._trigger('click');
+    assert.equal(ctx.__elements.get('settings-overlay').classList.contains('open'), true);
+  });
+
+  test('clicking the status bar is a no-op when a key is already saved', () => {
+    const ctx = loadApp();
+    ctx.localStorage.setItem('darwinApiKey', 'my-key');
+    ctx.__elements.get('status-bar')._trigger('click');
+    // openSettings() never ran, so it never even touched settings-overlay.
+    assert.equal(ctx.__elements.has('settings-overlay'), false);
+  });
+});

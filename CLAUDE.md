@@ -487,6 +487,15 @@ run the app itself, only to run the tests.
   Run with `node --test` (bare — a path argument like `node --test test/`
   does *not* do directory discovery the way you'd expect; the CI workflow
   and `npm test` both use the bare form) or `npm test`.
+- `loadApp()`'s `document.getElementById()` stub returns the *same* element
+  instance for a given id every call (a real DOM does too), with a real
+  Set-backed `classList` and a capturing `addEventListener` — not a no-op
+  stub — so tests can observe state a function mutated (e.g.
+  `setLiveStatus()` toggling a class) or trigger a listener app.js's
+  top-level code registered (e.g. a click handler) via the test-only
+  `el._trigger(type, event)` hook. The registry itself is exposed as
+  `ctx.__elements` (a `Map`) for tests to reach in with
+  `ctx.__elements.get('some-id')`.
 - Cross-realm gotcha if you add more object-returning function tests: a
   plain object/array a vm-loaded function *constructs and returns* has that
   vm context's `Object.prototype`, not the test file's — `assert.deepEqual`

@@ -24,16 +24,36 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// A real (Set-backed) classList and a capturing addEventListener, so tests
+// can both observe state changes (e.g. setLiveStatus() toggling a class)
+// and invoke registered handlers directly (e.g. a click listener) — a
+// plain no-op stub can't support either. getElementById() below returns
+// the *same* element instance for a given id every time (a real DOM does
+// too), so mutations/listeners made during app.js's top-level script
+// execution are still visible/triggerable from test code afterward.
 function makeElement() {
+  const classes = new Set();
+  const listeners = {};
   return {
     value: '',
     textContent: '',
     innerHTML: '',
     style: { setProperty() {}, removeProperty() {}, getPropertyValue() { return ''; } },
     dataset: {},
-    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-    addEventListener() {},
+    classList: {
+      add: (...names) => names.forEach((n) => classes.add(n)),
+      remove: (...names) => names.forEach((n) => classes.delete(n)),
+      toggle: (name, force) => {
+        const on = force === undefined ? !classes.has(name) : !!force;
+        if (on) classes.add(name); else classes.delete(name);
+        return on;
+      },
+      contains: (name) => classes.has(name),
+    },
+    addEventListener: (type, handler) => { (listeners[type] = listeners[type] || []).push(handler); },
     removeEventListener() {},
+    // Test-only hook (not a real DOM API) to invoke a registered listener.
+    _trigger(type, event) { (listeners[type] || []).forEach((h) => h(event)); },
     querySelector() { return null; },
     querySelectorAll() { return []; },
     getBoundingClientRect() { return { top: 0 }; },
@@ -68,9 +88,13 @@ function loadApp({ now } = {}) {
     }
   }
 
+  const elements = new Map();
   const sandbox = {
     document: {
-      getElementById: () => makeElement(),
+      getElementById: (id) => {
+        if (!elements.has(id)) elements.set(id, makeElement());
+        return elements.get(id);
+      },
       querySelector: () => null,
       querySelectorAll: () => [],
       documentElement: { style: { setProperty() {}, getPropertyValue() { return ''; } } },
@@ -96,6 +120,10 @@ function loadApp({ now } = {}) {
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
+  // Test-only hook (not a real DOM API): lets tests inspect/trigger the
+  // same per-id elements app.js's top-level code registered listeners on
+  // and mutated, e.g. ctx.__elements.get('status-bar')._trigger('click').
+  sandbox.__elements = elements;
 
   const context = vm.createContext(sandbox);
   const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
