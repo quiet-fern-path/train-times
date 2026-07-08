@@ -38,6 +38,9 @@ different auth models, and different failure-degradation requirements.
 | `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
 | `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
 | `.github/workflows/refresh-platforms.yml` | Cheap platform-only fetch: daily cron (03:10 UTC) + manual trigger. Runs `fetch_schedule.py --platforms-only` — see below. |
+| `scripts/test_fetch_schedule.py` | Python test suite (stdlib `unittest`) — see "Automated tests" below. |
+| `test/*.test.js`, `test/loadApp.js`, `test/loadSw.js` | JS test suite (Node's built-in `node:test`) — see "Automated tests" below. |
+| `.github/workflows/test.yml` | Runs both test suites on every push/PR. |
 
 ## Two separate credentials — don't mix them up
 
@@ -455,6 +458,49 @@ the service worker and live-overlay behaviour are both meaningfully
 different in a real HTTPS context vs `file://` or `localhost`. If you add
 local tooling, keep it optional and don't make the repo depend on a build
 step — the whole point is that `index.html` works by being fetched as-is.
+
+### Automated tests
+
+There's a real, CI-enforced test suite (`.github/workflows/test.yml`, runs
+on every push/PR) covering the pure logic in both `scripts/fetch_schedule.py`
+and `app.js`/`sw.js` — the parts of this codebase that have actually shipped
+real, silent bugs before (3am day-boundary math, RTT identity-recycling
+joins, connection pairing, overtaking, live-overlay delay/cancellation
+projection, the SW's stale-while-revalidate change detection). It's
+optional local tooling per the rule above — no dependency is required to
+run the app itself, only to run the tests.
+
+- **Python** (`scripts/test_fetch_schedule.py`, stdlib `unittest` + `mock`,
+  zero extra dependencies beyond `scripts/requirements.txt`): every RTT API
+  call is mocked, so no network or real `RTT_TOKEN` is needed. Run with
+  `python3 scripts/test_fetch_schedule.py` or
+  `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+- **JS** (`test/*.test.js`, Node's built-in `node:test` — no npm
+  dependencies at all, deliberately, to keep with the no-build-step rule
+  above): `app.js` and `sw.js` are classic (non-module) scripts, so
+  `test/loadApp.js`/`test/loadSw.js` load them into a fresh Node `vm`
+  context against a minimal hand-rolled `document`/`window`/`self` stub
+  (not jsdom — see those files' header comments for why this works and
+  what it deliberately doesn't cover) and read back their top-level
+  `function`-declared identifiers to test directly. `loadApp()` also
+  accepts a fixed `now` to test the 3am day-boundary logic deterministically.
+  Run with `node --test` (bare — a path argument like `node --test test/`
+  does *not* do directory discovery the way you'd expect; the CI workflow
+  and `npm test` both use the bare form) or `npm test`.
+- Cross-realm gotcha if you add more object-returning function tests: a
+  plain object/array a vm-loaded function *constructs and returns* has that
+  vm context's `Object.prototype`, not the test file's — `assert.deepEqual`
+  under `node:assert/strict` checks prototype identity and will fail on
+  structurally-identical data for this reason alone. Round-trip through the
+  `plain()` helper in the test files before comparing (see its comment).
+  Objects the test file constructs and merely *passes into* a vm function
+  (e.g. `overtakers()`'s pool of legs) don't have this problem — they keep
+  the test file's own realm.
+
+What's deliberately **not** covered here, because it needs a real browser/
+real HTTPS and can't be meaningfully mocked: the service worker's actual
+fetch-interception/caching behavior end-to-end, and the Darwin live-overlay
+fetch — see the manual recipe below for the latter.
 
 ### Testing the live overlay end-to-end from a Claude Code sandbox
 

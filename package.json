@@ -1,0 +1,7 @@
+{
+  "name": "train-times",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
