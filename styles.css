@@ -5,6 +5,7 @@
   --next-bg:#f0fdf5;--past-op:0.38;--radius:10px;
   --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.05);
   --header-h:128px;
+  --tab-h:35px;
 }
 body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100dvh}
 
@@ -38,7 +39,16 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .tab.active{color:#fff;border-bottom-color:var(--red)}
 
 /* STATUS BAR */
-.status-bar{padding:6px 14px;font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg);border-bottom:1px solid #dde0e8}
+/* Sticky (stacked below .tab-bar, same pattern as .tab-bar below .site-header)
+   so the live-status text — the only place the "no key saved" nudge and the
+   error/stale wording actually live — can't get scrolled out of view by
+   scrollToNextIfToday()'s jump past already-departed trains. Before this it
+   was a plain in-flow element and scrolled off-screen (sometimes hundreds of
+   px) on every "today" load, which is exactly why a missing-key state could
+   look like total silence instead of a visible message. */
+.status-bar{position:sticky;top:calc(var(--header-h) + var(--tab-h));z-index:98;padding:6px 14px;font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg);border-bottom:1px solid #dde0e8}
+.status-bar.clickable{cursor:pointer}
+.status-bar.clickable #live-label{text-decoration:underline dotted}
 .live-dot{width:7px;height:7px;border-radius:50%;background:#9ca3af;flex-shrink:0}
 .live-dot.on{background:#059669}
 .live-dot.stale{background:#f59e0b}
