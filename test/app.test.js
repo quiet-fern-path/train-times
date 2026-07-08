@@ -142,6 +142,80 @@ describe('matchByTime()', () => {
     assert.equal(ctx.matchByTime(null, '07:03'), null);
     assert.equal(ctx.matchByTime({}, '07:03'), null);
   });
+
+  describe('TOC disambiguation — regression for two services sharing a scheduled minute', () => {
+    // Two services can share an exact scheduled departure minute (e.g. GWR
+    // and Elizabeth line both at 18:48 ex-Paddington) — std alone picked
+    // whichever the Darwin board listed first, silently misattributing live
+    // delay/platform/cancellation to the wrong train.
+    test('prefers the candidate whose operatorCode matches the given toc', () => {
+      const ctx = loadApp();
+      const board = { trainServices: [{ std: '18:48', operatorCode: 'XR', etd: 'On time' }, { std: '18:48', operatorCode: 'GW', etd: '10 late' }] };
+      assert.equal(ctx.matchByTime(board, '18:48', 'GW').etd, '10 late');
+      assert.equal(ctx.matchByTime(board, '18:48', 'XR').etd, 'On time');
+    });
+
+    test('falls back to first-match-wins when toc is omitted', () => {
+      const ctx = loadApp();
+      const board = { trainServices: [{ std: '18:48', operatorCode: 'XR' }, { std: '18:48', operatorCode: 'GW' }] };
+      assert.equal(ctx.matchByTime(board, '18:48').operatorCode, 'XR');
+    });
+
+    test('falls back to first-match-wins when toc matches none of the candidates', () => {
+      const ctx = loadApp();
+      const board = { trainServices: [{ std: '18:48', operatorCode: 'XR' }, { std: '18:48', operatorCode: 'GW' }] };
+      assert.equal(ctx.matchByTime(board, '18:48', 'LM').operatorCode, 'XR');
+    });
+
+    test('a single candidate is returned regardless of toc (no ambiguity to resolve)', () => {
+      const ctx = loadApp();
+      const board = { trainServices: [{ std: '07:03', operatorCode: 'GW' }] };
+      assert.equal(ctx.matchByTime(board, '07:03', 'XR').operatorCode, 'GW');
+    });
+  });
+});
+
+describe('findCallingPoint() — live arrival data at a downstream stop, no extra API call', () => {
+  test('finds the calling point matching the given crs', () => {
+    const ctx = loadApp();
+    const svc = { subsequentCallingPoints: [{ callingPoint: [{ crs: 'TWY', et: '07:47' }, { crs: 'OXF', et: '08:20' }] }] };
+    assert.equal(ctx.findCallingPoint(svc, 'TWY').et, '07:47');
+  });
+
+  test('searches every call-point list, not just the first (services that divide)', () => {
+    const ctx = loadApp();
+    const svc = {
+      subsequentCallingPoints: [
+        { callingPoint: [{ crs: 'TWY', et: '07:47' }] },
+        { callingPoint: [{ crs: 'HOT', et: '08:05' }] },
+      ],
+    };
+    assert.equal(ctx.findCallingPoint(svc, 'HOT').et, '08:05');
+  });
+
+  test('returns null when the crs is never called at, or there are no calling points', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.findCallingPoint({ subsequentCallingPoints: [] }, 'TWY'), null);
+    assert.equal(ctx.findCallingPoint({}, 'TWY'), null);
+    const svc = { subsequentCallingPoints: [{ callingPoint: [{ crs: 'OXF' }] }] };
+    assert.equal(ctx.findCallingPoint(svc, 'TWY'), null);
+  });
+});
+
+describe('inlineLiveTime() — compact struck-through-scheduled live time for the change row', () => {
+  test('no live time, or live equals scheduled -> plain scheduled text', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.inlineLiveTime('07:15', null), '07:15');
+    assert.equal(ctx.inlineLiveTime('07:15', '07:15'), '07:15');
+  });
+
+  test('a differing live time is shown with the scheduled time struck through', () => {
+    const ctx = loadApp();
+    const html = ctx.inlineLiveTime('07:15', '07:20');
+    assert.match(html, /line-through/);
+    assert.match(html, /07:15/);
+    assert.match(html, /07:20/);
+  });
 });
 
 describe('applyDirectOverlay() — cancellation + delay projection onto direct legs', () => {
@@ -191,6 +265,60 @@ describe('applyDirectOverlay() — cancellation + delay projection onto direct l
     ctx.applyDirectOverlay([leg], '2026-07-02', null);
     assert.equal(leg._delayMins, 5);
   });
+
+  describe('destination live arrival (_liveArr) — fixes a real pre-existing gap', () => {
+    // directCard already read leg._liveArr || leg.arr, but nothing ever set
+    // _liveArr, so every arrival shown was scheduled-only regardless of
+    // actual delay. Read from the matched service's own
+    // subsequentCallingPoints (already fetched, filtered `to` destCrs) — no
+    // extra API call.
+    test('a delayed calling point sets _liveArr to the estimated time', () => {
+      const ctx = loadApp();
+      const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:27' };
+      const board = {
+        trainServices: [{
+          std: '07:03', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', et: '09:13' }] }],
+        }],
+      };
+      ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+      assert.equal(leg._liveArr, '09:13');
+    });
+
+    test('an on-time calling point sets _liveArr to the scheduled arrival', () => {
+      const ctx = loadApp();
+      const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:27' };
+      const board = {
+        trainServices: [{
+          std: '07:03', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', et: 'On time' }] }],
+        }],
+      };
+      ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+      assert.equal(leg._liveArr, '07:27');
+    });
+
+    test('a cancelled destination calling point marks the whole leg cancelled', () => {
+      const ctx = loadApp();
+      const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:27' };
+      const board = {
+        trainServices: [{
+          std: '07:03', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', isCancelled: true }] }],
+        }],
+      };
+      ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+      assert.equal(leg._cancelled, true);
+    });
+
+    test('no matching calling point for destCrs leaves _liveArr unset (falls back to scheduled at render time)', () => {
+      const ctx = loadApp();
+      const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:27' };
+      const board = { trainServices: [{ std: '07:03', etd: 'On time', subsequentCallingPoints: [] }] };
+      ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+      assert.equal(leg._liveArr, undefined);
+    });
+  });
 });
 
 describe('applyConnectionOverlay() — cancellation/delay projection onto both legs of a connection', () => {
@@ -237,6 +365,81 @@ describe('applyConnectionOverlay() — cancellation/delay projection onto both l
     ctx.applyConnectionOverlay([leg], '2026-07-02', null, null);
     assert.equal(leg._cancelledLeg, 1);
     assert.equal(leg._liveDepM, 428);
+  });
+
+  describe('live arrival at the change station (_liveChangeArr) — preferred over projecting delay forward', () => {
+    // A GetArrBoardWithDetails query at the change station returns HTTP 500
+    // in live testing (see CLAUDE.md) — the real live arrival there comes
+    // from leg-1's own departure-board match's subsequentCallingPoints
+    // instead, no extra API call.
+    test('a real calling-point arrival estimate is preferred over the origin-delay projection', () => {
+      const ctx = loadApp();
+      const leg = baseLeg();
+      // Origin delay alone would project change-arrival to 435+5=440 and
+      // leave only 438-440=-2 min for the connection (see the test above),
+      // but the calling point says it actually only ran 2 min late into
+      // Twyford (437), leaving a comfortable 1 min — the calling point
+      // estimate should win, not the cruder projection.
+      const boardA = {
+        trainServices: [{
+          std: '07:03', etd: '07:08',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'TWY', et: '07:17' }] }],
+        }],
+      };
+      ctx.applyConnectionOverlay([leg], '2026-07-02', boardA, null, 'TWY');
+      assert.equal(leg._liveChangeArr, '07:17');
+      assert.equal(leg._liveChangeMins, 438 - 437);
+    });
+
+    test('falls back to the origin-delay projection when no calling point is found', () => {
+      const ctx = loadApp();
+      const leg = baseLeg();
+      const boardA = { trainServices: [{ std: '07:03', etd: '07:08', subsequentCallingPoints: [] }] };
+      ctx.applyConnectionOverlay([leg], '2026-07-02', boardA, null, 'TWY');
+      assert.equal(leg._liveChangeArr, undefined);
+      assert.equal(leg._liveChangeMins, -2); // same as the plain-projection test above
+    });
+
+    test('a cancelled change-station calling point marks leg-1 cancelled', () => {
+      const ctx = loadApp();
+      const leg = baseLeg();
+      const boardA = {
+        trainServices: [{
+          std: '07:03', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'TWY', isCancelled: true }] }],
+        }],
+      };
+      ctx.applyConnectionOverlay([leg], '2026-07-02', boardA, null, 'TWY');
+      assert.equal(leg._cancelledLeg, 1);
+    });
+  });
+
+  describe('final destination live arrival (_liveArr) via leg-2\'s calling points', () => {
+    test('a delayed destination calling point on leg-2 sets _liveArr', () => {
+      const ctx = loadApp();
+      const leg = Object.assign(baseLeg(), { arr: '07:27' });
+      const boardB = {
+        trainServices: [{
+          std: '07:18', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'HOT', et: '07:35' }] }],
+        }],
+      };
+      ctx.applyConnectionOverlay([leg], '2026-07-02', null, boardB, 'TWY', 'HOT');
+      assert.equal(leg._liveArr, '07:35');
+    });
+
+    test('a cancelled destination calling point on leg-2 marks leg-2 cancelled', () => {
+      const ctx = loadApp();
+      const leg = Object.assign(baseLeg(), { arr: '07:27' });
+      const boardB = {
+        trainServices: [{
+          std: '07:18', etd: 'On time',
+          subsequentCallingPoints: [{ callingPoint: [{ crs: 'HOT', isCancelled: true }] }],
+        }],
+      };
+      ctx.applyConnectionOverlay([leg], '2026-07-02', null, boardB, 'TWY', 'HOT');
+      assert.equal(leg._cancelledLeg, 2);
+    });
   });
 });
 

@@ -26,7 +26,7 @@ import fetch_schedule as fs  # noqa: E402
 
 def make_svc(uid, service_date, dep_iso=None, arr_iso=None, display_as="CALL",
              in_passenger_service=True, platform_planned=None, platform_actual=None,
-             operator="GW"):
+             platform_forecast=None, operator="GW"):
     """Build a minimal RTT /gb-nr/location service item, shaped like the
     real API response (see CLAUDE.md's "New RTT API" section)."""
     svc = {
@@ -38,7 +38,11 @@ def make_svc(uid, service_date, dep_iso=None, arr_iso=None, display_as="CALL",
         },
         "temporalData": {"displayAs": display_as},
         "locationMetadata": {
-            "platform": {"planned": platform_planned, "actual": platform_actual}
+            "platform": {
+                "planned": platform_planned,
+                "actual": platform_actual,
+                "forecast": platform_forecast,
+            }
         },
     }
     if dep_iso:
@@ -129,6 +133,30 @@ class TestPassengerParsing(unittest.TestCase):
 
     def test_parse_dep_none_without_departure_time(self):
         self.assertIsNone(fs.parse_dep(make_svc("U1", "2026-07-02")))
+
+    def test_parse_dep_falls_back_to_forecast_platform_when_planned_is_absent(self):
+        # RTT's real (WTT-booked) `planned` platform is only populated for
+        # the calendar day a query is made — confirmed live: 100% same-day
+        # vs 0% a week ahead. `forecast` (a prediction, mutually exclusive
+        # with `planned`) is what fills the other 89 days of the lookahead.
+        svc = make_svc("U1", "2026-07-02", dep_iso="2026-07-02T07:54:00", platform_forecast="4")
+        self.assertEqual(fs.parse_dep(svc)["platform"], "4")
+
+    def test_parse_dep_prefers_planned_over_forecast_when_both_present(self):
+        svc = make_svc("U1", "2026-07-02", dep_iso="2026-07-02T07:54:00",
+                        platform_planned="3", platform_forecast="4")
+        self.assertEqual(fs.parse_dep(svc)["platform"], "3")
+
+    def test_parse_dep_platform_confirmed_still_based_on_actual_not_forecast(self):
+        # A forecast platform is a prediction, not a live confirmation —
+        # platformConfirmed must stay false even though a platform value is
+        # now present, exactly as it would with planned+no actual.
+        svc = make_svc("U1", "2026-07-02", dep_iso="2026-07-02T07:54:00", platform_forecast="4")
+        self.assertFalse(fs.parse_dep(svc)["platformConfirmed"])
+
+    def test_parse_dep_platform_none_when_neither_planned_nor_forecast_present(self):
+        svc = make_svc("U1", "2026-07-02", dep_iso="2026-07-02T07:54:00")
+        self.assertIsNone(fs.parse_dep(svc)["platform"])
 
     def test_parse_arr_extracts_fields(self):
         svc = make_svc("U1", "2026-07-02", arr_iso="2026-07-02T08:12:00")
@@ -510,6 +538,187 @@ class TestMainRoutesMerge(unittest.TestCase):
         with patch.object(sys, "argv", ["fetch_schedule.py", "--routes", "nonexistent"]):
             with self.assertRaises(SystemExit):
                 fs.main()
+
+
+class TestMergePlatformsForToday(unittest.TestCase):
+    """--platforms-only: a cheap daily refresh of just today's platform
+    fields, matched by (uid, serviceDate) — must never touch any other
+    field or any other day's legs (see merge_platforms_for_today's
+    docstring: this is deliberately not the --routes whole-route merge,
+    which would wipe out the other 89 days of data)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.orig_cwd)
+
+        self.routes = [
+            {"id": "rdg-oxf", "from": "RDG", "to": "OXF"},
+            {"id": "rdg-hoh", "from": "RDG", "to": "HOT", "change": "TWY", "minConnectionMins": 3},
+        ]
+
+    def _run_quietly(self, fn, *args, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(*args, **kwargs)
+
+    def test_direct_route_updates_only_platform_fields_of_matched_leg(self):
+        os.makedirs("data", exist_ok=True)
+        existing = {
+            "routes": {
+                "rdg-oxf": {
+                    "out": [{
+                        "uid": "U1", "serviceDate": "2026-07-08",
+                        "dep": "07:03", "depM": 423, "arr": "07:40", "arrM": 460,
+                        "platform": None, "platformConfirmed": False,
+                    }],
+                    "ret": [],
+                },
+            },
+            "generated_at": "2026-01-01T00:00:00Z",
+        }
+        with open("data/schedule.json", "w") as f:
+            json.dump(existing, f)
+
+        fresh = {
+            "out": [{
+                "uid": "U1", "serviceDate": "2026-07-08",
+                "dep": "07:03", "depM": 423, "arr": "07:40", "arrM": 460,
+                "platform": "2", "platformConfirmed": True,
+            }],
+            "ret": [],
+        }
+        with patch.object(fs, "fetch_direct", return_value=fresh) as mock_fetch:
+            self._run_quietly(fs.merge_platforms_for_today, self.routes)
+
+        # Only today's single-day window was queried, not the 90-day lookahead.
+        self.assertEqual(mock_fetch.call_args.args[2], [fs.date.today()])
+
+        with open("data/schedule.json") as f:
+            result = json.load(f)
+        leg = result["routes"]["rdg-oxf"]["out"][0]
+        self.assertEqual(leg["platform"], "2")
+        self.assertTrue(leg["platformConfirmed"])
+        # Every other field is untouched.
+        self.assertEqual(leg["dep"], "07:03")
+        self.assertEqual(leg["arr"], "07:40")
+        self.assertEqual(leg["arrM"], 460)
+
+    def test_connection_route_updates_platform1_and_platform2(self):
+        os.makedirs("data", exist_ok=True)
+        existing = {
+            "routes": {
+                "rdg-hoh": {
+                    "out": [{
+                        "uid1": "A1", "serviceDate1": "2026-07-08",
+                        "uid2": "B1", "serviceDate2": "2026-07-08",
+                        "dep": "07:03", "changeDep": "07:18", "arr": "07:40",
+                        "platform1": None, "platform1Confirmed": False,
+                        "platform2": None, "platform2Confirmed": False,
+                    }],
+                    "ret": [],
+                },
+            },
+            "generated_at": "2026-01-01T00:00:00Z",
+        }
+        with open("data/schedule.json", "w") as f:
+            json.dump(existing, f)
+
+        fresh = {
+            "out": [{
+                "uid1": "A1", "serviceDate1": "2026-07-08",
+                "uid2": "B1", "serviceDate2": "2026-07-08",
+                "platform1": "1", "platform1Confirmed": True,
+                "platform2": "3", "platform2Confirmed": True,
+            }],
+            "ret": [],
+        }
+        with patch.object(fs, "fetch_connection", return_value=fresh):
+            self._run_quietly(fs.merge_platforms_for_today, self.routes)
+
+        with open("data/schedule.json") as f:
+            result = json.load(f)
+        leg = result["routes"]["rdg-hoh"]["out"][0]
+        self.assertEqual(leg["platform1"], "1")
+        self.assertEqual(leg["platform2"], "3")
+        self.assertEqual(leg["dep"], "07:03")  # untouched
+
+    def test_leg_with_no_matching_fresh_counterpart_is_untouched(self):
+        os.makedirs("data", exist_ok=True)
+        existing = {
+            "routes": {"rdg-oxf": {"out": [{
+                "uid": "U1", "serviceDate": "2026-07-08",
+                "platform": None, "platformConfirmed": False,
+            }], "ret": []}},
+            "generated_at": "2026-01-01T00:00:00Z",
+        }
+        with open("data/schedule.json", "w") as f:
+            json.dump(existing, f)
+
+        with patch.object(fs, "fetch_direct", return_value={"out": [], "ret": []}):
+            self._run_quietly(fs.merge_platforms_for_today, self.routes)
+
+        with open("data/schedule.json") as f:
+            result = json.load(f)
+        self.assertIsNone(result["routes"]["rdg-oxf"]["out"][0]["platform"])
+
+    def test_route_not_yet_in_existing_data_is_skipped(self):
+        os.makedirs("data", exist_ok=True)
+        with open("data/schedule.json", "w") as f:
+            json.dump({"routes": {}, "generated_at": "2026-01-01T00:00:00Z"}, f)
+
+        with patch.object(fs, "fetch_direct") as mock_fetch, \
+             patch.object(fs, "fetch_connection") as mock_conn:
+            self._run_quietly(fs.merge_platforms_for_today, self.routes)
+        mock_fetch.assert_not_called()
+        mock_conn.assert_not_called()
+
+    def test_missing_schedule_json_is_a_no_op(self):
+        with patch.object(fs, "fetch_direct") as mock_fetch:
+            self._run_quietly(fs.merge_platforms_for_today, self.routes)
+        mock_fetch.assert_not_called()
+        self.assertFalse(os.path.exists("data/schedule.json"))
+
+
+class TestPlatformsOnlyCli(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.orig_cwd)
+
+        self.routes = [
+            {"id": "rdg-oxf", "from": "RDG", "to": "OXF"},
+            {"id": "rdg-mai", "from": "RDG", "to": "MAI"},
+        ]
+        with open("routes.json", "w") as f:
+            json.dump(self.routes, f)
+
+    def _run_main_quietly(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            fs.main()
+
+    def test_platforms_only_calls_merge_not_the_full_fetch(self):
+        with patch.object(sys, "argv", ["fetch_schedule.py", "--platforms-only"]), \
+             patch.object(fs, "merge_platforms_for_today") as mock_merge, \
+             patch.object(fs, "fetch_direct") as mock_full_fetch:
+            self._run_main_quietly()
+        mock_merge.assert_called_once()
+        mock_full_fetch.assert_not_called()
+        # Called with every configured route (no --routes filter given).
+        called_routes = mock_merge.call_args.args[0]
+        self.assertEqual({r["id"] for r in called_routes}, {"rdg-oxf", "rdg-mai"})
+
+    def test_platforms_only_combined_with_routes_filter(self):
+        with patch.object(sys, "argv", ["fetch_schedule.py", "--platforms-only", "--routes", "rdg-mai"]), \
+             patch.object(fs, "merge_platforms_for_today") as mock_merge:
+            self._run_main_quietly()
+        called_routes = mock_merge.call_args.args[0]
+        self.assertEqual({r["id"] for r in called_routes}, {"rdg-mai"})
 
 
 if __name__ == "__main__":
