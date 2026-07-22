@@ -4,5 +4,6 @@
   { "id": "rdg-mai", "name": "Reading ↔ Maidenhead",        "from": "RDG", "to": "MAI", "change": null },
   { "id": "rdg-hoh", "name": "Reading ↔ Henley-on-Thames",  "from": "RDG", "to": "HOT", "change": "TWY", "minConnectionMins": 3 },
   { "id": "pad-hoh", "name": "London Paddington ↔ Henley-on-Thames", "from": "PAD", "to": "HOT", "change": "TWY", "minConnectionMins": 3 },
-  { "id": "kgx-cbg", "name": "Kings Cross ↔ Cambridge",     "from": "KGX", "to": "CBG", "change": null }
+  { "id": "kgx-cbg", "name": "Kings Cross ↔ Cambridge",     "from": "KGX", "to": "CBG", "change": null },
+  { "id": "rdg-ted", "name": "Reading ↔ Teddington",        "from": "RDG", "to": "TED", "change": "TWI", "minConnectionMins": 5 }
 ]
