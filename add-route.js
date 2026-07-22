@@ -121,6 +121,14 @@ function readdRoute(routes, parked, id) {
   return { routes: newRoutes, parked: newParked };
 }
 
+// Drop a parked route entirely — unlike removeRoute/readdRoute, this never
+// moves the config anywhere, it's gone. The only way back is re-adding it by
+// hand (or restoring parked-routes.json from git history). Returns a new
+// array; a no-op (same contents) if `id` isn't actually parked.
+function purgeParked(parked, id) {
+  return (parked || []).filter(function (r) { return r.id !== id; });
+}
+
 // Swap the route with `id` with its neighbour `delta` positions away
 // (-1 = move up/earlier, +1 = move down/later). Order matters to the main
 // app: ROUTES[0] is the initial active route and renderRoutePicker() shows
@@ -195,6 +203,14 @@ function stageReadd(stage, id) {
   return {
     base: stage.base, routes: next.routes, stations: stage.stations, parked: next.parked,
     log: stage.log.concat(['Re-add ' + id])
+  };
+}
+
+function stageDelete(stage, id) {
+  return {
+    base: stage.base, routes: stage.routes, stations: stage.stations,
+    parked: purgeParked(stage.parked, id),
+    log: stage.log.concat(['Permanently delete ' + id])
   };
 }
 
@@ -448,13 +464,21 @@ async function refreshLists() {
       var span = document.createElement('span');
       var pending = STAGE && !routeExists(STAGE.base.parked, r.id);
       span.textContent = routeLabel(r) + (pending ? ' (pending)' : '');
-      var btn = document.createElement('button');
-      btn.className = 'btn-save manage-btn';
-      btn.textContent = 'Re-add';
-      btn.disabled = !hasToken();
-      btn.addEventListener('click', function () { onReadd(r.id); });
+      var readdBtn = document.createElement('button');
+      readdBtn.className = 'btn-save manage-btn';
+      readdBtn.textContent = 'Re-add';
+      readdBtn.disabled = !hasToken();
+      readdBtn.addEventListener('click', function () { onReadd(r.id); });
+
+      var deleteBtn = document.createElement('button');
+      deleteBtn.className = 'manage-btn manage-btn-danger';
+      deleteBtn.textContent = 'Delete forever';
+      deleteBtn.disabled = !hasToken();
+      deleteBtn.addEventListener('click', function () { onDelete(r.id); });
+
       row.appendChild(span);
-      row.appendChild(btn);
+      row.appendChild(readdBtn);
+      row.appendChild(deleteBtn);
       parkedEl.appendChild(row);
     });
     if (parkedSection) parkedSection.style.display = parked.length ? 'block' : 'none';
@@ -579,6 +603,20 @@ async function onReadd(id) {
   }
   STAGE = stageReadd(STAGE, id);
   setStatus('Queued: re-add ' + id + '.', 'ok');
+  await refreshLists();
+}
+
+async function onDelete(id) {
+  if (!confirm('Permanently delete "' + id + '"? Unlike Remove, this does NOT park it — ' +
+      'once submitted there is no button to get it back. Continue?')) return;
+  try {
+    await ensureStage();
+  } catch (e) {
+    setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    return;
+  }
+  STAGE = stageDelete(STAGE, id);
+  setStatus('Queued: permanently delete ' + id + '. Nothing is gone until you submit.', 'ok');
   await refreshLists();
 }
 
