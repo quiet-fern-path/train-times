@@ -60,6 +60,62 @@ test('mergeRoute appends without mutating the input', () => {
   assert.equal(routes.length, 1);
 });
 
+test('buildRoute builds a direct route (no minConnectionMins key)', () => {
+  const ctx = loadAddRoute();
+  const names = { RDG: 'Reading', BRI: 'Bristol Temple Meads' };
+  const route = ctx.buildRoute('RDG', 'BRI', names);
+  assert.deepEqual(plain(route), {
+    id: 'rdg-bri', name: 'Reading ↔ Bristol Temple Meads', from: 'RDG', to: 'BRI', change: null,
+  });
+  assert.ok(!('minConnectionMins' in route));
+});
+
+test('buildRoute builds a connection route with the given minConnectionMins', () => {
+  const ctx = loadAddRoute();
+  const names = { RDG: 'Reading', HOT: 'Henley-On-Thames', TWY: 'Twyford' };
+  const route = ctx.buildRoute('RDG', 'HOT', names, { change: 'TWY', minConnectionMins: 4 });
+  assert.deepEqual(plain(route), {
+    id: 'rdg-hot', name: 'Reading ↔ Henley-On-Thames', from: 'RDG', to: 'HOT',
+    change: 'TWY', minConnectionMins: 4,
+  });
+});
+
+test('buildRoute defaults minConnectionMins to 5 when a connection omits it', () => {
+  const ctx = loadAddRoute();
+  const route = ctx.buildRoute('RDG', 'HOT', {}, { change: 'TWY' });
+  assert.equal(route.minConnectionMins, 5);
+});
+
+// ── moveRoute (reordering) ────────────────────────────────────────────────
+
+test('moveRoute swaps a route with its next-lower neighbour (delta -1)', () => {
+  const ctx = loadAddRoute();
+  const routes = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  const out = ctx.moveRoute(routes, 'b', -1);
+  assert.deepEqual(plain(out).map((r) => r.id), ['b', 'a', 'c']);
+  assert.deepEqual(routes.map((r) => r.id), ['a', 'b', 'c']); // unmutated
+});
+
+test('moveRoute swaps a route with its next-higher neighbour (delta +1)', () => {
+  const ctx = loadAddRoute();
+  const routes = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  const out = ctx.moveRoute(routes, 'b', 1);
+  assert.deepEqual(plain(out).map((r) => r.id), ['a', 'c', 'b']);
+});
+
+test('moveRoute is a no-op past either boundary', () => {
+  const ctx = loadAddRoute();
+  const routes = [{ id: 'a' }, { id: 'b' }];
+  assert.deepEqual(plain(ctx.moveRoute(routes, 'a', -1)).map((r) => r.id), ['a', 'b']);
+  assert.deepEqual(plain(ctx.moveRoute(routes, 'b', 1)).map((r) => r.id), ['a', 'b']);
+});
+
+test('moveRoute is a no-op for an unknown id', () => {
+  const ctx = loadAddRoute();
+  const routes = [{ id: 'a' }, { id: 'b' }];
+  assert.deepEqual(plain(ctx.moveRoute(routes, 'nope', 1)).map((r) => r.id), ['a', 'b']);
+});
+
 test('mergeStations adds only missing names, never overwriting', () => {
   const ctx = loadAddRoute();
   const st = { RDG: 'Reading' };
@@ -218,6 +274,41 @@ test('commitAddRoute commits routes.json + stations.json with the new route', as
   assert.equal(JSON.parse(files['stations.json']).RDG, 'Reading');
 });
 
+test('commitAddRoute commits a connection route with the change station name added', async () => {
+  const ctx = loadAddRoute();
+  ctx.localStorage.setItem('githubToken', 'tok');
+
+  const routesJson = [{ id: 'rdg-pad', from: 'RDG', to: 'PAD', change: null }];
+  const stationsJson = { RDG: 'Reading', PAD: 'London Paddington' };
+  let treeBody = null;
+
+  ctx.fetch = async (url, opts = {}) => {
+    const method = opts.method || 'GET';
+    if (url.includes('/contents/routes.json')) return resp({ content: b64(routesJson) });
+    if (url.includes('/contents/stations.json')) return resp({ content: b64(stationsJson) });
+    if (url.endsWith('/git/ref/heads/main')) return resp({ object: { sha: 'P' } });
+    if (url.endsWith('/git/commits/P') && method === 'GET') return resp({ tree: { sha: 'BT' } });
+    if (url.endsWith('/git/trees')) { treeBody = JSON.parse(opts.body); return resp({ sha: 'NT' }); }
+    if (url.endsWith('/git/commits') && method === 'POST') return resp({ sha: 'NC' });
+    if (url.endsWith('/git/refs/heads/main')) return resp({});
+    throw new Error('unexpected ' + method + ' ' + url);
+  };
+
+  const names = { RDG: 'Reading', HOT: 'Henley-On-Thames', TWY: 'Twyford' };
+  const res = await ctx.commitAddRoute('RDG', 'HOT', names, { change: 'TWY', minConnectionMins: 4 });
+  assert.equal(res.id, 'rdg-hot');
+
+  const files = Object.fromEntries(treeBody.tree.map((t) => [t.path, t.content]));
+  const committedRoutes = JSON.parse(files['routes.json']);
+  const added = committedRoutes.find((r) => r.id === 'rdg-hot');
+  assert.deepEqual(added, {
+    id: 'rdg-hot', name: 'Reading ↔ Henley-On-Thames', from: 'RDG', to: 'HOT',
+    change: 'TWY', minConnectionMins: 4,
+  });
+  // Change station's display name was added alongside from/to.
+  assert.equal(JSON.parse(files['stations.json']).TWY, 'Twyford');
+});
+
 test('commitAddRoute rejects a duplicate route id', async () => {
   const ctx = loadAddRoute();
   ctx.localStorage.setItem('githubToken', 'tok');
@@ -230,4 +321,31 @@ test('commitAddRoute rejects a duplicate route id', async () => {
     ctx.commitAddRoute('RDG', 'PAD', { RDG: 'Reading', PAD: 'London Paddington' }),
     /already exists/
   );
+});
+
+// ── commitMoveRoute (reorder) ────────────────────────────────────────────────
+
+test('commitMoveRoute reads fresh routes.json, applies the swap, commits only routes.json', async () => {
+  const ctx = loadAddRoute();
+  ctx.localStorage.setItem('githubToken', 'tok');
+
+  const routesJson = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  let treeBody = null;
+  ctx.fetch = async (url, opts = {}) => {
+    const method = opts.method || 'GET';
+    if (url.includes('/contents/routes.json')) return resp({ content: b64(routesJson) });
+    if (url.endsWith('/git/ref/heads/main')) return resp({ object: { sha: 'P' } });
+    if (url.endsWith('/git/commits/P') && method === 'GET') return resp({ tree: { sha: 'BT' } });
+    if (url.endsWith('/git/trees')) { treeBody = JSON.parse(opts.body); return resp({ sha: 'NT' }); }
+    if (url.endsWith('/git/commits') && method === 'POST') return resp({ sha: 'NC' });
+    if (url.endsWith('/git/refs/heads/main')) return resp({});
+    throw new Error('unexpected ' + method + ' ' + url);
+  };
+
+  await ctx.commitMoveRoute('b', -1);
+
+  assert.equal(treeBody.tree.length, 1);
+  assert.equal(treeBody.tree[0].path, 'routes.json');
+  const committed = JSON.parse(treeBody.tree[0].content);
+  assert.deepEqual(committed.map((r) => r.id), ['b', 'a', 'c']);
 });

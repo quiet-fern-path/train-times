@@ -1,12 +1,15 @@
 // add-route.js — the in-app route builder / manager.
 //
-// Lets the (sole) owner add an arbitrary DIRECT route, and remove / re-add
-// any route (direct OR connection, e.g. Henley), by committing routes.json /
+// Lets the (sole) owner add an arbitrary route — direct, or a connection with
+// a change station and a minimum connection time (default 5 min) — remove /
+// re-add any route, and reorder the active list, by committing routes.json /
 // stations.json / parked-routes.json to the repo with their own fine-grained
 // GitHub token. A push to routes.json then triggers update-schedule.yml, which
 // fetches just the new/re-added route (fast 7-day phase, then a 90-day
 // backfill) — so the route appears in the main app fully first-class with no
-// app.js changes. See CLAUDE.md and the plan for the why.
+// app.js changes. Reordering touches only routes.json (no ids are missing),
+// so its push no-ops the fetch — same as removing a route. See CLAUDE.md and
+// the plan for the why.
 //
 // Written as a classic script with top-level `function` declarations (like
 // app.js) so the pure helpers can be loaded and unit-tested in a Node vm
@@ -34,6 +37,25 @@ function buildRouteId(from, to) {
 function buildRouteName(from, to, names) {
   names = names || {};
   return (names[from] || from) + ' ↔ ' + (names[to] || to);
+}
+
+// Build a full route object. Direct when opts.change is falsy (change: null,
+// no minConnectionMins key — matches the direct entries already in
+// routes.json); a connection route when opts.change is set (minConnectionMins
+// defaults to 5, same fallback fetch_schedule.py already uses for a route
+// missing the key). id/name are always keyed by origin/destination only (not
+// the change station), matching the existing rdg-hoh/pad-hoh convention.
+function buildRoute(from, to, names, opts) {
+  opts = opts || {};
+  var route = {
+    id: buildRouteId(from, to),
+    name: buildRouteName(from, to, names),
+    from: from,
+    to: to,
+    change: opts.change || null
+  };
+  if (opts.change) route.minConnectionMins = opts.minConnectionMins || 5;
+  return route;
 }
 
 // Extract a CRS from a picker value that may be a bare code ("RDG") or the
@@ -88,6 +110,23 @@ function readdRoute(routes, parked, id) {
   var newRoutes = (routes || []).slice();
   if (moved && !routeExists(newRoutes, id)) newRoutes = newRoutes.concat([moved]);
   return { routes: newRoutes, parked: newParked };
+}
+
+// Swap the route with `id` with its neighbour `delta` positions away
+// (-1 = move up/earlier, +1 = move down/later). Order matters to the main
+// app: ROUTES[0] is the initial active route and renderRoutePicker() shows
+// chips in array order. Clamped at the boundaries (a no-op past either end);
+// returns a new array, never mutates the input.
+function moveRoute(routes, id, delta) {
+  var arr = (routes || []).slice();
+  var idx = arr.findIndex(function (r) { return r.id === id; });
+  if (idx === -1) return arr;
+  var next = idx + delta;
+  if (next < 0 || next >= arr.length) return arr;
+  var tmp = arr[idx];
+  arr[idx] = arr[next];
+  arr[next] = tmp;
+  return arr;
 }
 
 // ── GitHub commit layer ─────────────────────────────────────────────────────
@@ -168,26 +207,31 @@ async function ghCommitFiles(message, files) {
 
 // ── High-level repo operations (browser only) ───────────────────────────────
 
-// Build and commit a new direct route. Reads the current routes.json /
-// stations.json from GitHub, applies the pure merges, commits both (stations
-// only if a new name is actually added). Returns {id, name, commitSha}.
-async function commitAddRoute(from, to, names) {
-  var id = buildRouteId(from, to);
-  var name = buildRouteName(from, to, names);
+// Build and commit a new route — direct, or (with opts.change set) a
+// connection with a change station and minConnectionMins. Reads the current
+// routes.json / stations.json from GitHub, applies the pure merges, commits
+// both (stations only if a new name is actually added — including the change
+// station's, for a connection). Returns {id, name, commitSha}.
+async function commitAddRoute(from, to, names, opts) {
+  opts = opts || {};
+  var route = buildRoute(from, to, names, opts);
   var routes = await ghGetJsonFile('routes.json');
-  if (routeExists(routes, id)) throw new Error('Route "' + id + '" already exists.');
-  var route = { id: id, name: name, from: from, to: to, change: null };
+  if (routeExists(routes, route.id)) throw new Error('Route "' + route.id + '" already exists.');
   var newRoutes = mergeRoute(routes, route);
 
   var stations = await ghGetJsonFile('stations.json');
-  var newStations = mergeStations(stations, { [from]: names[from], [to]: names[to] });
+  var entries = {};
+  entries[from] = names[from];
+  entries[to] = names[to];
+  if (opts.change) entries[opts.change] = names[opts.change];
+  var newStations = mergeStations(stations, entries);
 
   var files = [{ path: 'routes.json', content: toJsonFile(newRoutes) }];
   if (JSON.stringify(newStations) !== JSON.stringify(stations)) {
     files.push({ path: 'stations.json', content: toJsonFile(newStations) });
   }
-  var sha = await ghCommitFiles('Add route ' + id + ' (' + name + ')', files);
-  return { id: id, name: name, commitSha: sha };
+  var sha = await ghCommitFiles('Add route ' + route.id + ' (' + route.name + ')', files);
+  return { id: route.id, name: route.name, commitSha: sha };
 }
 
 // Remove a route (active -> parked) in one commit. Works for connection routes.
@@ -209,6 +253,16 @@ async function commitReaddRoute(id) {
   return ghCommitFiles('Re-add route ' + id, [
     { path: 'routes.json', content: toJsonFile(next.routes) },
     { path: 'parked-routes.json', content: toJsonFile(next.parked) }
+  ]);
+}
+
+// Move a route up/down in the active list, in one commit (routes.json only —
+// no ids become missing, so the delta-aware push no-ops, same as a removal).
+async function commitMoveRoute(id, delta) {
+  var routes = await ghGetJsonFile('routes.json');
+  var reordered = moveRoute(routes, id, delta);
+  return ghCommitFiles('Reorder routes (move ' + id + ')', [
+    { path: 'routes.json', content: toJsonFile(reordered) }
   ]);
 }
 
@@ -264,17 +318,35 @@ async function refreshLists() {
   var active = el('active-routes');
   if (active) {
     active.innerHTML = '';
-    routes.forEach(function (r) {
+    routes.forEach(function (r, i) {
       var row = document.createElement('div');
       row.className = 'manage-row';
       var span = document.createElement('span');
       span.textContent = routeLabel(r);
+
+      var upBtn = document.createElement('button');
+      upBtn.className = 'manage-btn manage-btn-move';
+      upBtn.textContent = '▲';
+      upBtn.title = 'Move up';
+      upBtn.disabled = !hasToken() || i === 0;
+      upBtn.addEventListener('click', function () { onMove(r.id, -1); });
+
+      var downBtn = document.createElement('button');
+      downBtn.className = 'manage-btn manage-btn-move';
+      downBtn.textContent = '▼';
+      downBtn.title = 'Move down';
+      downBtn.disabled = !hasToken() || i === routes.length - 1;
+      downBtn.addEventListener('click', function () { onMove(r.id, 1); });
+
       var btn = document.createElement('button');
       btn.className = 'btn-close manage-btn';
       btn.textContent = 'Remove';
       btn.disabled = !hasToken();
       btn.addEventListener('click', function () { onRemove(r.id); });
+
       row.appendChild(span);
+      row.appendChild(upBtn);
+      row.appendChild(downBtn);
       row.appendChild(btn);
       active.appendChild(row);
     });
@@ -312,12 +384,34 @@ function updateTokenUi() {
   if (addBtn) addBtn.disabled = !have;
 }
 
+function connectionOpts() {
+  var toggle = el('connection-toggle');
+  if (!toggle || !toggle.checked) return { opts: null };
+
+  var change = parseCrs(el('change-input').value);
+  if (!change || !STATIONS_ALL[change]) return { error: 'Pick a valid change station.' };
+
+  var minConn = parseInt(el('min-conn-input').value, 10);
+  if (!Number.isFinite(minConn) || minConn < 1) {
+    return { error: 'Minimum connection minutes must be a positive number.' };
+  }
+  return { opts: { change: change, minConnectionMins: minConn } };
+}
+
 async function onAdd() {
   var from = parseCrs(el('from-input').value);
   var to = parseCrs(el('to-input').value);
   if (!from || !STATIONS_ALL[from]) { setStatus('Pick a valid origin station.', 'err'); return; }
   if (!to || !STATIONS_ALL[to]) { setStatus('Pick a valid destination station.', 'err'); return; }
   if (from === to) { setStatus('Origin and destination must differ.', 'err'); return; }
+
+  var conn = connectionOpts();
+  if (conn.error) { setStatus(conn.error, 'err'); return; }
+  var opts = conn.opts;
+  if (opts && (opts.change === from || opts.change === to)) {
+    setStatus('Change station must differ from both origin and destination.', 'err');
+    return;
+  }
 
   var id = buildRouteId(from, to);
   setStatus('Committing ' + id + '…', 'busy');
@@ -329,15 +423,28 @@ async function onAdd() {
       setStatus('Cancelled.', '');
       return;
     }
-    var res = await commitAddRoute(from, to, STATIONS_ALL);
+    var res = await commitAddRoute(from, to, STATIONS_ALL, opts);
     setStatus('Added ' + res.name + '. The schedule will fetch automatically (usable in ~2–3 min, full 90 days a few minutes later).', 'ok');
     el('from-input').value = '';
     el('to-input').value = '';
+    if (el('change-input')) el('change-input').value = '';
+    if (el('connection-toggle')) { el('connection-toggle').checked = false; toggleConnectionFields(); }
     await refreshLists();
   } catch (e) {
     setStatus(e.message, 'err');
   } finally {
     el('btn-add').disabled = !hasToken();
+  }
+}
+
+async function onMove(id, delta) {
+  setStatus('Reordering…', 'busy');
+  try {
+    await commitMoveRoute(id, delta);
+    setStatus('Reordered.', 'ok');
+    await refreshLists();
+  } catch (e) {
+    setStatus(e.message, 'err');
   }
 }
 
@@ -381,6 +488,12 @@ function onClearToken() {
   setStatus('Token cleared.', '');
 }
 
+function toggleConnectionFields() {
+  var toggle = el('connection-toggle');
+  var fields = el('connection-fields');
+  if (fields) fields.style.display = (toggle && toggle.checked) ? 'block' : 'none';
+}
+
 async function initAddRoute() {
   var link = el('actions-link');
   if (link) link.href = actionsLink();
@@ -389,6 +502,8 @@ async function initAddRoute() {
   el('btn-save-token').addEventListener('click', onSaveToken);
   var clearBtn = el('btn-clear-token');
   if (clearBtn) clearBtn.addEventListener('click', onClearToken);
+  var connToggle = el('connection-toggle');
+  if (connToggle) connToggle.addEventListener('change', toggleConnectionFields);
 
   updateTokenUi();
 

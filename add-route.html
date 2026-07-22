@@ -35,17 +35,30 @@
     </div>
   </section>
 
-  <!-- Add a new direct route -->
+  <!-- Add a new route (direct, or a connection with a change) -->
   <section class="manage-section">
     <h2>Add a route</h2>
-    <p>Direct routes only. Type a station name or CRS code and pick from the list.
-      Connection routes (with a change) aren't created here — but you can remove and
-      re-add existing ones below.</p>
+    <p>Type a station name or CRS code and pick from the list.</p>
     <label for="from-input">From</label>
     <input id="from-input" list="station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
     <label for="to-input">To</label>
     <input id="to-input" list="station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
     <datalist id="station-options"></datalist>
+
+    <label class="manage-checkbox-row">
+      <input type="checkbox" id="connection-toggle">
+      This route needs a change (connection)
+    </label>
+    <div id="connection-fields" style="display:none">
+      <label for="change-input">Change at</label>
+      <input id="change-input" list="station-options" autocomplete="off" placeholder="e.g. Twyford (TWY)">
+      <label for="min-conn-input">Minimum connection time (minutes)</label>
+      <input id="min-conn-input" type="number" min="1" value="5">
+      <p class="manage-hint">Check the physical platform layout at the change station before
+        picking this — it depends on real platform adjacency at that specific station, not a
+        generic default.</p>
+    </div>
+
     <div class="row">
       <button class="btn-save" id="btn-add" disabled>Add route</button>
     </div>
@@ -57,6 +70,7 @@
   <!-- Current active routes -->
   <section class="manage-section">
     <h2>Current routes</h2>
+    <p>Use ▲/▼ to reorder — the first route is what opens by default.</p>
     <div id="active-routes" class="manage-list"></div>
   </section>
 

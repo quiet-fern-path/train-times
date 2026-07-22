@@ -459,21 +459,24 @@ Connection route: same, plus `"change": "CRS"` and `"minConnectionMins": N`.
 Check the physical platform layout at the change station before picking
 `N` — the Twyford value (3) was chosen based on real platform-adjacency
 research for that specific station, not a generic default; don't copy it
-to a different interchange without checking. The builder does **not** create
-connection routes (it can't research `N`), but it can remove and re-add
-existing ones losslessly.
+to a different interchange without checking. The builder can create these
+too (with an in-page reminder about researching `N`, defaulting the field to
+5 rather than assuming any particular station's adjacency), and can remove
+and re-add existing ones losslessly regardless of how they were created.
 
 ## In-app route builder (`add-route.html` / `add-route.js`)
 
-Lets the owner add an arbitrary **direct** route, and remove / re-add any
-route (direct *or* connection), from the app itself — no hand-editing. There
-is deliberately **no new client data path**: research established there's no
-free, static, browser-only way to get a *future* timetable for an arbitrary
-route, so the builder just makes the existing server-side pre-fetch
-frictionless. It commits the config with the owner's `githubToken` (above)
-and lets the Action fetch the schedule; the route then appears in the main
-app fully first-class with **zero `app.js` changes** (the app is already
-data-driven off `routes.json` + `schedule.json`).
+Lets the owner add an arbitrary route — direct, or a connection with a change
+station and minimum connection time — remove / re-add any route, and reorder
+the active list, from the app itself — no hand-editing. There is deliberately
+**no new client data path**: research established there's no free, static,
+browser-only way to get a *future* timetable for an arbitrary route, so the
+builder just makes the existing server-side pre-fetch frictionless. It
+commits the config with the owner's `githubToken` (above) and lets the Action
+fetch the schedule; the route then appears in the main app fully first-class
+with **zero `app.js` changes** (the app is already data-driven off
+`routes.json` + `schedule.json`, and route *order* in that array is what
+`renderRoutePicker()`/`ROUTES[0]` already key off).
 
 Key pieces, all reused rather than rebuilt:
 
@@ -487,6 +490,18 @@ Key pieces, all reused rather than rebuilt:
   no research. Removed data is auto-pruned by the next weekly cron full run
   (which rebuilds `schedule.json` from `routes.json` only); until then a
   re-add is instant because the data is still there.
+- **Creating a connection route** in the add form (`buildRoute()`) sets
+  `change`/`minConnectionMins` (default 5) alongside `from`/`to`, and includes
+  the change station's display name in the `stations.json` merge. The page
+  shows the same platform-adjacency research warning as this file's "Adding a
+  route" section, but doesn't block on it — the owner is trusted to have
+  actually checked, same as a hand-edit would be.
+- **Reordering** (`moveRoute`/`commitMoveRoute`) swaps a route with its
+  neighbour and commits **only** `routes.json` — always re-read fresh from
+  GitHub immediately before the swap (not a stale copy from page load), so two
+  reorders in quick succession can't race each other's base state. Adds no
+  missing route ids, so the delta-aware push below no-ops, same as a removal —
+  purely a metadata commit, no RTT calls.
 - **Delta-aware push** in `update-schedule.yml`: a `push` that touches
   `routes.json` runs `fetch_schedule.py --print-missing-routes` (ids in
   `routes.json` but not yet in `schedule.json`) and fetches only those, in two
