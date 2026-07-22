@@ -31,18 +31,21 @@ different auth models, and different failure-degradation requirements.
 | `index.html` | App shell. Also contains the inline bootstrap-cache script (see below). |
 | `styles.css` | All styling. Single file, no preprocessor. |
 | `app.js` | All client logic: rendering, overtaking, live overlay, settings. |
+| `add-route.html` / `add-route.js` | In-app route builder / manager (see "In-app route builder" below). Standalone page linked from the settings sheet; commits `routes.json`/`stations.json`/`parked-routes.json` via the GitHub API with the user's own token. |
 | `sw.js` | Service worker — stale-while-revalidate caching. |
 | `routes.json` | Route config: `{id, name, from, to, change, minConnectionMins}`. Edit this to add/change routes — no other code changes needed for a direct route. |
-| `stations.json` | CRS code → display name. Add an entry whenever you add a station to `routes.json`. |
+| `parked-routes.json` | Routes removed via the builder, kept with full config for one-click re-add. Ships as `[]`. Not read by the main app. |
+| `stations.json` | CRS code → display name for the configured routes. Add an entry whenever you add a station to `routes.json`. |
+| `stations_all.json` | Full national CRS → name map (~2,600). Powers the builder's station autocomplete only; loaded lazily by `add-route.html`, kept out of the main app's precache. |
 | `data/schedule.json` | Generated output. Don't hand-edit — it's overwritten by the Action every run. Ships with an empty-arrays placeholder (`is_seed_placeholder: true`) until the Action runs for real. |
 | `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
 | `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
 | `.github/workflows/refresh-platforms.yml` | Cheap platform-only fetch: daily cron (03:10 UTC) + manual trigger. Runs `fetch_schedule.py --platforms-only` — see below. |
 | `scripts/test_fetch_schedule.py` | Python test suite (stdlib `unittest`) — see "Automated tests" below. |
-| `test/*.test.js`, `test/loadApp.js`, `test/loadSw.js` | JS test suite (Node's built-in `node:test`) — see "Automated tests" below. |
+| `test/*.test.js`, `test/loadApp.js`, `test/loadSw.js`, `test/loadAddRoute.js` | JS test suite (Node's built-in `node:test`) — see "Automated tests" below. `loadAddRoute.js` loads `add-route.js` with no DOM so its pure helpers can be tested. |
 | `.github/workflows/test.yml` | Runs both test suites on every push/PR. |
 
-## Two separate credentials — don't mix them up
+## Three separate credentials — don't mix them up
 
 - **RTT refresh token**: GitHub repo secret (`RTT_TOKEN`). Used only by
   `fetch_schedule.py` inside the Action. Register at `api-portal.rtt.io`.
@@ -55,11 +58,19 @@ different auth models, and different failure-degradation requirements.
   (⚙ icon), stored in their own `localStorage` under `darwinApiKey`. Never
   stored in the repo, never sent anywhere except directly from that
   visitor's browser to `api1.raildata.org.uk`.
+- **GitHub token** (`localStorage.githubToken`): a fine-grained PAT the owner
+  pastes into the route builder (`add-route.html`), scoped to this repo with
+  `Contents: Read and write`. Used only from that page, browser → GitHub API
+  (`api.github.com`, which is CORS-enabled). Local-only, never committed. It
+  needs *no* `actions` scope: the commit itself triggers the fetch via the
+  delta-aware push, so the builder never calls `workflow_dispatch`.
 
 If you're ever tempted to put a Darwin key in a repo secret or env var —
 don't. It has to be per-visitor because of CORS/ToS constraints already
 worked through; see the "why" notes in `fetch_schedule.py`'s docstring for
-the RTT side of this and the commit history for the CORS investigation.
+the RTT side of this and the commit history for the CORS investigation. The
+same rule applies to the GitHub token: browser/localStorage only, never a
+repo secret. `RTT_TOKEN` stays server-only; the other two stay client-only.
 
 ## 3am timetable day convention
 
@@ -441,13 +452,63 @@ at once.
 
 Direct route: add one object to `routes.json`, add any new station codes to
 `stations.json`. Nothing else. The next Action run (or a manual
-`workflow_dispatch` trigger) picks it up automatically.
+`workflow_dispatch` trigger) picks it up automatically. The in-app builder
+(below) is the friction-free way to do exactly this from a phone.
 
 Connection route: same, plus `"change": "CRS"` and `"minConnectionMins": N`.
 Check the physical platform layout at the change station before picking
 `N` — the Twyford value (3) was chosen based on real platform-adjacency
 research for that specific station, not a generic default; don't copy it
-to a different interchange without checking.
+to a different interchange without checking. The builder does **not** create
+connection routes (it can't research `N`), but it can remove and re-add
+existing ones losslessly.
+
+## In-app route builder (`add-route.html` / `add-route.js`)
+
+Lets the owner add an arbitrary **direct** route, and remove / re-add any
+route (direct *or* connection), from the app itself — no hand-editing. There
+is deliberately **no new client data path**: research established there's no
+free, static, browser-only way to get a *future* timetable for an arbitrary
+route, so the builder just makes the existing server-side pre-fetch
+frictionless. It commits the config with the owner's `githubToken` (above)
+and lets the Action fetch the schedule; the route then appears in the main
+app fully first-class with **zero `app.js` changes** (the app is already
+data-driven off `routes.json` + `schedule.json`).
+
+Key pieces, all reused rather than rebuilt:
+
+- **One commit via the Git Data API** (`ghCommitFiles` in `add-route.js`):
+  ref → base tree → tree (inline file `content`, no separate blobs) → commit
+  → update ref. Writing `routes.json` (+ `stations.json` / `parked-routes.json`)
+  in a single commit means the push trigger fires once.
+- **Remove / re-add** move the full route object between `routes.json` and
+  `parked-routes.json` (`removeRoute`/`readdRoute`). Type-agnostic — a parked
+  connection route (Henley) re-adds with its exact `change`/`minConnectionMins`,
+  no research. Removed data is auto-pruned by the next weekly cron full run
+  (which rebuilds `schedule.json` from `routes.json` only); until then a
+  re-add is instant because the data is still there.
+- **Delta-aware push** in `update-schedule.yml`: a `push` that touches
+  `routes.json` runs `fetch_schedule.py --print-missing-routes` (ids in
+  `routes.json` but not yet in `schedule.json`) and fetches only those, in two
+  phases so a new route is usable in ~2–3 min: `--routes NEW --days 7` (fast),
+  commit, then `--routes NEW --start-day 7 --append` (backfill days 7–89),
+  commit. Cron (full) and `workflow_dispatch` (scoped, full-replace) paths are
+  unchanged. Removing a route adds no missing ids, so its push no-ops.
+- **`--days N` / `--start-day S`** bound the fetch to `[S, S+N)`; when `--days`
+  is omitted the window runs from `S` to the end of the 90-day lookahead (so
+  `--start-day 7` = days 7–89, not a fresh 90). **`--append`** unions the
+  fetched day range into a route's existing arrays (`merge_route_append`)
+  instead of replacing them, so the backfill keeps the fast phase's first week
+  and re-queries no day twice. Don't collapse these back to a single
+  full-replace fetch — that's the ~7-min-vs-~2-min add UX and the call
+  minimisation the two phases exist for.
+- **Call minimisation**: `--print-missing-routes` returns *all* missing ids to
+  one `--routes` run, and `fetch_station_day` caches per `(station, day)`, so
+  routes added together that share a station fetch it once. The floor: raw
+  station boards aren't persisted between runs, so a genuinely new route must
+  still fetch its own stations once.
+- **`stations_all.json`** (national CRS→name) powers the builder's autocomplete
+  only; it's loaded lazily by that page and kept out of the main precache.
 
 ## Local development
 

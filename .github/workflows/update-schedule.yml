@@ -46,21 +46,49 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
-      - name: Fetch latest schedule
+      - name: Fetch and commit schedule
         env:
           RTT_TOKEN: ${{ secrets.RTT_TOKEN }}
           ROUTES: ${{ github.event.inputs.routes }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ -n "$ROUTES" ]; then
-            python scripts/fetch_schedule.py --routes "$ROUTES"
-          else
-            python scripts/fetch_schedule.py
-          fi
-
-      - name: Commit updated schedule
-        run: |
+          set -euo pipefail
           git config user.name "schedule-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/schedule.json
-          git diff --cached --quiet || git commit -m "Update schedule data ($(date -u +%F))"
-          git push
+
+          # Commit data/schedule.json (only if it actually changed) and push.
+          # schedule.json is NOT in this workflow's push-trigger paths, so
+          # these commits never re-trigger the workflow.
+          commit_push() {
+            git add data/schedule.json
+            git diff --cached --quiet || { git commit -m "$1" && git push; }
+          }
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            # A routes.json edit (a route added or re-added, e.g. from the
+            # in-app builder). Fetch ONLY the routes missing from
+            # schedule.json rather than a full ~720-call run. Two phases so a
+            # new route is usable within ~2-3 min: a fast 7-day fetch first,
+            # then an append-merge backfill of the rest of the 90-day
+            # lookahead (days 7-89) that keeps the first week and re-queries
+            # no day twice.
+            NEW=$(python scripts/fetch_schedule.py --print-missing-routes)
+            if [ -z "$NEW" ]; then
+              echo "No new routes in routes.json — nothing to fetch."
+              exit 0
+            fi
+            echo "New/re-added routes to fetch: $NEW"
+            python scripts/fetch_schedule.py --routes "$NEW" --days 7
+            commit_push "Add schedule data for $NEW (first 7 days) ($(date -u +%F))"
+            python scripts/fetch_schedule.py --routes "$NEW" --start-day 7 --append
+            commit_push "Backfill schedule data for $NEW (days 7-89) ($(date -u +%F))"
+          elif [ -n "$ROUTES" ]; then
+            # Manual scoped refresh (workflow_dispatch): full 90-day replace of
+            # just the named routes.
+            python scripts/fetch_schedule.py --routes "$ROUTES"
+            commit_push "Update schedule data for $ROUTES ($(date -u +%F))"
+          else
+            # Cron / manual full run: every route, full overwrite.
+            python scripts/fetch_schedule.py
+            commit_push "Update schedule data ($(date -u +%F))"
+          fi

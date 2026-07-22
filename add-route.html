@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Manage routes · Train Times</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="hrow">
+    <div class="route-title">Manage routes <span id="token-badge" class="token-badge" style="display:none">🔑</span></div>
+    <a href="./index.html" class="icon-btn" style="margin-left:auto;text-decoration:none">‹ Back</a>
+  </div>
+</header>
+
+<main class="manage-main">
+
+  <div id="status" class="manage-status"></div>
+
+  <!-- Token gate: shown until a GitHub token is stored on this device -->
+  <section id="token-gate" class="manage-section" style="display:none">
+    <h2>Connect your GitHub token</h2>
+    <p>Adding or removing a route commits to your repo. Paste a
+      <strong>fine-grained personal access token</strong> scoped to
+      <code>quiet-fern-path/train-times</code> with <strong>Contents: Read and write</strong>
+      (an expiry is recommended). Stored only on this device, never committed.</p>
+    <label for="token-input">GitHub token</label>
+    <input id="token-input" type="password" autocomplete="off" autocapitalize="off" placeholder="github_pat_…">
+    <div class="row">
+      <button class="btn-save" id="btn-save-token">Save token</button>
+    </div>
+  </section>
+
+  <!-- Add a new direct route -->
+  <section class="manage-section">
+    <h2>Add a route</h2>
+    <p>Direct routes only. Type a station name or CRS code and pick from the list.
+      Connection routes (with a change) aren't created here — but you can remove and
+      re-add existing ones below.</p>
+    <label for="from-input">From</label>
+    <input id="from-input" list="station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
+    <label for="to-input">To</label>
+    <input id="to-input" list="station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
+    <datalist id="station-options"></datalist>
+    <div class="row">
+      <button class="btn-save" id="btn-add" disabled>Add route</button>
+    </div>
+    <p>After adding, the schedule fetches automatically — usable in ~2–3 minutes,
+      with the full 90 days backfilled a few minutes later.
+      <a id="actions-link" href="#" target="_blank" rel="noopener">Watch the Action ›</a></p>
+  </section>
+
+  <!-- Current active routes -->
+  <section class="manage-section">
+    <h2>Current routes</h2>
+    <div id="active-routes" class="manage-list"></div>
+  </section>
+
+  <!-- Parked (removed) routes, hidden when empty -->
+  <section id="parked-section" class="manage-section" style="display:none">
+    <h2>Parked routes</h2>
+    <p>Removed routes kept here with their full config, ready to re-add in one click.</p>
+    <div id="parked-routes" class="manage-list"></div>
+  </section>
+
+  <section class="manage-section manage-token-footer">
+    <button class="btn-close" id="btn-clear-token">Forget GitHub token on this device</button>
+  </section>
+
+</main>
+
+<script src="add-route.js"></script>
+</body>
+</html>
