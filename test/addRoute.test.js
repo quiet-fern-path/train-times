@@ -305,6 +305,44 @@ test('stageReadd moves a parked route back and logs it', () => {
   assert.deepEqual(plain(stage1.log), ['Re-add rdg-hoh']);
 });
 
+// ── purgeParked / stageDelete (permanent delete, unlike remove/re-add) ──────
+
+test('purgeParked drops the entry entirely (not moved anywhere)', () => {
+  const ctx = loadAddRoute();
+  const henley = { id: 'rdg-hoh', from: 'RDG', to: 'HOT', change: 'TWY', minConnectionMins: 3 };
+  const out = ctx.purgeParked([{ id: 'a' }, henley], 'rdg-hoh');
+  assert.deepEqual(plain(out).map((r) => r.id), ['a']);
+});
+
+test('purgeParked is a no-op for an id that is not parked', () => {
+  const ctx = loadAddRoute();
+  const parked = [{ id: 'a' }];
+  assert.deepEqual(plain(ctx.purgeParked(parked, 'nope')).map((r) => r.id), ['a']);
+});
+
+test('stageDelete purges from the working copy, logs it, and leaves routes/stations untouched', () => {
+  const ctx = loadAddRoute();
+  const henley = { id: 'rdg-hoh', from: 'RDG', to: 'HOT', change: 'TWY', minConnectionMins: 3 };
+  const stage0 = baseStage(ctx, [{ id: 'rdg-pad' }], { RDG: 'Reading' }, [henley]);
+  const stage1 = ctx.stageDelete(stage0, 'rdg-hoh');
+  assert.equal(ctx.routeExists(stage1.parked, 'rdg-hoh'), false);
+  assert.deepEqual(plain(stage1.routes).map((r) => r.id), ['rdg-pad']); // untouched
+  assert.deepEqual(plain(stage1.log), ['Permanently delete rdg-hoh']);
+  // Base is untouched — the delete is still only queued.
+  assert.ok(ctx.routeExists(stage0.base.parked, 'rdg-hoh'));
+});
+
+test('buildCommitPlan includes parked-routes.json for a queued permanent delete', () => {
+  const ctx = loadAddRoute();
+  const stage0 = baseStage(ctx, [], {}, [{ id: 'a' }, { id: 'b' }]);
+  const stage1 = ctx.stageDelete(stage0, 'a');
+  const plan = ctx.buildCommitPlan(stage1);
+  const files = Object.fromEntries(plain(plan.files).map((f) => [f.path, f.content]));
+  assert.deepEqual(Object.keys(files), ['parked-routes.json']);
+  assert.deepEqual(JSON.parse(files['parked-routes.json']).map((r) => r.id), ['b']);
+  assert.equal(plan.message, 'Permanently delete a');
+});
+
 test('stageMove reorders the working copy and logs the direction', () => {
   const ctx = loadAddRoute();
   const stage0 = baseStage(ctx, [{ id: 'a' }, { id: 'b' }, { id: 'c' }]);

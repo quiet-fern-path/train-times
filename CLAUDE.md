@@ -531,6 +531,12 @@ Key pieces, all reused rather than rebuilt:
   auto-pruned by the next weekly cron full run (which rebuilds `schedule.json`
   from `routes.json` only); until then a re-add is instant because the data
   is still there.
+- **Delete forever** (`purgeParked`, called by `stageDelete`) drops a parked
+  route from `parked-routes.json` entirely rather than moving it anywhere —
+  unlike Remove, this isn't reversible from the UI once submitted (only by
+  restoring `parked-routes.json` from git history). A confirm dialog spells
+  this out; the button styling (`.manage-btn-danger`) is deliberately
+  distinct from Re-add's so the two aren't confused at a glance.
 - **Creating a connection route** in the add form (`buildRoute()`, called by
   `stageAdd`) sets `change`/`minConnectionMins` (default 5) alongside
   `from`/`to`, and includes the change station's display name in the
