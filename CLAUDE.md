@@ -478,30 +478,70 @@ with **zero `app.js` changes** (the app is already data-driven off
 `routes.json` + `schedule.json`, and route *order* in that array is what
 `renderRoutePicker()`/`ROUTES[0]` already key off).
 
+### Staging model — every action queues locally, one Submit commits it all
+
+Add/remove/re-add/reorder are **local edits against an in-memory working
+copy** (`STAGE` — a `{base, routes, stations, parked, log}` object built by
+`rebaseStage()`); nothing touches GitHub until the owner clicks **"Submit N
+changes"**, at which point every queued edit lands in **one commit**. This is
+what lets adding a route, removing a different one, and reordering the rest
+all happen in a single push instead of one noisy commit per click.
+
+- **`ensureStage()`** lazily fetches `routes.json`/`stations.json`/
+  `parked-routes.json` fresh from GitHub **once** per session (via
+  `ghGetStageBase()`) and anchors `STAGE` with `rebaseStage()`. Every
+  subsequent action reuses the in-memory copy — no further network reads
+  until Submit. Clearing the GitHub token does **not** clear `STAGE`, so an
+  in-progress queue survives a token swap.
+- **`stageAdd`/`stageRemove`/`stageReadd`/`stageMove`** are pure functions
+  (mirroring `mergeRoute`/`removeRoute`/`readdRoute`/`moveRoute`, which they
+  call internally) that return a **new** stage object with the working copy
+  updated and a human-readable entry appended to `log` — `base` is passed
+  through untouched, so the diff against it always reflects the *whole*
+  session's queued changes, not just the last action.
+- **`buildCommitPlan(stage)`** diffs the working copy against `stage.base`
+  file-by-file (`routes.json`/`stations.json`/`parked-routes.json`) and only
+  includes a file if it actually changed — a pure reorder, for instance,
+  never touches `stations.json` or `parked-routes.json`. `buildCommitMessage`
+  turns `log` into a short subject (the single entry verbatim, or an "N route
+  changes" summary) plus one bullet per entry in the body, so the whole batch
+  is visible in the commit.
+- **`commitStage(stage)`** calls `buildCommitPlan` then `ghCommitFiles` **once**
+  with every changed file — this is the only network write in the whole flow.
+  On success the DOM layer re-anchors `STAGE` via `rebaseStage()` on the
+  just-committed values (not a re-fetch), so the owner can immediately keep
+  queuing more changes. **`discardStage(stage)`** reverts the working copy to
+  `stage.base` and clears `log`, also without a network round trip.
+- **`stageAdd` validates against the current working copy**, not just the
+  original base — so queuing two routes with the same id in one session (or a
+  route whose id collides with one added earlier in the same batch) is still
+  rejected, exactly as if each had gone through its own commit.
+
 Key pieces, all reused rather than rebuilt:
 
 - **One commit via the Git Data API** (`ghCommitFiles` in `add-route.js`):
   ref → base tree → tree (inline file `content`, no separate blobs) → commit
-  → update ref. Writing `routes.json` (+ `stations.json` / `parked-routes.json`)
-  in a single commit means the push trigger fires once.
-- **Remove / re-add** move the full route object between `routes.json` and
-  `parked-routes.json` (`removeRoute`/`readdRoute`). Type-agnostic — a parked
-  connection route (Henley) re-adds with its exact `change`/`minConnectionMins`,
-  no research. Removed data is auto-pruned by the next weekly cron full run
-  (which rebuilds `schedule.json` from `routes.json` only); until then a
-  re-add is instant because the data is still there.
-- **Creating a connection route** in the add form (`buildRoute()`) sets
-  `change`/`minConnectionMins` (default 5) alongside `from`/`to`, and includes
-  the change station's display name in the `stations.json` merge. The page
-  shows the same platform-adjacency research warning as this file's "Adding a
-  route" section, but doesn't block on it — the owner is trusted to have
-  actually checked, same as a hand-edit would be.
-- **Reordering** (`moveRoute`/`commitMoveRoute`) swaps a route with its
-  neighbour and commits **only** `routes.json` — always re-read fresh from
-  GitHub immediately before the swap (not a stale copy from page load), so two
-  reorders in quick succession can't race each other's base state. Adds no
-  missing route ids, so the delta-aware push below no-ops, same as a removal —
-  purely a metadata commit, no RTT calls.
+  → update ref. `commitStage` always writes every changed file in this single
+  call, so the push trigger fires exactly once regardless of how many
+  add/remove/reorder actions were queued.
+- **Remove / re-add** move the full route object between the working `routes`
+  and `parked` arrays (`removeRoute`/`readdRoute`, called by `stageRemove`/
+  `stageReadd`). Type-agnostic — a parked connection route (Henley) re-adds
+  with its exact `change`/`minConnectionMins`, no research. Removed data is
+  auto-pruned by the next weekly cron full run (which rebuilds `schedule.json`
+  from `routes.json` only); until then a re-add is instant because the data
+  is still there.
+- **Creating a connection route** in the add form (`buildRoute()`, called by
+  `stageAdd`) sets `change`/`minConnectionMins` (default 5) alongside
+  `from`/`to`, and includes the change station's display name in the
+  `stations.json` merge. The page shows the same platform-adjacency research
+  warning as this file's "Adding a route" section, but doesn't block on it —
+  the owner is trusted to have actually checked, same as a hand-edit would be.
+- **Reordering** (`moveRoute`, called by `stageMove`) swaps a route with its
+  neighbour in the working copy only — nothing is written until Submit, so
+  several reorders (and any other queued edits) land together. A pure reorder
+  batch adds no missing route ids, so the delta-aware push below no-ops, same
+  as a removal — purely a metadata commit, no RTT calls.
 - **Delta-aware push** in `update-schedule.yml`: a `push` that touches
   `routes.json` runs `fetch_schedule.py --print-missing-routes` (ids in
   `routes.json` but not yet in `schedule.json`) and fetches only those, in two

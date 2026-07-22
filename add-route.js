@@ -2,14 +2,23 @@
 //
 // Lets the (sole) owner add an arbitrary route — direct, or a connection with
 // a change station and a minimum connection time (default 5 min) — remove /
-// re-add any route, and reorder the active list, by committing routes.json /
-// stations.json / parked-routes.json to the repo with their own fine-grained
-// GitHub token. A push to routes.json then triggers update-schedule.yml, which
-// fetches just the new/re-added route (fast 7-day phase, then a 90-day
-// backfill) — so the route appears in the main app fully first-class with no
-// app.js changes. Reordering touches only routes.json (no ids are missing),
-// so its push no-ops the fetch — same as removing a route. See CLAUDE.md and
-// the plan for the why.
+// re-add any route, and reorder the active list, from the app itself.
+//
+// STAGING MODEL: every action above is a *local* edit against an in-memory
+// working copy (STAGE) — nothing touches GitHub until "Submit N changes" is
+// clicked, at which point every queued edit is combined into ONE commit
+// (routes.json / stations.json / parked-routes.json, whichever actually
+// changed). This lets the owner add a route, remove a different one, and
+// reorder the rest, then push it all as a single commit — matching how a
+// hand-edit session in GitHub's web editor would naturally look (one commit,
+// several logical changes), rather than one noisy commit per click.
+//
+// A push to routes.json then triggers update-schedule.yml, which fetches
+// just the new/re-added route(s) (fast 7-day phase, then a 90-day backfill)
+// — so each route appears in the main app fully first-class with no app.js
+// changes. Reordering/removing alone adds no missing route ids, so if a
+// submitted batch is pure reorders/removals the push no-ops the fetch.
+// See CLAUDE.md and the plan for the why.
 //
 // Written as a classic script with top-level `function` declarations (like
 // app.js) so the pure helpers can be loaded and unit-tested in a Node vm
@@ -129,6 +138,99 @@ function moveRoute(routes, id, delta) {
   return arr;
 }
 
+// ── Staging (pure, unit-tested) ──────────────────────────────────────────────
+//
+// A "stage" is `{ base: {routes, stations, parked}, routes, stations, parked,
+// log }` — `base` is the triple as last read from (or committed to) GitHub;
+// `routes`/`stations`/`parked` are the working copy every stage* function
+// mutates; `log` is a human-readable list of queued changes, newest last.
+// None of these functions touch the network — see ghGetStageBase/commitStage
+// below for the network glue, and ensureStage/onSubmit/onDiscard for the DOM
+// wiring that ties them together.
+
+// Anchor a stage on `routes`/`stations`/`parked` as the new base, with an
+// empty log — used both to create a fresh stage (from a GitHub fetch) and to
+// re-anchor one after a successful commit (from what was just committed),
+// so the owner can keep queuing more changes without a full re-fetch.
+function rebaseStage(routes, stations, parked) {
+  return {
+    base: { routes: routes, stations: stations, parked: parked },
+    routes: routes, stations: stations, parked: parked,
+    log: []
+  };
+}
+
+// Revert the working copy to the stage's base, discarding every queued
+// change (but keeping the same base — no network round trip needed).
+function discardStage(stage) {
+  return rebaseStage(stage.base.routes, stage.base.stations, stage.base.parked);
+}
+
+function stageAdd(stage, from, to, names, opts) {
+  var route = buildRoute(from, to, names, opts);
+  if (routeExists(stage.routes, route.id)) throw new Error('Route "' + route.id + '" already exists.');
+  var entries = {};
+  entries[from] = names[from];
+  entries[to] = names[to];
+  if (opts && opts.change) entries[opts.change] = names[opts.change];
+  return {
+    base: stage.base,
+    routes: mergeRoute(stage.routes, route),
+    stations: mergeStations(stage.stations, entries),
+    parked: stage.parked,
+    log: stage.log.concat(['Add ' + route.id + ' (' + route.name + ')'])
+  };
+}
+
+function stageRemove(stage, id) {
+  var next = removeRoute(stage.routes, stage.parked, id);
+  return {
+    base: stage.base, routes: next.routes, stations: stage.stations, parked: next.parked,
+    log: stage.log.concat(['Remove ' + id])
+  };
+}
+
+function stageReadd(stage, id) {
+  var next = readdRoute(stage.routes, stage.parked, id);
+  return {
+    base: stage.base, routes: next.routes, stations: stage.stations, parked: next.parked,
+    log: stage.log.concat(['Re-add ' + id])
+  };
+}
+
+function stageMove(stage, id, delta) {
+  return {
+    base: stage.base, routes: moveRoute(stage.routes, id, delta),
+    stations: stage.stations, parked: stage.parked,
+    log: stage.log.concat(['Reorder ' + id + (delta < 0 ? ' up' : ' down')])
+  };
+}
+
+// Multi-line commit message: short subject (readable in a log/notification),
+// then one bullet per queued change so the full batch is visible in the body.
+function buildCommitMessage(log) {
+  if (!log || !log.length) return 'Route changes (no-op)';
+  if (log.length === 1) return log[0];
+  return log.length + ' route changes\n\n' + log.map(function (l) { return '- ' + l; }).join('\n');
+}
+
+// Diff the working copy against the stage's base to decide which files
+// actually need committing (e.g. a pure reorder never touches stations.json
+// or parked-routes.json), and build the combined commit message.
+function buildCommitPlan(stage) {
+  var files = [];
+  if (JSON.stringify(stage.routes) !== JSON.stringify(stage.base.routes)) {
+    files.push({ path: 'routes.json', content: toJsonFile(stage.routes) });
+  }
+  if (JSON.stringify(stage.stations) !== JSON.stringify(stage.base.stations)) {
+    files.push({ path: 'stations.json', content: toJsonFile(stage.stations) });
+  }
+  if (JSON.stringify(stage.parked) !== JSON.stringify(stage.base.parked)) {
+    files.push({ path: 'parked-routes.json', content: toJsonFile(stage.parked) });
+  }
+  return { files: files, message: buildCommitMessage(stage.log) };
+}
+
 // ── GitHub commit layer ─────────────────────────────────────────────────────
 
 function ghApiUrl(path) {
@@ -207,68 +309,28 @@ async function ghCommitFiles(message, files) {
 
 // ── High-level repo operations (browser only) ───────────────────────────────
 
-// Build and commit a new route — direct, or (with opts.change set) a
-// connection with a change station and minConnectionMins. Reads the current
-// routes.json / stations.json from GitHub, applies the pure merges, commits
-// both (stations only if a new name is actually added — including the change
-// station's, for a connection). Returns {id, name, commitSha}.
-async function commitAddRoute(from, to, names, opts) {
-  opts = opts || {};
-  var route = buildRoute(from, to, names, opts);
+// Fetch the current routes.json / stations.json / parked-routes.json triple
+// from GitHub HEAD — the starting point for a new staging session.
+async function ghGetStageBase() {
   var routes = await ghGetJsonFile('routes.json');
-  if (routeExists(routes, route.id)) throw new Error('Route "' + route.id + '" already exists.');
-  var newRoutes = mergeRoute(routes, route);
-
   var stations = await ghGetJsonFile('stations.json');
-  var entries = {};
-  entries[from] = names[from];
-  entries[to] = names[to];
-  if (opts.change) entries[opts.change] = names[opts.change];
-  var newStations = mergeStations(stations, entries);
-
-  var files = [{ path: 'routes.json', content: toJsonFile(newRoutes) }];
-  if (JSON.stringify(newStations) !== JSON.stringify(stations)) {
-    files.push({ path: 'stations.json', content: toJsonFile(newStations) });
-  }
-  var sha = await ghCommitFiles('Add route ' + route.id + ' (' + route.name + ')', files);
-  return { id: route.id, name: route.name, commitSha: sha };
-}
-
-// Remove a route (active -> parked) in one commit. Works for connection routes.
-async function commitRemoveRoute(id) {
-  var routes = await ghGetJsonFile('routes.json');
   var parked = await ghGetJsonFile('parked-routes.json');
-  var next = removeRoute(routes, parked, id);
-  return ghCommitFiles('Remove route ' + id + ' (park for later)', [
-    { path: 'routes.json', content: toJsonFile(next.routes) },
-    { path: 'parked-routes.json', content: toJsonFile(next.parked) }
-  ]);
+  return { routes: routes, stations: stations, parked: parked };
 }
 
-// Re-add a parked route (parked -> active) in one commit. Works for Henley.
-async function commitReaddRoute(id) {
-  var routes = await ghGetJsonFile('routes.json');
-  var parked = await ghGetJsonFile('parked-routes.json');
-  var next = readdRoute(routes, parked, id);
-  return ghCommitFiles('Re-add route ' + id, [
-    { path: 'routes.json', content: toJsonFile(next.routes) },
-    { path: 'parked-routes.json', content: toJsonFile(next.parked) }
-  ]);
-}
-
-// Move a route up/down in the active list, in one commit (routes.json only —
-// no ids become missing, so the delta-aware push no-ops, same as a removal).
-async function commitMoveRoute(id, delta) {
-  var routes = await ghGetJsonFile('routes.json');
-  var reordered = moveRoute(routes, id, delta);
-  return ghCommitFiles('Reorder routes (move ' + id + ')', [
-    { path: 'routes.json', content: toJsonFile(reordered) }
-  ]);
+// Commit everything queued in `stage` as ONE commit. Returns the commit sha,
+// or null if nothing in the working copy actually differs from the base
+// (e.g. every queued change cancelled itself out).
+async function commitStage(stage) {
+  var plan = buildCommitPlan(stage);
+  if (!plan.files.length) return null;
+  return ghCommitFiles(plan.message, plan.files);
 }
 
 // ── DOM wiring (browser only) ───────────────────────────────────────────────
 
 var STATIONS_ALL = {};
+var STAGE = null;
 
 function el(id) { return document.getElementById(id); }
 
@@ -309,11 +371,34 @@ function routeLabel(r) {
   return name + kind;
 }
 
+// Lazily start (or return the existing) staging session. A no-op once STAGE
+// is set — after a successful submit it's re-anchored (not nulled), so the
+// owner can keep queuing more changes without a network round trip, and
+// clearing the GitHub token doesn't lose an in-progress queue either.
+async function ensureStage() {
+  if (STAGE) return STAGE;
+  var base = await ghGetStageBase();
+  STAGE = rebaseStage(base.routes, base.stations, base.parked);
+  return STAGE;
+}
+
 async function refreshLists() {
-  var routes = [];
-  var parked = [];
-  try { routes = await loadJson('./routes.json'); } catch (e) { /* leave empty */ }
-  try { parked = await loadJson('./parked-routes.json'); } catch (e) { /* file may not exist yet */ }
+  if (hasToken() && !STAGE) {
+    try { await ensureStage(); } catch (e) {
+      setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    }
+  }
+
+  var routes, parked;
+  if (STAGE) {
+    routes = STAGE.routes;
+    parked = STAGE.parked;
+  } else {
+    routes = [];
+    parked = [];
+    try { routes = await loadJson('./routes.json'); } catch (e) { /* leave empty */ }
+    try { parked = await loadJson('./parked-routes.json'); } catch (e) { /* file may not exist yet */ }
+  }
 
   var active = el('active-routes');
   if (active) {
@@ -322,7 +407,8 @@ async function refreshLists() {
       var row = document.createElement('div');
       row.className = 'manage-row';
       var span = document.createElement('span');
-      span.textContent = routeLabel(r);
+      var pending = STAGE && !routeExists(STAGE.base.routes, r.id);
+      span.textContent = routeLabel(r) + (pending ? ' (pending)' : '');
 
       var upBtn = document.createElement('button');
       upBtn.className = 'manage-btn manage-btn-move';
@@ -360,7 +446,8 @@ async function refreshLists() {
       var row = document.createElement('div');
       row.className = 'manage-row';
       var span = document.createElement('span');
-      span.textContent = routeLabel(r);
+      var pending = STAGE && !routeExists(STAGE.base.parked, r.id);
+      span.textContent = routeLabel(r) + (pending ? ' (pending)' : '');
       var btn = document.createElement('button');
       btn.className = 'btn-save manage-btn';
       btn.textContent = 'Re-add';
@@ -372,6 +459,26 @@ async function refreshLists() {
     });
     if (parkedSection) parkedSection.style.display = parked.length ? 'block' : 'none';
   }
+
+  var pendingSection = el('pending-section');
+  var pendingLog = el('pending-log');
+  var log = STAGE ? STAGE.log : [];
+  if (pendingLog) {
+    pendingLog.innerHTML = '';
+    log.forEach(function (entry) {
+      var li = document.createElement('li');
+      li.textContent = entry;
+      pendingLog.appendChild(li);
+    });
+  }
+  if (pendingSection) pendingSection.style.display = log.length ? 'block' : 'none';
+  var submitBtn = el('btn-submit');
+  if (submitBtn) {
+    submitBtn.disabled = !hasToken() || !log.length;
+    submitBtn.textContent = 'Submit ' + log.length + ' change' + (log.length === 1 ? '' : 's') + ' to GitHub';
+  }
+  var discardBtn = el('btn-discard');
+  if (discardBtn) discardBtn.disabled = !log.length;
 }
 
 function updateTokenUi() {
@@ -413,18 +520,21 @@ async function onAdd() {
     return;
   }
 
-  var id = buildRouteId(from, to);
-  setStatus('Committing ' + id + '…', 'busy');
-  el('btn-add').disabled = true;
   try {
-    var routesNow = await ghGetJsonFile('routes.json');
-    if (reversePairExists(routesNow, from, to) &&
-        !confirm('A route for the reverse journey already exists (it covers both directions). Add this one anyway?')) {
-      setStatus('Cancelled.', '');
-      return;
-    }
-    var res = await commitAddRoute(from, to, STATIONS_ALL, opts);
-    setStatus('Added ' + res.name + '. The schedule will fetch automatically (usable in ~2–3 min, full 90 days a few minutes later).', 'ok');
+    await ensureStage();
+  } catch (e) {
+    setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    return;
+  }
+
+  if (reversePairExists(STAGE.routes, from, to) &&
+      !confirm('A route for the reverse journey already exists (it covers both directions). Queue this one anyway?')) {
+    return;
+  }
+
+  try {
+    STAGE = stageAdd(STAGE, from, to, STATIONS_ALL, opts);
+    setStatus('Queued: add ' + buildRouteId(from, to) + '. Review the pending changes below, then submit.', 'ok');
     el('from-input').value = '';
     el('to-input').value = '';
     if (el('change-input')) el('change-input').value = '';
@@ -432,43 +542,75 @@ async function onAdd() {
     await refreshLists();
   } catch (e) {
     setStatus(e.message, 'err');
-  } finally {
-    el('btn-add').disabled = !hasToken();
   }
 }
 
 async function onMove(id, delta) {
-  setStatus('Reordering…', 'busy');
   try {
-    await commitMoveRoute(id, delta);
-    setStatus('Reordered.', 'ok');
-    await refreshLists();
+    await ensureStage();
   } catch (e) {
-    setStatus(e.message, 'err');
+    setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    return;
   }
+  STAGE = stageMove(STAGE, id, delta);
+  setStatus('Queued: reorder.', 'ok');
+  await refreshLists();
 }
 
 async function onRemove(id) {
-  if (!confirm('Remove "' + id + '"? It will be parked so you can re-add it later.')) return;
-  setStatus('Removing ' + id + '…', 'busy');
+  if (!confirm('Queue removal of "' + id + '"? It will be parked (and can be re-added any time) once you submit.')) return;
   try {
-    await commitRemoveRoute(id);
-    setStatus('Removed ' + id + ' (parked).', 'ok');
-    await refreshLists();
+    await ensureStage();
   } catch (e) {
-    setStatus(e.message, 'err');
+    setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    return;
   }
+  STAGE = stageRemove(STAGE, id);
+  setStatus('Queued: remove ' + id + '.', 'ok');
+  await refreshLists();
 }
 
 async function onReadd(id) {
-  setStatus('Re-adding ' + id + '…', 'busy');
   try {
-    await commitReaddRoute(id);
-    setStatus('Re-added ' + id + '. If its data was pruned it will re-fetch (~2–3 min); otherwise it returns instantly.', 'ok');
+    await ensureStage();
+  } catch (e) {
+    setStatus('Could not load current routes from GitHub: ' + e.message, 'err');
+    return;
+  }
+  STAGE = stageReadd(STAGE, id);
+  setStatus('Queued: re-add ' + id + '.', 'ok');
+  await refreshLists();
+}
+
+async function onSubmit() {
+  if (!STAGE || !STAGE.log.length) return;
+  var btn = el('btn-submit');
+  if (btn) btn.disabled = true;
+  setStatus('Submitting ' + STAGE.log.length + ' change(s)…', 'busy');
+  try {
+    var plan = buildCommitPlan(STAGE);
+    if (!plan.files.length) {
+      STAGE = rebaseStage(STAGE.routes, STAGE.stations, STAGE.parked);
+      setStatus('Nothing actually changed — cleared the pending list.', '');
+    } else {
+      await commitStage(STAGE);
+      STAGE = rebaseStage(STAGE.routes, STAGE.stations, STAGE.parked);
+      setStatus('Committed. The schedule will fetch automatically for any new/re-added routes (usable in ~2–3 min, full 90 days a few minutes later).', 'ok');
+    }
     await refreshLists();
   } catch (e) {
     setStatus(e.message, 'err');
+  } finally {
+    if (btn) btn.disabled = !(STAGE && STAGE.log.length) || !hasToken();
   }
+}
+
+function onDiscard() {
+  if (!STAGE || !STAGE.log.length) return;
+  if (!confirm('Discard all ' + STAGE.log.length + ' pending change(s)? Nothing has been committed yet.')) return;
+  STAGE = discardStage(STAGE);
+  setStatus('Discarded pending changes.', '');
+  refreshLists();
 }
 
 function onSaveToken() {
@@ -485,7 +627,7 @@ function onClearToken() {
   localStorage.removeItem('githubToken');
   updateTokenUi();
   refreshLists();
-  setStatus('Token cleared.', '');
+  setStatus('Token cleared. Any pending changes are kept — paste a token again to submit them.', '');
 }
 
 function toggleConnectionFields() {
@@ -504,6 +646,10 @@ async function initAddRoute() {
   if (clearBtn) clearBtn.addEventListener('click', onClearToken);
   var connToggle = el('connection-toggle');
   if (connToggle) connToggle.addEventListener('change', toggleConnectionFields);
+  var submitBtn = el('btn-submit');
+  if (submitBtn) submitBtn.addEventListener('click', onSubmit);
+  var discardBtn = el('btn-discard');
+  if (discardBtn) discardBtn.addEventListener('click', onDiscard);
 
   updateTokenUi();
 
