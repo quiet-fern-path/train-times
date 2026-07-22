@@ -7,6 +7,13 @@
     "change": null
   },
   {
+    "id": "rdg-mai",
+    "name": "Reading ↔ Maidenhead",
+    "from": "RDG",
+    "to": "MAI",
+    "change": null
+  },
+  {
     "id": "rdg-oxf",
     "name": "Reading ↔ Oxford",
     "from": "RDG",
@@ -19,13 +26,5 @@
     "from": "KGX",
     "to": "CBG",
     "change": null
-  },
-  {
-    "id": "rdg-ted",
-    "name": "Reading ↔ Teddington",
-    "from": "RDG",
-    "to": "TED",
-    "change": "TWI",
-    "minConnectionMins": 5
   }
 ]

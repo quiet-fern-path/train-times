@@ -1,12 +1,5 @@
 [
   {
-    "id": "rdg-mai",
-    "name": "Reading ↔ Maidenhead",
-    "from": "RDG",
-    "to": "MAI",
-    "change": null
-  },
-  {
     "id": "rdg-hoh",
     "name": "Reading ↔ Henley-on-Thames",
     "from": "RDG",
