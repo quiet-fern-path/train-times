@@ -15,7 +15,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 os.environ.setdefault("RTT_TOKEN", "test-token")
@@ -719,6 +719,208 @@ class TestPlatformsOnlyCli(unittest.TestCase):
             self._run_main_quietly()
         called_routes = mock_merge.call_args.args[0]
         self.assertEqual({r["id"] for r in called_routes}, {"rdg-mai"})
+
+
+class TestMissingRouteIds(unittest.TestCase):
+    """missing_route_ids drives the delta-aware push: only routes in
+    routes.json but not yet in schedule.json get fetched. Type-agnostic."""
+
+    def test_returns_ids_not_yet_in_schedule_sorted(self):
+        routes = [{"id": "b"}, {"id": "a"}, {"id": "c-conn", "change": "TWY"}]
+        schedule = {"routes": {"a": {"out": [], "ret": []}}}
+        self.assertEqual(fs.missing_route_ids(routes, schedule), ["b", "c-conn"])
+
+    def test_empty_or_missing_schedule_means_all_missing(self):
+        routes = [{"id": "a"}, {"id": "b"}]
+        self.assertEqual(fs.missing_route_ids(routes, {}), ["a", "b"])
+        self.assertEqual(fs.missing_route_ids(routes, None), ["a", "b"])
+
+    def test_none_missing_returns_empty(self):
+        routes = [{"id": "a"}, {"id": "b"}]
+        schedule = {"routes": {"a": {}, "b": {}}}
+        self.assertEqual(fs.missing_route_ids(routes, schedule), [])
+
+
+class TestMergeRouteAppend(unittest.TestCase):
+    """Backfill phase: union the freshly-fetched day range into a route's
+    existing arrays, keeping every other day and never losing the fast
+    phase's early days."""
+
+    def _leg(self, d, depm, **extra):
+        leg = {"date": d, "depM": depm}
+        leg.update(extra)
+        return leg
+
+    def test_unions_disjoint_ranges_sorted_by_date_then_depm(self):
+        existing = {
+            "out": [self._leg("2026-07-02", 500), self._leg("2026-07-02", 420),
+                    self._leg("2026-07-03", 430)],
+            "ret": [self._leg("2026-07-02", 600)],
+        }
+        fresh = {"out": [self._leg("2026-07-04", 440)], "ret": []}
+        merged = fs.merge_route_append(existing, fresh, {"2026-07-04"})
+        self.assertEqual(
+            [(l["date"], l["depM"]) for l in merged["out"]],
+            [("2026-07-02", 420), ("2026-07-02", 500), ("2026-07-03", 430), ("2026-07-04", 440)],
+        )
+        # No legs lost from either side.
+        self.assertEqual(len(merged["ret"]), 1)
+
+    def test_fetched_dates_win_on_overlap(self):
+        existing = {"out": [self._leg("2026-07-03", 430, stale=True)], "ret": []}
+        fresh = {"out": [self._leg("2026-07-03", 431, fresh=True)], "ret": []}
+        merged = fs.merge_route_append(existing, fresh, {"2026-07-03"})
+        self.assertEqual(len(merged["out"]), 1)
+        self.assertTrue(merged["out"][0].get("fresh"))
+        self.assertNotIn("stale", merged["out"][0])
+
+    def test_connection_leg_fields_preserved(self):
+        existing = {"out": [self._leg("2026-07-02", 420, platform1="3", changeMins=4,
+                                      minConnectionMins=3)], "ret": []}
+        fresh = {"out": [self._leg("2026-07-09", 425, platform1="5", changeMins=6)], "ret": []}
+        merged = fs.merge_route_append(existing, fresh, {"2026-07-09"})
+        kept = merged["out"][0]
+        self.assertEqual(kept["platform1"], "3")
+        self.assertEqual(kept["changeMins"], 4)
+
+    def test_does_not_mutate_inputs(self):
+        existing = {"out": [self._leg("2026-07-02", 420)], "ret": []}
+        fresh = {"out": [self._leg("2026-07-09", 425)], "ret": []}
+        fs.merge_route_append(existing, fresh, {"2026-07-09"})
+        self.assertEqual(len(existing["out"]), 1)
+        self.assertEqual(existing["out"][0]["date"], "2026-07-02")
+
+
+class _FixedDate(date):
+    """date subclass with a fixed today() so main()'s lookahead window is
+    deterministic. Arithmetic still returns real date objects."""
+    @classmethod
+    def today(cls):
+        return date(2026, 7, 2)
+
+
+class TestMainDayWindowAndAppend(unittest.TestCase):
+    """--days / --start-day select the fetch window (applies to direct AND
+    connection routes, since both loop over the same days list), and --append
+    backfills without re-querying or discarding the fast phase's days."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.orig_cwd)
+        fs._station_day_cache.clear()
+        self.addCleanup(fs._station_day_cache.clear)
+
+        self.routes = [
+            {"id": "rdg-bri", "from": "RDG", "to": "BRI", "change": None},
+            {"id": "rdg-hoh", "from": "RDG", "to": "HOT", "change": "TWY", "minConnectionMins": 3},
+        ]
+        with open("routes.json", "w") as f:
+            json.dump(self.routes, f)
+
+    def _run(self, argv, api_recorder):
+        with patch.object(sys, "argv", ["fetch_schedule.py"] + argv), \
+             patch.object(fs, "date", _FixedDate), \
+             patch.object(fs, "api_get", side_effect=api_recorder), \
+             contextlib.redirect_stdout(io.StringIO()):
+            fs.main()
+
+    def test_direct_route_fast_phase_queries_only_first_seven_days(self):
+        queried = []
+        self._run(["--routes", "rdg-bri", "--days", "7"],
+                  lambda p: queried.append((p["code"], p["timeFrom"][:10])) or [])
+        dates = sorted({d for _, d in queried})
+        self.assertEqual(dates, [f"2026-07-{2 + i:02d}" for i in range(7)])
+        # Both endpoint stations fetched, once per day each.
+        self.assertEqual({s for s, _ in queried}, {"RDG", "BRI"})
+        self.assertEqual(len(queried), 2 * 7)
+
+    def test_connection_route_window_applies_to_all_three_stations(self):
+        queried = []
+        self._run(["--routes", "rdg-hoh", "--days", "7"],
+                  lambda p: queried.append((p["code"], p["timeFrom"][:10])) or [])
+        dates = sorted({d for _, d in queried})
+        self.assertEqual(dates, [f"2026-07-{2 + i:02d}" for i in range(7)])
+        self.assertEqual({s for s, _ in queried}, {"RDG", "TWY", "HOT"})
+
+    def test_append_backfill_keeps_early_days_and_never_requeries_them(self):
+        os.makedirs("data", exist_ok=True)
+        early = {"out": [{"date": f"2026-07-{2 + i:02d}", "depM": 400 + i} for i in range(7)],
+                 "ret": []}
+        existing = {"routes": {"rdg-bri": early, "rdg-hoh": {"out": [{"keep": True}], "ret": []}},
+                    "generated_at": "2026-01-01T00:00:00Z"}
+        with open("data/schedule.json", "w") as f:
+            json.dump(existing, f)
+
+        queried = []
+        # Backfill days 7..9 (2026-07-09..11) with append.
+        self._run(["--routes", "rdg-bri", "--start-day", "7", "--days", "3", "--append"],
+                  lambda p: queried.append((p["code"], p["timeFrom"][:10])) or [])
+
+        # Only the backfill window was queried — the fast phase's days weren't.
+        self.assertEqual(sorted({d for _, d in queried}),
+                         ["2026-07-09", "2026-07-10", "2026-07-11"])
+
+        with open("data/schedule.json") as f:
+            result = json.load(f)
+        # The fast phase's days 0-6 survive the backfill.
+        self.assertEqual([l["date"] for l in result["routes"]["rdg-bri"]["out"]],
+                         [f"2026-07-{2 + i:02d}" for i in range(7)])
+        # An untouched route is left exactly as it was.
+        self.assertEqual(result["routes"]["rdg-hoh"]["out"], [{"keep": True}])
+
+    def test_backfill_default_window_runs_to_end_of_lookahead(self):
+        # --start-day 7 with no --days must cover days 7..89 (the rest of the
+        # 90-day lookahead), NOT a fresh 90 days starting at day 7.
+        queried = []
+        self._run(["--routes", "rdg-bri", "--start-day", "7", "--append"],
+                  lambda p: queried.append(p["timeFrom"][:10]) or [])
+        dates = sorted(set(queried))
+        self.assertEqual(len(dates), fs.LOOKAHEAD_DAYS - 7)
+        self.assertEqual(dates[0], (date(2026, 7, 2) + timedelta(days=7)).isoformat())
+        self.assertEqual(dates[-1], (date(2026, 7, 2) + timedelta(days=fs.LOOKAHEAD_DAYS - 1)).isoformat())
+
+    def test_append_requires_routes(self):
+        with patch.object(sys, "argv", ["fetch_schedule.py", "--append"]):
+            with self.assertRaises(SystemExit):
+                fs.main()
+
+
+class TestPrintMissingRoutes(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.orig_cwd)
+        with open("routes.json", "w") as f:
+            json.dump([{"id": "rdg-oxf"}, {"id": "rdg-mai"}, {"id": "kgx-cbg"}], f)
+
+    def _capture(self):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["fetch_schedule.py", "--print-missing-routes"]), \
+             contextlib.redirect_stdout(buf):
+            fs.main()
+        return buf.getvalue().strip()
+
+    def test_prints_only_ids_missing_from_schedule(self):
+        os.makedirs("data", exist_ok=True)
+        with open("data/schedule.json", "w") as f:
+            json.dump({"routes": {"rdg-oxf": {}}}, f)
+        self.assertEqual(self._capture(), "kgx-cbg,rdg-mai")
+
+    def test_prints_all_when_no_schedule_file(self):
+        self.assertEqual(self._capture(), "kgx-cbg,rdg-mai,rdg-oxf")
+
+    def test_prints_empty_when_none_missing(self):
+        os.makedirs("data", exist_ok=True)
+        with open("data/schedule.json", "w") as f:
+            json.dump({"routes": {"rdg-oxf": {}, "rdg-mai": {}, "kgx-cbg": {}}}, f)
+        self.assertEqual(self._capture(), "")
 
 
 if __name__ == "__main__":

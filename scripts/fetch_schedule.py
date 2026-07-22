@@ -613,6 +613,40 @@ def merge_platforms_for_today(routes):
     print("Done.")
 
 
+# ── Scoped-refresh helpers (pure, unit-tested) ────────────────────────────────
+
+def missing_route_ids(routes, schedule):
+    """Route ids present in routes.json but not yet in schedule.json's routes
+    map — i.e. routes that have never been fetched. The delta-aware push in
+    update-schedule.yml uses this to fetch only newly-added (or re-added)
+    routes instead of a full run. Type-agnostic: direct and connection routes
+    are keyed the same way (by id)."""
+    have = set((schedule or {}).get("routes", {}).keys())
+    return sorted(r["id"] for r in routes if r["id"] not in have)
+
+
+def merge_route_append(existing_route, fresh_route, fetched_dates):
+    """Union freshly-fetched legs into a route's existing out/ret arrays,
+    replacing only the days that were just fetched and keeping every other
+    day. Used by the backfill phase of an on-demand add: phase 1 fetches days
+    [0, 7) and phase 2 fetches [7, 90) with this merge, so no (station, day)
+    is fetched twice and phase 1's fast-committed early days aren't lost.
+    `fetched_dates` is the set of ISO date strings covered by the fresh fetch;
+    existing legs on those dates are dropped in favour of the fresh ones, and
+    fresh dates that overlap the existing data win. Returns a new dict; does
+    not mutate either input."""
+    merged = {}
+    for direction in ("out", "ret"):
+        kept = [
+            leg for leg in (existing_route or {}).get(direction, [])
+            if leg.get("date") not in fetched_dates
+        ]
+        combined = kept + list((fresh_route or {}).get(direction, []))
+        combined.sort(key=lambda leg: (leg.get("date") or "", leg.get("depM") or 0))
+        merged[direction] = combined
+    return merged
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -636,27 +670,79 @@ def main():
              "day untouched. Combine with --routes to restrict which routes "
              "are refreshed. Requires data/schedule.json to already exist.",
     )
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="Number of lookahead days to fetch. Combined with --start-day "
+             "this defines a window [start-day, start-day+days). When omitted "
+             "the window runs from --start-day to the end of the "
+             f"{LOOKAHEAD_DAYS}-day lookahead. Used for the fast first phase of "
+             "an on-demand route add (e.g. --days 7) so a new route is usable "
+             "within a couple of minutes, with the rest backfilled separately "
+             "(see --append).",
+    )
+    parser.add_argument(
+        "--start-day", type=int, default=0,
+        help="Offset (in days from today) of the first day to fetch (default "
+             "0). The backfill phase of an on-demand add uses e.g. "
+             "--start-day 7 to fetch only days 7..89 without re-querying the "
+             "first week already fetched by the fast phase.",
+    )
+    parser.add_argument(
+        "--append", action="store_true",
+        help="Merge the fetched day window into each route's existing out/ret "
+             "arrays instead of replacing them (union by date — fetched days "
+             "win, all other days are kept). Use for the backfill phase so it "
+             "doesn't discard the fast phase's early days. Requires --routes.",
+    )
+    parser.add_argument(
+        "--print-missing-routes", action="store_true",
+        help="Print a comma-separated list of route ids that are in "
+             "routes.json but not yet in data/schedule.json (never fetched), "
+             "then exit. Used by the delta-aware push workflow to fetch only "
+             "new/re-added routes. Makes no API calls.",
+    )
     args = parser.parse_args()
+
+    with open("routes.json") as f:
+        all_routes = json.load(f)
+
+    if args.print_missing_routes:
+        schedule = {}
+        if os.path.exists("data/schedule.json"):
+            with open("data/schedule.json") as f:
+                schedule = json.load(f)
+        print(",".join(missing_route_ids(all_routes, schedule)))
+        return
     route_filter = (
         {r.strip() for r in args.routes.split(",") if r.strip()}
         if args.routes else None
     )
 
-    with open("routes.json") as f:
-        routes = json.load(f)
-
+    routes = all_routes
     if route_filter is not None:
         unknown = route_filter - {route["id"] for route in routes}
         if unknown:
             raise SystemExit(f"Unknown route id(s) in --routes: {', '.join(sorted(unknown))}")
         routes = [route for route in routes if route["id"] in route_filter]
 
+    if args.append and route_filter is None:
+        raise SystemExit("--append requires --routes (it merges named routes into existing data).")
+
     if args.platforms_only:
         merge_platforms_for_today(routes)
         return
 
     # Timetable days are calendar dates — the day starts at 03:00 on that date.
-    days = [date.today() + timedelta(days=i) for i in range(LOOKAHEAD_DAYS)]
+    # --start-day / --days select a window [start, start+num). When --days is
+    # omitted the window runs from start-day to the end of the 90-day lookahead,
+    # so `--start-day 7` (the backfill phase) covers days 7..89, not a fresh 90
+    # days starting at 7.
+    num_days = args.days if args.days is not None else max(0, LOOKAHEAD_DAYS - args.start_day)
+    days = [
+        date.today() + timedelta(days=i)
+        for i in range(args.start_day, args.start_day + num_days)
+    ]
+    fetched_dates = {d.isoformat() for d in days}
 
     # A scoped run (--routes) merges into whatever's already on disk instead
     # of overwriting every route, so the other routes' last-known-good data
@@ -668,16 +754,27 @@ def main():
     else:
         result = {"routes": {}}
 
+    window = f"days {args.start_day}..{args.start_day + num_days - 1}"
     for route in routes:
         rid = route["id"]
-        print(f"\nFetching {rid} ({route['from']} ↔ {route['to']})…")
+        print(f"\nFetching {rid} ({route['from']} ↔ {route['to']})… [{window}]")
         if route.get("change"):
-            result["routes"][rid] = fetch_connection(
+            fresh = fetch_connection(
                 route["from"], route["change"], route["to"],
                 route.get("minConnectionMins", 5), days,
             )
         else:
-            result["routes"][rid] = fetch_direct(route["from"], route["to"], days)
+            fresh = fetch_direct(route["from"], route["to"], days)
+
+        if args.append:
+            # Backfill phase: union this window into the route's existing
+            # arrays rather than replacing them, so the fast phase's early
+            # days survive and no day is fetched twice.
+            result["routes"][rid] = merge_route_append(
+                result["routes"].get(rid), fresh, fetched_dates
+            )
+        else:
+            result["routes"][rid] = fresh
 
         out_c = len(result["routes"][rid]["out"])
         ret_c = len(result["routes"][rid]["ret"])
