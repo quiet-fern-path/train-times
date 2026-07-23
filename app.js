@@ -7,6 +7,12 @@ let SCHEDULE = { routes: {} };
 let activeRouteId = null;
 let activeDir = 'out';
 let secTimer = null;
+// routeId -> {out, ret} of legs synthesized directly from a live departure
+// board (see synthesizeLiveLegs/overlayLiveOnlyRoute) for "quick" routes —
+// session-only routes added via the "+" chip that have no schedule.json
+// entry at all. Plays the same role SCHEDULE.routes[id] plays for curated
+// routes, but is never persisted to localStorage/the repo.
+let LIVE_ONLY_BOARDS = {};
 // routeId -> has a live fetch ever succeeded for this route (today)? Drives
 // whether a failed refresh reports "still showing last known live data" vs
 // "no live data yet" — see refreshLiveOverlay().
@@ -102,12 +108,41 @@ async function loadJSON(url) {
   return r.json();
 }
 
+// ── Quick (session-only) routes ────────────────────────────────────
+// Added via the "+" chip in the route picker: no schedule.json entry, no
+// commit, nothing written to the repo — just an instant live-board view.
+// Stored in sessionStorage (not localStorage) so the platform itself enforces
+// "gone when the tab/browser session ends" rather than needing cleanup code.
+const USER_ROUTES_KEY = 'userRoutes';
+
+function loadUserRoutes() {
+  let raw;
+  try { raw = sessionStorage.getItem(USER_ROUTES_KEY); } catch (e) { return []; }
+  if (!raw) return [];
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { return []; }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter(r => r && typeof r.id === 'string' && typeof r.from === 'string' && typeof r.to === 'string');
+}
+
+function saveUserRoutes(routes) {
+  try { sessionStorage.setItem(USER_ROUTES_KEY, JSON.stringify(routes)); } catch (e) { /* full/unavailable — nothing to surface */ }
+}
+
+// Curated routes first, so ROUTES[0] (the default active route — see loadAll)
+// is never displaced by a quick route added this session.
+function mergeUserRoutes(baseRoutes) {
+  return (baseRoutes || []).concat(loadUserRoutes());
+}
+
 async function loadAll() {
-  [ROUTES, STATIONS, SCHEDULE] = await Promise.all([
+  let routes;
+  [routes, STATIONS, SCHEDULE] = await Promise.all([
     loadJSON('./routes.json'),
     loadJSON('./stations.json'),
     loadJSON('./data/schedule.json'),
   ]);
+  ROUTES = mergeUserRoutes(routes);
   activeRouteId = ROUTES[0].id;
 }
 
@@ -125,7 +160,7 @@ const DATA_RELOAD_HANDLERS = {
     SCHEDULE = await loadJSON('./data/schedule.json');
   },
   [new URL('./routes.json', location.href).href]: async () => {
-    ROUTES = await loadJSON('./routes.json');
+    ROUTES = mergeUserRoutes(await loadJSON('./routes.json'));
     if (!ROUTES.some(r => r.id === activeRouteId)) activeRouteId = ROUTES[0].id;
   },
   [new URL('./stations.json', location.href).href]: async () => {
@@ -253,11 +288,23 @@ function derivePlatformState(livePlatform, bookedPlatform, hidden) {
 }
 
 // ── Route picker / tabs ─────────────────────────────────────────────
+// The "+" add-quick-route control is deliberately its own class (not
+// `.route-chip`) so it's never swept up by the `.route-chip` click wiring
+// below, which assumes every match has a real `data-route` id.
 function renderRoutePicker() {
   const el = document.getElementById('route-picker');
-  el.innerHTML = ROUTES.map(r =>
-    `<button class="route-chip${r.id === activeRouteId ? ' active' : ''}" data-route="${r.id}">${r.name}</button>`
-  ).join('');
+  el.innerHTML = ROUTES.map(r => {
+    // A quick (session-only) route gets a small live-dot marker and its own
+    // "×" to remove it instantly — curated routes have neither; removing one
+    // of those stays exclusively the deliberate, git-committed flow in
+    // add-route.html.
+    const chip = `<button class="route-chip${r.id === activeRouteId ? ' active' : ''}${r.liveOnly ? ' route-chip-live' : ''}" data-route="${r.id}">${r.liveOnly ? '<span class="route-chip-dot"></span>' : ''}${r.name}</button>`;
+    const removeBtn = r.liveOnly
+      ? `<button class="chip-remove" data-remove="${r.id}" title="Remove this quick route">&times;</button>`
+      : '';
+    return chip + removeBtn;
+  }).join('') + `<button class="chip-add-quick" id="chip-add-quick" title="Add a quick live route — this session only, no commit">+</button>`;
+
   el.querySelectorAll('.route-chip').forEach(btn => {
     btn.addEventListener('click', () => {
       activeRouteId = btn.dataset.route;
@@ -266,6 +313,11 @@ function renderRoutePicker() {
       scrollToNextIfToday();
     });
   });
+  el.querySelectorAll('.chip-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeQuickRoute(btn.dataset.remove));
+  });
+  const addBtn = document.getElementById('chip-add-quick');
+  if (addBtn) addBtn.addEventListener('click', openQuickRouteSheet);
 }
 
 function updateRouteTitle() {
@@ -402,21 +454,14 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
 }
 
 // ── Rendering ───────────────────────────────────────────────────────
-function renderDirection(dir) {
-  const route = currentRoute();
-  if (!route) return;
-  const listEl = document.getElementById('list-' + dir);
-  const dateStr = document.getElementById('vdate').value || todayStr();
-  const isToday = dateStr === todayStr();
-  const curM = isToday ? nowM() : -1;
-
-  const routeData = SCHEDULE.routes[route.id] || { out: [], ret: [] };
-  const isConnection = !!route.change;
-  const legs = (routeData[dir] || []).filter(l => l.date === dateStr).sort((a, b) => a.depM - b.depM);
-
+// Shared by both the schedule-backed path and the quick (live-only) path
+// below — overtaking, next-train selection, the now-line, and card building
+// don't care where the legs came from, only that they carry depM/arrM/
+// _cancelled/_next-compatible fields (which both synthesizeLiveLegs and
+// schedule.json legs do).
+function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml) {
   if (!legs.length) {
-    const dayLabel = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
-    listEl.innerHTML = `<div class="no-svc"><strong>No service data</strong>No trains found for ${dayLabel}. If this looks wrong, the weekly schedule refresh may not have run yet, or this date is beyond the current lookahead window.</div>`;
+    listEl.innerHTML = emptyHtml;
     return;
   }
 
@@ -449,6 +494,7 @@ function renderDirection(dir) {
       slowerCount > 0 ? `· ${slowerCount} slower train${slowerCount === 1 ? '' : 's'} dimmed` : '';
   }
 
+  const route = currentRoute();
   const parts = [];
   let nowDone = false;
   for (const leg of visible) {
@@ -457,7 +503,7 @@ function renderDirection(dir) {
       parts.push(`<div class="now-line">Now ${hm}</div>`);
       nowDone = true;
     }
-    parts.push(isConnection ? connectionCard(leg, route, dir, isToday, curM, fasterMap.get(leg)) : directCard(leg, route, dir, isToday, curM, fasterMap.get(leg)));
+    parts.push(cardBuilder(leg, route, dir, isToday, curM, fasterMap.get(leg)));
   }
   if (isToday && !nowDone) {
     const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
@@ -474,16 +520,61 @@ function renderDirection(dir) {
   }
 }
 
+function liveOnlyEmptyHtml() {
+  return apiKey()
+    ? `<div class="no-svc"><strong>Fetching live departures…</strong>This is a quick route — it has no timetable of its own, only Darwin's live board. If nothing shows up in a few seconds, check your connection.</div>`
+    : `<div class="no-svc"><strong>This is a quick route</strong>It has no timetable of its own — it only shows live departures. Add your free Darwin key (tap ⚙) to see anything here.</div>`;
+}
+
+function renderDirection(dir) {
+  const route = currentRoute();
+  if (!route) return;
+  const listEl = document.getElementById('list-' + dir);
+
+  if (route.liveOnly) {
+    const board = LIVE_ONLY_BOARDS[route.id] || {};
+    const legs = (board[dir] || []).slice().sort((a, b) => a.depM - b.depM);
+    renderLegList(listEl, legs, dir, true, nowM(), directCard, liveOnlyEmptyHtml());
+    return;
+  }
+
+  const dateStr = document.getElementById('vdate').value || todayStr();
+  const isToday = dateStr === todayStr();
+  const curM = isToday ? nowM() : -1;
+
+  const routeData = SCHEDULE.routes[route.id] || { out: [], ret: [] };
+  const isConnection = !!route.change;
+  const legs = (routeData[dir] || []).filter(l => l.date === dateStr).sort((a, b) => a.depM - b.depM);
+  const dayLabel = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+  const emptyHtml = `<div class="no-svc"><strong>No service data</strong>No trains found for ${dayLabel}. If this looks wrong, the weekly schedule refresh may not have run yet, or this date is beyond the current lookahead window.</div>`;
+
+  renderLegList(listEl, legs, dir, isToday, curM, isConnection ? connectionCard : directCard, emptyHtml);
+}
+
 function render() {
   Object.values(SCHEDULE.routes).forEach(rd => {
     (rd.out || []).forEach(l => { delete l._next; });
     (rd.ret || []).forEach(l => { delete l._next; });
   });
+  Object.values(LIVE_ONLY_BOARDS).forEach(rd => {
+    (rd.out || []).forEach(l => { delete l._next; });
+    (rd.ret || []).forEach(l => { delete l._next; });
+  });
+  const route = currentRoute();
+  const isLiveOnly = !!(route && route.liveOnly);
+  // A quick route only ever shows "now" — force today so a date left over
+  // from a previously-viewed curated route can't leak in, and hide the date
+  // nav entirely since there's nothing else to navigate to.
+  if (isLiveOnly) document.getElementById('vdate').value = todayStr();
+  const dateNav = document.querySelector('.date-nav');
+  if (dateNav) dateNav.style.display = isLiveOnly ? 'none' : 'flex';
   renderRoutePicker();
   updateRouteTitle();
   renderDirection('out');
   renderDirection('ret');
-  document.getElementById('schedule-age').textContent = scheduleAgeLabel();
+  // schedule.json's generation time is meaningless for a quick route (it has
+  // no schedule.json entry at all).
+  document.getElementById('schedule-age').textContent = isLiveOnly ? '' : scheduleAgeLabel();
   refreshLiveOverlay();
 }
 
@@ -614,6 +705,59 @@ function findCallingPoint(svc, crs) {
   return null;
 }
 
+// Build leg-shaped objects directly from a live departure board's own
+// trainServices — used for quick (session-only) routes, which have no
+// schedule.json entry to overlay live data onto. Unlike applyDirectOverlay
+// (which projects a live delay onto a pre-existing RTT-scheduled leg), a
+// quick route has nothing to compare "live" against except this same fetch,
+// so the scheduled and _live* fields both come from it. derivePlatformState
+// is passed a null booked platform (there isn't one), so a live platform
+// always reads as confirmed, never "changed" — there's nothing to compare it
+// against. uid is always null: Darwin's serviceID isn't the RTT identity RTT
+// deep links need, so directCard's existing `leg.uid ? ... : ''` guard
+// already hides the link, no card changes required.
+function synthesizeLiveLegs(board, destCrs) {
+  if (!board || !board.trainServices) return [];
+  const legs = [];
+  for (const svc of board.trainServices) {
+    if (!svc.std) continue;
+    const destPoint = findCallingPoint(svc, destCrs);
+    if (!destPoint) continue; // board is already filtered `to` destCrs — shouldn't normally miss
+    const depM = liveMinute(svc.std);
+    const etdIsTime = svc.etd && /^\d{2}:\d{2}$/.test(svc.etd);
+    const isCancelled = svc.isCancelled || svc.etd === 'Cancelled' || !!destPoint.isCancelled || false;
+    const delayMins = etdIsTime ? Math.max(0, liveMinute(svc.etd) - depM) : 0;
+    const platformState = derivePlatformState(svc.platform, null, svc.platformIsHidden);
+    let liveArr = null;
+    if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) liveArr = destPoint.et;
+    else if (destPoint.et === 'On time') liveArr = destPoint.st || null;
+
+    legs.push({
+      date: todayStr(),
+      serviceDate: todayStr(),
+      uid: null,
+      toc: svc.operatorCode,
+      dep: svc.std,
+      depM,
+      arr: destPoint.st || null,
+      arrM: destPoint.st ? liveMinute(destPoint.st) : null,
+      platform: null, // no "booked" platform for a quick route
+      platformConfirmed: false,
+      _liveChecked: true,
+      _cancelled: isCancelled,
+      _liveDep: etdIsTime ? svc.etd : svc.std,
+      _platform: svc.platform || null,
+      _platformConfirmed: platformState.confirmed,
+      _platformChanged: platformState.changed,
+      _platformHidden: platformState.hidden,
+      _delayMins: delayMins,
+      _liveDepM: depM + delayMins,
+      _liveArr: liveArr,
+    });
+  }
+  return legs;
+}
+
 // ── Live data persistence (survive reload / tab switch, up to 1hr) ──
 // In-memory live state (leg._liveDepM etc., liveEverSucceeded,
 // lastLiveSuccessAt) is lost on every page load, so a refresh used to show
@@ -658,7 +802,25 @@ function restoreLegs(legs, isConnection, cached) {
     if (snap) Object.assign(leg, snap);
   }
 }
+// A quick route's cache lives in sessionStorage (gone with the session, like
+// the route itself) and holds the FULL synthesized leg arrays rather than a
+// sparse _field diff — there's no separate schedule leg to merge onto, the
+// cached leg *is* the whole thing. Curated routes keep the existing
+// localStorage + sparse-diff-onto-schedule-legs behaviour unchanged.
+function liveCacheStorage(route) { return route.liveOnly ? sessionStorage : localStorage; }
+
 function saveLiveCache(route, dateStr) {
+  if (route.liveOnly) {
+    const board = LIVE_ONLY_BOARDS[route.id];
+    if (!board) return;
+    const payload = { date: dateStr, savedAt: Date.now(), out: board.out, ret: board.ret };
+    try {
+      sessionStorage.setItem(liveCacheKey(route.id), JSON.stringify(payload));
+    } catch (e) {
+      // sessionStorage full/unavailable — nothing to surface to the user.
+    }
+    return;
+  }
   const data = SCHEDULE.routes[route.id];
   if (!data) return;
   const isConnection = !!route.change;
@@ -677,12 +839,20 @@ function saveLiveCache(route, dateStr) {
 }
 function restoreLiveCacheForRoute(route) {
   let raw;
-  try { raw = localStorage.getItem(liveCacheKey(route.id)); } catch (e) { return; }
+  try { raw = liveCacheStorage(route).getItem(liveCacheKey(route.id)); } catch (e) { return; }
   if (!raw) return;
   let cached;
   try { cached = JSON.parse(raw); } catch (e) { return; }
   const age = Date.now() - (cached.savedAt || 0);
   if (!(age >= 0) || age > LIVE_CACHE_MAX_AGE_MS || cached.date !== todayStr()) return;
+
+  if (route.liveOnly) {
+    LIVE_ONLY_BOARDS[route.id] = { out: cached.out || [], ret: cached.ret || [] };
+    liveEverSucceeded[route.id] = true;
+    lastLiveSuccessAt[route.id] = cached.savedAt;
+    return;
+  }
+
   const data = SCHEDULE.routes[route.id];
   if (!data) return;
   const isConnection = !!route.change;
@@ -728,12 +898,17 @@ async function refreshLiveOverlay() {
   updateLiveErrorIndicator();
 
   if (!apiKey()) {
-    setLiveStatus('off', 'Scheduled times only — tap ⚙ for live platforms & delays');
+    // A quick route has no scheduled-time fallback at all (unlike curated
+    // routes), so it needs a distinct message rather than "scheduled times
+    // only", which would wrongly imply it has scheduled times to fall back to.
+    setLiveStatus('off', route.liveOnly
+      ? 'This route needs your Darwin key to show anything — tap ⚙'
+      : 'Scheduled times only — tap ⚙ for live platforms & delays');
     return;
   }
 
   const dateStr = document.getElementById('vdate').value || todayStr();
-  if (dateStr !== todayStr()) {
+  if (!route.liveOnly && dateStr !== todayStr()) {
     setLiveStatus('off', 'Scheduled times (live only available for today)');
     return;
   }
@@ -747,9 +922,11 @@ async function refreshLiveOverlay() {
   liveAuthError = false;
   let ok = false;
   try {
-    ok = route.change
-      ? await overlayConnectionLive(route, dateStr)
-      : await overlayDirectLive(route, dateStr);
+    ok = route.liveOnly
+      ? await overlayLiveOnlyRoute(route)
+      : route.change
+        ? await overlayConnectionLive(route, dateStr)
+        : await overlayDirectLive(route, dateStr);
   } catch (e) {
     ok = false;
     liveErrorDetails.push(`Unexpected error in refreshLiveOverlay: ${e && e.stack ? e.stack : e}`);
@@ -758,7 +935,7 @@ async function refreshLiveOverlay() {
   if (ok) {
     liveEverSucceeded[route.id] = true;
     lastLiveSuccessAt[route.id] = Date.now();
-    setLiveStatus('on', 'Live platforms & delays');
+    setLiveStatus('on', route.liveOnly ? 'Live departures' : 'Live platforms & delays');
     saveLiveCache(route, dateStr);
   } else if (liveAuthError) {
     // Distinct from a generic/transient failure: Darwin rejected the key
@@ -768,7 +945,9 @@ async function refreshLiveOverlay() {
   } else if (liveEverSucceeded[route.id]) {
     setLiveStatus('stale', staleLiveLabel(route.id));
   } else {
-    setLiveStatus('error', 'Scheduled times (live update failed)');
+    // A quick route has no scheduled-time fallback to mention — unlike a
+    // curated route, there was never anything else to show.
+    setLiveStatus('error', route.liveOnly ? 'No live data yet — check your connection' : 'Scheduled times (live update failed)');
   }
 
   if (!ok && liveErrorDetails.length) {
@@ -787,6 +966,31 @@ async function refreshLiveOverlay() {
 
   renderDirection('out');
   renderDirection('ret');
+}
+
+// Pure merge step, factored out so the "never wipe on a failed fetch"
+// guarantee is directly unit-testable without touching module-private state:
+// only replaces out/ret for whichever board actually succeeded this round
+// (mirrors applyDirectOverlay's own "if (!board) return" no-wipe behaviour),
+// so a dropped connection (e.g. a Tube tunnel) never blanks the last-known
+// board for the direction that failed.
+function mergeLiveOnlyBoard(existing, outBoard, retBoard, route) {
+  existing = existing || { out: [], ret: [] };
+  return {
+    out: outBoard ? synthesizeLiveLegs(outBoard, route.to) : (existing.out || []),
+    ret: retBoard ? synthesizeLiveLegs(retBoard, route.from) : (existing.ret || []),
+  };
+}
+
+// Fetches both direction boards for a quick route and merges them in via
+// mergeLiveOnlyBoard — there's no schedule leg to overlay onto, this fully
+// replaces LIVE_ONLY_BOARDS[route.id] each round (except where a board fetch
+// failed, see above).
+async function overlayLiveOnlyRoute(route) {
+  const outBoard = await fetchBoard(route.from, route.to, 'to');
+  const retBoard = await fetchBoard(route.to, route.from, 'to');
+  LIVE_ONLY_BOARDS[route.id] = mergeLiveOnlyBoard(LIVE_ONLY_BOARDS[route.id], outBoard, retBoard, route);
+  return !!(outBoard || retBoard);
 }
 
 async function overlayDirectLive(route, dateStr) {
@@ -962,6 +1166,94 @@ document.querySelectorAll('.tab').forEach(btn => {
     }
   });
 });
+
+// ── Quick (session-only) route sheet ────────────────────────────────
+// stations_all.json (~2,500 entries) is lazily fetched here on first open and
+// cached in this module-level var for the rest of the session — kept out of
+// the main app's precache/bootstrap list (same reasoning as add-route.html
+// lazy-loading it) so it never bloats a normal first visit.
+let QUICK_STATIONS = null;
+
+async function ensureQuickStations() {
+  if (QUICK_STATIONS) return QUICK_STATIONS;
+  QUICK_STATIONS = await loadJSON('./stations_all.json');
+  const dl = document.getElementById('quick-station-options');
+  if (dl) {
+    dl.innerHTML = Object.keys(QUICK_STATIONS)
+      .map(crs => `<option value="${QUICK_STATIONS[crs]} (${crs})"></option>`).join('');
+  }
+  return QUICK_STATIONS;
+}
+
+// Extract a CRS from a picker value that may be a bare code ("RDG") or the
+// "Name (RDG)" form used by the datalist options above — same convention as
+// add-route.js's parseCrs.
+function parseQuickCrs(input) {
+  if (!input) return '';
+  const s = String(input).trim().toUpperCase();
+  const m = s.match(/\(([A-Z0-9]{3})\)\s*$/);
+  if (m) return m[1];
+  return /^[A-Z0-9]{3}$/.test(s) ? s : '';
+}
+
+// Prefixed distinctly from curated ids (which are never "q-...") so a quick
+// route can never collide with — or be confused in the URL hash/persisted
+// state with — a real, git-committed route id.
+function buildQuickRouteId(from, to) { return 'q-' + from.toLowerCase() + '-' + to.toLowerCase(); }
+
+async function openQuickRouteSheet() {
+  document.getElementById('quick-route-error').textContent = '';
+  document.getElementById('quick-from-input').value = '';
+  document.getElementById('quick-to-input').value = '';
+  document.getElementById('quick-route-overlay').classList.add('open');
+  try {
+    await ensureQuickStations();
+  } catch (e) {
+    document.getElementById('quick-route-error').textContent = 'Could not load the station list: ' + e.message;
+  }
+}
+function closeQuickRouteSheet() {
+  document.getElementById('quick-route-overlay').classList.remove('open');
+}
+
+function addQuickRoute() {
+  const errEl = document.getElementById('quick-route-error');
+  const from = parseQuickCrs(document.getElementById('quick-from-input').value);
+  const to = parseQuickCrs(document.getElementById('quick-to-input').value);
+  const stations = QUICK_STATIONS || {};
+  if (!from || !stations[from]) { errEl.textContent = 'Pick a valid origin station.'; return; }
+  if (!to || !stations[to]) { errEl.textContent = 'Pick a valid destination station.'; return; }
+  if (from === to) { errEl.textContent = 'Origin and destination must differ.'; return; }
+
+  const id = buildQuickRouteId(from, to);
+  if (ROUTES.some(r => r.id === id)) { errEl.textContent = 'That route is already added.'; return; }
+
+  const route = { id, name: `${stations[from]} ↔ ${stations[to]}`, from, to, change: null, liveOnly: true };
+  ROUTES = ROUTES.concat([route]);
+  saveUserRoutes(ROUTES.filter(r => r.liveOnly));
+  activeRouteId = id;
+  closeQuickRouteSheet();
+  persistState();
+  render();
+  scrollToNextIfToday();
+}
+
+// No confirmation dialog: this is local-only and instantly reversible by
+// re-adding, unlike the git-committed remove flow in add-route.html.
+function removeQuickRoute(id) {
+  ROUTES = ROUTES.filter(r => r.id !== id);
+  saveUserRoutes(ROUTES.filter(r => r.liveOnly));
+  delete LIVE_ONLY_BOARDS[id];
+  try { sessionStorage.removeItem(liveCacheKey(id)); } catch (e) { /* ignore */ }
+  delete liveEverSucceeded[id];
+  delete lastLiveSuccessAt[id];
+  if (activeRouteId === id) activeRouteId = ROUTES[0].id;
+  persistState();
+  render();
+}
+
+document.getElementById('btn-quick-route-close').addEventListener('click', closeQuickRouteSheet);
+document.getElementById('btn-quick-route-add').addEventListener('click', addQuickRoute);
 
 // ── Settings panel ──────────────────────────────────────────────────
 function openSettings() {

@@ -30,13 +30,13 @@ different auth models, and different failure-degradation requirements.
 |---|---|
 | `index.html` | App shell. Also contains the inline bootstrap-cache script (see below). |
 | `styles.css` | All styling. Single file, no preprocessor. |
-| `app.js` | All client logic: rendering, overtaking, live overlay, settings. |
+| `app.js` | All client logic: rendering, overtaking, live overlay, settings, quick (session-only) live routes (see below). |
 | `add-route.html` / `add-route.js` | In-app route builder / manager (see "In-app route builder" below). Standalone page linked from the settings sheet; commits `routes.json`/`stations.json`/`parked-routes.json` via the GitHub API with the user's own token. |
 | `sw.js` | Service worker — stale-while-revalidate caching. |
 | `routes.json` | Route config: `{id, name, from, to, change, minConnectionMins}`. Edit this to add/change routes — no other code changes needed for a direct route. |
 | `parked-routes.json` | Routes removed via the builder, kept with full config for one-click re-add. Ships as `[]`. Not read by the main app. |
 | `stations.json` | CRS code → display name for the configured routes. Add an entry whenever you add a station to `routes.json`. |
-| `stations_all.json` | Full national CRS → name map (~2,600). Powers the builder's station autocomplete only; loaded lazily by `add-route.html`, kept out of the main app's precache. |
+| `stations_all.json` | Full national CRS → name map (~2,600). Powers station autocomplete for both the builder (`add-route.html`) and the main app's quick-route sheet; loaded lazily by each, kept out of the main app's precache. |
 | `data/schedule.json` | Generated output. Don't hand-edit — it's overwritten by the Action every run. Ships with an empty-arrays placeholder (`is_seed_placeholder: true`) until the Action runs for real. |
 | `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
 | `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
@@ -570,6 +570,73 @@ Key pieces, all reused rather than rebuilt:
   still fetch its own stations once.
 - **`stations_all.json`** (national CRS→name) powers the builder's autocomplete
   only; it's loaded lazily by that page and kept out of the main precache.
+
+## Quick (session-only) live routes
+
+A second, much lighter way to see an arbitrary route, built directly into
+`app.js` (not the builder page) — no GitHub token, no commit, no schedule
+fetch, just an instant view of Darwin's live departure board. A "**+**" chip
+at the end of the route picker (`renderRoutePicker()`) opens a small sheet
+(`#quick-route-overlay` in `index.html`) with From/To station autocomplete
+(`stations_all.json`, lazily fetched the first time the sheet opens — same
+reasoning as the builder page keeping it out of the main precache). The
+resulting route object gets `liveOnly: true` and an id prefixed `q-` (e.g.
+`q-rdg-bri`) so it can never collide with a real, git-committed route id.
+
+**Deliberately session-scoped, not a permanent add** — this was an explicit
+design decision, not an oversight: quick routes and their live-board cache
+live in **`sessionStorage`**, not `localStorage`, so the browser itself
+enforces "gone when the tab/browser session ends" rather than needing cleanup
+code. `loadUserRoutes()`/`saveUserRoutes()`/`mergeUserRoutes()` read/write
+`sessionStorage.userRoutes`; `ROUTES` is `routes.json`'s curated entries with
+these appended (curated ones stay first, so `ROUTES[0]` — the default active
+route — is never displaced by a quick route). Don't "fix" this to
+`localStorage` — that's the opposite of what was asked for.
+
+**No schedule.json entry at all** — `LIVE_ONLY_BOARDS` (routeId → `{out,
+ret}`) plays the same role `SCHEDULE.routes[id]` plays for curated routes, but
+is populated purely by fetching the live board and mapping it straight into
+leg-shaped objects (`synthesizeLiveLegs()`), since there's no RTT schedule to
+overlay live data onto. This reuses everything the existing live overlay
+already does — `fetchBoard()` (same two calls `overlayDirectLive` makes),
+`liveMinute()`, `findCallingPoint()` (for the destination's scheduled/live
+arrival — the board is already filtered `filterType:'to'`), and
+`derivePlatformState()` — called with a **null booked platform** (there isn't
+one for a quick route), so a live platform always reads as confirmed, never
+"changed": there's nothing to compare it against. `leg.uid` is always `null`
+— Darwin's `serviceID` isn't the RTT identity RTT deep links need, so
+`directCard()`'s existing `leg.uid ? ... : ''` guard already hides the link
+with no card changes. Quick routes are **direct only** — no change-station
+field in the sheet, matching the connection-scope decision already made for
+the builder.
+
+**Never wipe the last-known board on a failed fetch** — `mergeLiveOnlyBoard()`
+(factored out specifically so this is unit-testable) only replaces `out`/
+`ret` for whichever board actually succeeded that round, mirroring
+`applyDirectOverlay`'s own no-wipe-on-failure behaviour. This is what makes a
+quick route robust to a dropped connection (e.g. a Tube tunnel): the last
+board keeps rendering, the status bar shows "stale" via the *existing*
+`staleLiveLabel()` machinery, and `window.addEventListener('online', ...)`
+already re-fetches on reconnect — none of that needed any new code.
+
+**The live-board cache shape differs from curated routes'** — `saveLiveCache`/
+`restoreLiveCacheForRoute` branch on `route.liveOnly`: curated routes cache a
+*sparse diff* of `_live*` fields keyed by uid (`snapshotLegs`/`restoreLegs`),
+merged onto freshly-loaded schedule legs on restore. A quick route has no
+separate schedule to merge onto, so its cached payload is the **full
+synthesized leg array** itself, stored under the same `liveCache:<id>` key
+name (same 1-hour staleness check) but in `sessionStorage` instead of
+`localStorage`. This is why a quick route's last board still shows instantly
+after a reload *within the same tab session*, but is gone after the tab/
+browser closes — the same mechanism the requirement asked for, just backed by
+a different store.
+
+**Date nav is hidden and forced to today** for a quick route (`render()`) —
+there's no other day to show, only "now". `#schedule-age` is blanked for the
+same reason: `schedule.json`'s generation time is meaningless for a route
+that has no entry in it. Removing a quick route (the chip's "×") needs no
+confirmation dialog, unlike the builder's Remove/Delete-forever — it's
+local-only and instantly reversible by just re-adding it.
 
 ## Local development
 

@@ -32,6 +32,13 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .route-picker{display:flex;gap:6px;overflow-x:auto;margin-top:8px;padding-bottom:2px;-webkit-overflow-scrolling:touch}
 .route-chip{flex-shrink:0;padding:6px 12px;border-radius:20px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#cbd5e1;font-size:.76rem;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap}
 .route-chip.active{background:#fff;color:var(--navy);border-color:#fff}
+/* Quick (session-only) route: a small live-dot marker distinguishes it from
+   curated chips, echoing the same green used for "live" elsewhere (.live-dot.on). */
+.route-chip-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#34d399;margin-right:5px;vertical-align:middle}
+.chip-remove{flex-shrink:0;width:22px;height:22px;margin-left:-4px;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#cbd5e1;font-size:.9rem;line-height:1;cursor:pointer;font-family:inherit}
+.chip-remove:hover{background:rgba(255,255,255,.25)}
+.chip-add-quick{flex-shrink:0;width:30px;height:30px;padding:0;border-radius:50%;border:1px dashed rgba(255,255,255,.4);background:transparent;color:#cbd5e1;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit}
+.chip-add-quick:hover{background:rgba(255,255,255,.12)}
 
 /* TABS */
 .tab-bar{position:sticky;top:var(--header-h);z-index:99;display:flex;background:var(--navy-mid);box-shadow:0 2px 6px rgba(0,0,0,.25)}
