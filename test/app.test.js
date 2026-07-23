@@ -547,3 +547,189 @@ describe('openSettings() and the status-bar click-to-settings shortcut', () => {
     assert.equal(ctx.__elements.has('settings-overlay'), false);
   });
 });
+
+describe('synthesizeLiveLegs() — quick (session-only) routes built straight off a live board', () => {
+  test('a matched, on-time service becomes a leg with zero delay and a confirmed platform', () => {
+    const ctx = loadApp();
+    const board = {
+      trainServices: [{
+        std: '07:03', etd: 'On time', platform: '3', operatorCode: 'GW',
+        subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '07:47', et: 'On time' }] }],
+      }],
+    };
+    const legs = ctx.synthesizeLiveLegs(board, 'PAD');
+    assert.equal(legs.length, 1);
+    const leg = legs[0];
+    assert.equal(leg.dep, '07:03');
+    assert.equal(leg.depM, 423);
+    assert.equal(leg.arr, '07:47');
+    assert.equal(leg.uid, null); // no RTT identity available from Darwin -> no deep link
+    assert.equal(leg.toc, 'GW');
+    assert.equal(leg._cancelled, false);
+    assert.equal(leg._delayMins, 0);
+    assert.equal(leg._liveDepM, 423);
+    assert.equal(leg._liveArr, '07:47');
+    // No booked platform to compare against -> confirmed, never "changed".
+    assert.equal(leg._platformConfirmed, true);
+    assert.equal(leg._platformChanged, false);
+  });
+
+  test('cancellation is detected via etd === "Cancelled", matching applyDirectOverlay\'s convention', () => {
+    const ctx = loadApp();
+    const board = {
+      trainServices: [{
+        std: '07:03', etd: 'Cancelled',
+        subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '07:47' }] }],
+      }],
+    };
+    assert.equal(ctx.synthesizeLiveLegs(board, 'PAD')[0]._cancelled, true);
+  });
+
+  test('a cancelled destination calling point also marks the leg cancelled', () => {
+    const ctx = loadApp();
+    const board = {
+      trainServices: [{
+        std: '07:03', etd: 'On time',
+        subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '07:47', isCancelled: true }] }],
+      }],
+    };
+    assert.equal(ctx.synthesizeLiveLegs(board, 'PAD')[0]._cancelled, true);
+  });
+
+  test('a delayed departure computes _delayMins/_liveDepM using the 3am-aware liveMinute', () => {
+    const ctx = loadApp();
+    const board = {
+      trainServices: [{
+        std: '23:50', etd: '00:10',
+        subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '00:30' }] }],
+      }],
+    };
+    const leg = ctx.synthesizeLiveLegs(board, 'PAD')[0];
+    assert.equal(leg.depM, 1430); // 23:50
+    assert.equal(leg._delayMins, 1450 - 1430); // 00:10 -> 1450 via the boundary offset
+    assert.equal(leg._liveDepM, 1430 + 20);
+  });
+
+  test('a delayed destination calling point sets _liveArr to the estimate', () => {
+    const ctx = loadApp();
+    const board = {
+      trainServices: [{
+        std: '07:03', etd: 'On time',
+        subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '07:47', et: '08:02' }] }],
+      }],
+    };
+    assert.equal(ctx.synthesizeLiveLegs(board, 'PAD')[0]._liveArr, '08:02');
+  });
+
+  test('a service with no calling point at destCrs is skipped (board should already be filtered `to` destCrs)', () => {
+    const ctx = loadApp();
+    const board = { trainServices: [{ std: '07:03', etd: 'On time', subsequentCallingPoints: [] }] };
+    assert.deepEqual(plain(ctx.synthesizeLiveLegs(board, 'PAD')), []);
+  });
+
+  test('a service with no std is skipped defensively', () => {
+    const ctx = loadApp();
+    const board = { trainServices: [{ etd: 'On time' }] };
+    assert.deepEqual(plain(ctx.synthesizeLiveLegs(board, 'PAD')), []);
+  });
+
+  test('null/board-less input returns an empty array rather than throwing', () => {
+    const ctx = loadApp();
+    assert.deepEqual(plain(ctx.synthesizeLiveLegs(null, 'PAD')), []);
+    assert.deepEqual(plain(ctx.synthesizeLiveLegs({}, 'PAD')), []);
+  });
+});
+
+describe('mergeLiveOnlyBoard() — a failed board fetch must never blank the last-known board', () => {
+  const route = { from: 'RDG', to: 'BRI' };
+  const boardFor = (crs) => ({
+    trainServices: [{ std: '07:00', etd: 'On time', subsequentCallingPoints: [{ callingPoint: [{ crs, st: '08:00' }] }] }],
+  });
+
+  test('both boards succeed -> both directions replaced', () => {
+    const ctx = loadApp();
+    const result = ctx.mergeLiveOnlyBoard(null, boardFor('BRI'), boardFor('RDG'), route);
+    assert.equal(result.out.length, 1);
+    assert.equal(result.ret.length, 1);
+  });
+
+  test('one board fails -> only that direction keeps its previous legs, the other still updates', () => {
+    const ctx = loadApp();
+    const existing = { out: [{ dep: 'stale-out' }], ret: [{ dep: 'stale-ret' }] };
+    const result = ctx.mergeLiveOnlyBoard(existing, null, boardFor('RDG'), route);
+    assert.deepEqual(result.out, existing.out); // failed fetch -> untouched, never blanked
+    assert.equal(result.ret.length, 1); // succeeded fetch -> replaced with fresh legs
+    assert.notEqual(result.ret[0].dep, 'stale-ret');
+  });
+
+  test('both boards fail -> both directions keep their previous legs entirely', () => {
+    const ctx = loadApp();
+    const existing = { out: [{ dep: 'stale-out' }], ret: [{ dep: 'stale-ret' }] };
+    const result = ctx.mergeLiveOnlyBoard(existing, null, null, route);
+    assert.deepEqual(plain(result), existing);
+  });
+
+  test('no existing board and both fetches fail -> empty arrays, not a crash', () => {
+    const ctx = loadApp();
+    assert.deepEqual(plain(ctx.mergeLiveOnlyBoard(null, null, null, route)), { out: [], ret: [] });
+  });
+});
+
+describe('quick-route id/CRS helpers', () => {
+  test('buildQuickRouteId prefixes with q- so it can never collide with a curated route id', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.buildQuickRouteId('RDG', 'BRI'), 'q-rdg-bri');
+  });
+
+  test('parseQuickCrs handles bare codes and the "Name (CRS)" datalist form', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.parseQuickCrs('RDG'), 'RDG');
+    assert.equal(ctx.parseQuickCrs('Reading (RDG)'), 'RDG');
+    assert.equal(ctx.parseQuickCrs('reading (rdg)'), 'RDG');
+    assert.equal(ctx.parseQuickCrs('not a station'), '');
+    assert.equal(ctx.parseQuickCrs(''), '');
+  });
+});
+
+describe('quick-route sessionStorage (loadUserRoutes/saveUserRoutes/mergeUserRoutes)', () => {
+  test('round-trips a saved list through sessionStorage', () => {
+    const ctx = loadApp();
+    const routes = [{ id: 'q-rdg-bri', name: 'Reading ↔ Bristol', from: 'RDG', to: 'BRI', change: null, liveOnly: true }];
+    ctx.saveUserRoutes(routes);
+    assert.deepEqual(plain(ctx.loadUserRoutes()), routes);
+  });
+
+  test('returns an empty array when nothing is stored', () => {
+    const ctx = loadApp();
+    assert.deepEqual(plain(ctx.loadUserRoutes()), []);
+  });
+
+  test('discards a malformed sessionStorage value rather than throwing', () => {
+    const ctx = loadApp();
+    ctx.sessionStorage.setItem('userRoutes', 'not json');
+    assert.deepEqual(plain(ctx.loadUserRoutes()), []);
+    ctx.sessionStorage.setItem('userRoutes', '{"not":"an array"}');
+    assert.deepEqual(plain(ctx.loadUserRoutes()), []);
+  });
+
+  test('filters out entries missing id/from/to', () => {
+    const ctx = loadApp();
+    ctx.sessionStorage.setItem('userRoutes', JSON.stringify([
+      { id: 'q-a-b', from: 'A', to: 'B' },
+      { from: 'A', to: 'B' }, // no id
+      { id: 'q-c-d', from: 'C' }, // no to
+      null,
+    ]));
+    const loaded = ctx.loadUserRoutes();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].id, 'q-a-b');
+  });
+
+  test('mergeUserRoutes appends session routes AFTER curated ones, so ROUTES[0] stays curated', () => {
+    const ctx = loadApp();
+    ctx.saveUserRoutes([{ id: 'q-rdg-bri', from: 'RDG', to: 'BRI' }]);
+    const curated = [{ id: 'rdg-pad', from: 'RDG', to: 'PAD' }];
+    const merged = ctx.mergeUserRoutes(curated);
+    assert.deepEqual(plain(merged).map((r) => r.id), ['rdg-pad', 'q-rdg-bri']);
+  });
+});
