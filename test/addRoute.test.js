@@ -43,6 +43,18 @@ test('parseCrs handles bare codes and the "Name (CRS)" datalist form', () => {
   assert.equal(ctx.parseCrs(''), '');
 });
 
+test('resolveCrs falls back to an exact, case-insensitive station-name match', () => {
+  const ctx = loadAddRoute();
+  const stations = { RDG: 'Reading', BRI: 'Bristol Temple Meads' };
+  assert.equal(ctx.resolveCrs('RDG', stations), 'RDG');
+  assert.equal(ctx.resolveCrs('Reading (RDG)', stations), 'RDG');
+  assert.equal(ctx.resolveCrs('Reading', stations), 'RDG');
+  assert.equal(ctx.resolveCrs('reading', stations), 'RDG');
+  assert.equal(ctx.resolveCrs('bristol temple meads', stations), 'BRI');
+  assert.equal(ctx.resolveCrs('Not A Real Station', stations), '');
+  assert.equal(ctx.resolveCrs('', stations), '');
+});
+
 test('routeExists and reversePairExists', () => {
   const ctx = loadAddRoute();
   const routes = [{ id: 'rdg-bri', from: 'RDG', to: 'BRI' }];

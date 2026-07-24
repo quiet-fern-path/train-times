@@ -54,10 +54,15 @@
     <h2>Add a route</h2>
     <p>Type a station name or CRS code and pick from the list.</p>
     <label for="from-input">From</label>
-    <input id="from-input" list="station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
+    <div class="station-field">
+      <input id="from-input" autocomplete="off" placeholder="e.g. Reading (RDG)">
+      <div class="station-suggestions" id="from-suggestions"></div>
+    </div>
     <label for="to-input">To</label>
-    <input id="to-input" list="station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
-    <datalist id="station-options"></datalist>
+    <div class="station-field">
+      <input id="to-input" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
+      <div class="station-suggestions" id="to-suggestions"></div>
+    </div>
 
     <label class="manage-checkbox-row">
       <input type="checkbox" id="connection-toggle">
@@ -65,7 +70,10 @@
     </label>
     <div id="connection-fields" style="display:none">
       <label for="change-input">Change at</label>
-      <input id="change-input" list="station-options" autocomplete="off" placeholder="e.g. Twyford (TWY)">
+      <div class="station-field">
+        <input id="change-input" autocomplete="off" placeholder="e.g. Twyford (TWY)">
+        <div class="station-suggestions" id="change-suggestions"></div>
+      </div>
       <label for="min-conn-input">Minimum connection time (minutes)</label>
       <input id="min-conn-input" type="number" min="1" value="5">
       <p class="manage-hint">Check the physical platform layout at the change station before

@@ -127,6 +127,20 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .btn-close{background:#e5e7eb;color:var(--text)}
 .error-text{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.72rem;line-height:1.5;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;resize:vertical}
 
+/* STATION PICKER — custom dropdown, not a native <datalist>: iOS Safari
+   silently ignores the `list` attribute and shows no suggestions at all, so
+   this is rendered/filtered entirely in JS to work the same everywhere.
+   Deliberately in normal document flow, not position:absolute — these sheets
+   are short bottom sheets with little vertical gap before the next control
+   (e.g. the Add/Cancel row right after the To field), so an overlaid box
+   can visually cover a button below it and swallow the tap meant for it.
+   Pushing the sheet's own content down instead means the list can never
+   sit on top of anything else. */
+.station-suggestions{display:none;margin-top:4px;background:var(--surface);border:1px solid #ccc;border-radius:6px;box-shadow:var(--shadow);max-height:220px;overflow-y:auto}
+.station-suggestions.open{display:block}
+.station-suggestion{padding:9px 10px;font-size:.85rem;cursor:pointer}
+.station-suggestion:hover,.station-suggestion.active{background:#eef2ff}
+
 /* MANAGE-ROUTES PAGE (add-route.html) */
 .manage-main{max-width:640px;margin:0 auto;padding:12px 14px 60px}
 .manage-section{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px;margin-top:12px}

@@ -63,10 +63,15 @@
       just the next ~20 trains from Darwin. Gone when you close this tab or browser session
       (nothing is saved or committed anywhere).</p>
     <label for="quick-from-input">From</label>
-    <input id="quick-from-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
+    <div class="station-field">
+      <input id="quick-from-input" autocomplete="off" placeholder="e.g. Reading (RDG)">
+      <div class="station-suggestions" id="quick-from-suggestions"></div>
+    </div>
     <label for="quick-to-input">To</label>
-    <input id="quick-to-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
-    <datalist id="quick-station-options"></datalist>
+    <div class="station-field">
+      <input id="quick-to-input" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
+      <div class="station-suggestions" id="quick-to-suggestions"></div>
+    </div>
     <p id="quick-route-error" style="color:#b91c1c;font-weight:600"></p>
     <div class="row">
       <button class="btn-close" id="btn-quick-route-close">Cancel</button>

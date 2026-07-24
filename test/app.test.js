@@ -708,6 +708,17 @@ describe('quick-route id/CRS helpers', () => {
     assert.equal(ctx.parseQuickCrs('not a station'), '');
     assert.equal(ctx.parseQuickCrs(''), '');
   });
+
+  test('resolveQuickCrs falls back to an exact, case-insensitive station-name match', () => {
+    const ctx = loadApp();
+    const stations = { RDG: 'Reading', BRI: 'Bristol Temple Meads' };
+    assert.equal(ctx.resolveQuickCrs('RDG', stations), 'RDG');
+    assert.equal(ctx.resolveQuickCrs('Reading (RDG)', stations), 'RDG');
+    assert.equal(ctx.resolveQuickCrs('Reading', stations), 'RDG');
+    assert.equal(ctx.resolveQuickCrs('bristol temple meads', stations), 'BRI');
+    assert.equal(ctx.resolveQuickCrs('Not A Real Station', stations), '');
+    assert.equal(ctx.resolveQuickCrs('', stations), '');
+  });
 });
 
 describe('quick-route sessionStorage (loadUserRoutes/saveUserRoutes/mergeUserRoutes)', () => {
