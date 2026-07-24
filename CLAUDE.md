@@ -260,6 +260,29 @@ reintroduce a `!isConnection` gate around it.
 
 ## Known-correct-on-purpose things that look like bugs
 
+- **Station pickers (`add-route.html`'s From/To/Change-at, the quick-route
+  sheet's From/To) use a custom JS-rendered suggestions list
+  (`attachStationPicker()` in both `add-route.js` and `app.js`), not a native
+  `<input list="...">` + `<datalist>`.** This shipped as a datalist originally
+  and looked fine in testing (works in desktop Chromium/Firefox) but was a
+  real, live bug: **iOS Safari silently ignores the `list` attribute and
+  renders zero suggestions, ever** — no error, no fallback, just a plain text
+  input. Since this app is explicitly designed to be used from a visitor's
+  phone (the Darwin key, the whole point of the settings ⚙ flow), that's not
+  an edge case. It also compounded with validation: typing a station name
+  without picking a datalist option failed with "pick a valid station" (only
+  the "Name (CRS)" form a datalist selection produces was accepted), so
+  affected visitors got no suggestions *and* a hard failure on typed input.
+  `resolveCrs()`/`resolveQuickCrs()` now also accept an exact, case-insensitive
+  name match as a fallback for the same reason. Don't reintroduce a
+  `<datalist>` for a station picker as a "simplification" — it silently
+  regresses to zero-suggestions on every iOS browser (they're all WebKit
+  under the hood, so this isn't Safari-specific, it's iOS-specific). The
+  suggestions box is deliberately in normal document flow, not
+  `position:absolute` — these are short bottom sheets with little vertical
+  gap before the next control (e.g. Add/Cancel right after the To field), and
+  an overlaid box tall enough to reach that row visually covers it, silently
+  swallowing a tap meant for the button underneath.
 - **`overtakers()` excludes `_cancelled` legs.** This was a real bug once:
   a cancelled train counted as a valid "faster alternative" and could hide
   a perfectly catchable real train. Don't remove the `!o._cancelled` check.
@@ -699,6 +722,24 @@ What's deliberately **not** covered here, because it needs a real browser/
 real HTTPS and can't be meaningfully mocked: the service worker's actual
 fetch-interception/caching behavior end-to-end, and the Darwin live-overlay
 fetch — see the manual recipe below for the latter.
+
+**This sandbox only has Chromium pre-installed, not WebKit** — so even the
+manual Playwright recipe below can't catch a bug that's specific to iOS
+Safari (all iOS browsers are WebKit under the hood, no matter what they're
+branded). This isn't hypothetical: the original `<datalist>`-based station
+pickers passed every unit test and looked correct end-to-end in a real,
+Playwright-driven Chromium session — the bug (zero suggestions, ever, on
+iOS) only surfaced when an actual visitor tried it on their phone. `npm
+install playwright`'s WebKit build isn't an option either — downloading a
+new browser binary isn't possible in this sandbox
+(`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` is set specifically to stop that).
+Given this app's design center is a visitor's phone (the whole Darwin-key/
+settings-⚙ flow), any new non-trivial interactive widget (dropdowns,
+comboboxes, custom pickers — anything beyond a plain input/button) should
+either (a) be checked against known WebKit/iOS support gaps for whatever
+native element it might otherwise lean on, before writing it, or (b) be
+flagged to the visitor as needing a real on-device check, rather than
+reported as verified off of a Chromium-only pass.
 
 ### Testing the live overlay end-to-end from a Claude Code sandbox
 
