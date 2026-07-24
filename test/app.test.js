@@ -548,6 +548,25 @@ describe('openSettings() and the status-bar click-to-settings shortcut', () => {
   });
 });
 
+describe('noMoreTrainsLabel() — a quick route has no schedule, so it must not claim "today" is done', () => {
+  test('a curated route claims the day is fully shown (a real, accurate claim there)', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.noMoreTrainsLabel('14:05', { id: 'rdg-pad' }), 'Now 14:05 — no more trains today');
+  });
+
+  test('a liveOnly route only claims the current live window is exhausted, not the whole day', () => {
+    const ctx = loadApp();
+    const label = ctx.noMoreTrainsLabel('14:05', { id: 'q-rdg-bri', liveOnly: true });
+    assert.equal(label, 'Now 14:05 — no more departures in the live board right now');
+    assert.doesNotMatch(label, /today/);
+  });
+
+  test('a missing route (defensive) falls back to the curated wording', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.noMoreTrainsLabel('14:05', undefined), 'Now 14:05 — no more trains today');
+  });
+});
+
 describe('synthesizeLiveLegs() — quick (session-only) routes built straight off a live board', () => {
   test('a matched, on-time service becomes a leg with zero delay and a confirmed platform', () => {
     const ctx = loadApp();

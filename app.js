@@ -462,6 +462,19 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
   </div>`;
 }
 
+// A quick route has no schedule to fall back on — its whole leg list IS
+// Darwin's rolling ~20-service/~2hr board window (see CLAUDE.md's "Known
+// limitations" section), so "no more trains today" would be a false claim:
+// more services almost certainly exist later, they just haven't entered that
+// window yet and will appear once tickMinute()'s periodic refresh catches
+// them. A curated route's 90-day schedule really has been fully shown by
+// this point, so that claim stays accurate there — don't unify the wording.
+function noMoreTrainsLabel(hm, route) {
+  return route && route.liveOnly
+    ? `Now ${hm} — no more departures in the live board right now`
+    : `Now ${hm} — no more trains today`;
+}
+
 // ── Rendering ───────────────────────────────────────────────────────
 // Shared by both the schedule-backed path and the quick (live-only) path
 // below — overtaking, next-train selection, the now-line, and card building
@@ -516,7 +529,7 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
   }
   if (isToday && !nowDone) {
     const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-    parts.push(`<div class="now-line">Now ${hm} — no more trains today</div>`);
+    parts.push(`<div class="now-line">${noMoreTrainsLabel(hm, route)}</div>`);
   }
   listEl.innerHTML = parts.join('');
 
