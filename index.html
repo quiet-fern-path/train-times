@@ -56,6 +56,25 @@
   </div>
 </div>
 
+<div class="settings-overlay" id="quick-route-overlay">
+  <div class="settings-sheet">
+    <h2>Quick live route</h2>
+    <p>Shows live departures for any station pair right now — no timetable, no date picker,
+      just the next ~20 trains from Darwin. Gone when you close this tab or browser session
+      (nothing is saved or committed anywhere).</p>
+    <label for="quick-from-input">From</label>
+    <input id="quick-from-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
+    <label for="quick-to-input">To</label>
+    <input id="quick-to-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
+    <datalist id="quick-station-options"></datalist>
+    <p id="quick-route-error" style="color:#b91c1c;font-weight:600"></p>
+    <div class="row">
+      <button class="btn-close" id="btn-quick-route-close">Cancel</button>
+      <button class="btn-save" id="btn-quick-route-add">Add</button>
+    </div>
+  </div>
+</div>
+
 <div class="settings-overlay" id="error-overlay">
   <div class="settings-sheet">
     <h2>Live data error details</h2>
