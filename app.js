@@ -161,7 +161,10 @@ function currentRoute() {
 // script in index.html also caches by location.pathname, not
 // location.href, for the same reason). localStorage is only a fallback
 // for the rare case of opening a bare URL with no hash at all (e.g. a
-// home-screen icon someone saved before this existed).
+// home-screen icon someone saved before this existed) — and only for the
+// route and direction. The date is intentionally never restored from
+// localStorage, so a fresh reopen always defaults to "now" rather than the
+// last-browsed day; only an explicit date in the URL hash overrides that.
 function readURLState() {
   const params = new URLSearchParams(location.hash.replace(/^#/, ''));
   return { route: params.get('route'), dir: params.get('dir'), date: params.get('date') };
@@ -178,14 +181,20 @@ function persistState() {
   const state = { route: activeRouteId, dir: activeDir, date: inp.value || todayStr() };
   localStorage.setItem('lastRouteId', state.route);
   localStorage.setItem('lastDir', state.dir);
-  localStorage.setItem('lastDate', state.date);
+  // Deliberately NOT persisting the date to localStorage: a fresh reopen
+  // (home-screen icon relaunch, new session) should default to "now", not
+  // whatever day was last browsed. Route/direction still persist. An explicit
+  // date in the URL hash IS still honoured on restore below, so a shared or
+  // bookmarked dated link, and a same-tab reload (whose hash carries the date
+  // this call writes), both keep their day — only the stale cross-session
+  // fallback is dropped.
   writeURLState(state);
 }
 function restoreState() {
   const url = readURLState();
   const routeId = url.route || localStorage.getItem('lastRouteId');
   const dir = url.dir || localStorage.getItem('lastDir');
-  const dateStr = url.date || localStorage.getItem('lastDate');
+  const dateStr = url.date; // hash-only, no localStorage fallback — see persistState
   if (routeId && ROUTES.some(r => r.id === routeId)) activeRouteId = routeId;
   if (dir === 'out' || dir === 'ret') activeDir = dir;
   if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) inp.value = dateStr;
