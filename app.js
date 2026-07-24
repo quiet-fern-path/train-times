@@ -181,6 +181,33 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// sw.js's stale-while-revalidate only ever re-checks a data file when
+// *something* issues a fetch for it — it never polls on its own. On a page
+// that's just sitting open, that means routes.json/stations.json/
+// schedule.json are checked exactly once, at load, and never again — so a
+// route added or removed via add-route.html (a separate page/tab) never
+// reaches an already-open app tab until the reader forces a full reload,
+// and has to guess-and-retry that reload until it happens to land after
+// both the commit's CDN propagation and (for the schedule itself) the
+// fetch Action have actually landed. Re-issuing the same three fetches
+// whenever the tab regains focus reuses that exact cache-compare-notify
+// pipeline (DATA_RELOAD_HANDLERS above) without a manual reload: harmless
+// no-op if nothing changed, in-place hot-reload if something did. Debounced
+// so rapid tab-switching doesn't fire it repeatedly.
+let lastFocusCheckAt = 0;
+function checkForDataUpdates() {
+  const now = Date.now();
+  if (now - lastFocusCheckAt < 20000) return;
+  lastFocusCheckAt = now;
+  ['./routes.json', './stations.json', './data/schedule.json'].forEach(url => {
+    fetch(url).catch(() => {}); // response is unused — sw.js's own fetch handler does the compare/notify
+  });
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') checkForDataUpdates();
+});
+window.addEventListener('focus', checkForDataUpdates);
+
 function currentRoute() {
   return ROUTES.find(r => r.id === activeRouteId);
 }
