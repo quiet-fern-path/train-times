@@ -428,10 +428,18 @@ function attachStationPicker(inputId, boxId, getStations) {
     for (var crs in stations) {
       if (!Object.prototype.hasOwnProperty.call(stations, crs)) continue;
       var name = stations[crs];
-      if (name.toLowerCase().indexOf(q) !== -1 || crs.toLowerCase().indexOf(q) !== -1) {
-        matches.push({ crs: crs, label: name + ' (' + crs + ')' });
-      }
+      var nameLower = name.toLowerCase();
+      var crsLower = crs.toLowerCase();
+      // Rank so a name/code *starting* with the query (e.g. "Oxford" for
+      // "oxf") outranks one that merely contains it elsewhere (e.g.
+      // "Foxfield") — a plain contains-match alone surfaced the wrong one first.
+      var rank = nameLower.indexOf(q) === 0 ? 0
+        : crsLower.indexOf(q) === 0 ? 1
+        : nameLower.indexOf(q) !== -1 || crsLower.indexOf(q) !== -1 ? 2
+        : -1;
+      if (rank !== -1) matches.push({ crs: crs, label: name + ' (' + crs + ')', rank: rank });
     }
+    matches.sort(function (a, b) { return a.rank - b.rank; });
     renderMatches(matches.slice(0, 8));
   });
 

@@ -1297,10 +1297,18 @@ function attachStationPicker(inputId, boxId, getStations) {
     for (const crs in stations) {
       if (!Object.prototype.hasOwnProperty.call(stations, crs)) continue;
       const name = stations[crs];
-      if (name.toLowerCase().includes(q) || crs.toLowerCase().includes(q)) {
-        matches.push({ crs, label: `${name} (${crs})` });
-      }
+      const nameLower = name.toLowerCase();
+      const crsLower = crs.toLowerCase();
+      // Rank so a name/code *starting* with the query (e.g. "Oxford" for
+      // "oxf") outranks one that merely contains it elsewhere (e.g.
+      // "Foxfield") — a plain contains-match alone surfaced the wrong one first.
+      const rank = nameLower.startsWith(q) ? 0
+        : crsLower.startsWith(q) ? 1
+        : nameLower.includes(q) || crsLower.includes(q) ? 2
+        : -1;
+      if (rank !== -1) matches.push({ crs, label: `${name} (${crs})`, rank });
     }
+    matches.sort((a, b) => a.rank - b.rank);
     renderMatches(matches.slice(0, 8));
   });
 
