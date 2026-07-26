@@ -324,9 +324,10 @@ function derivePlatformState(livePlatform, bookedPlatform, hidden) {
 }
 
 // ── Route picker / tabs ─────────────────────────────────────────────
-// The "+" add-quick-route control is deliberately its own class (not
-// `.route-chip`) so it's never swept up by the `.route-chip` click wiring
-// below, which assumes every match has a real `data-route` id.
+// The "+" add-quick-route control lives in the header next to the settings
+// gear (a static element, wired once below), not in this dynamically
+// rebuilt chip row — it's an action, not a route, so it doesn't need to
+// scroll away with the chips or get re-created on every render.
 function renderRoutePicker() {
   const el = document.getElementById('route-picker');
   el.innerHTML = ROUTES.map(r => {
@@ -339,7 +340,7 @@ function renderRoutePicker() {
       ? `<button class="chip-remove" data-remove="${r.id}" title="Remove this quick route">&times;</button>`
       : '';
     return chip + removeBtn;
-  }).join('') + `<button class="chip-add-quick" id="chip-add-quick" title="Add a quick live route — this session only, no commit">+</button>`;
+  }).join('');
 
   el.querySelectorAll('.route-chip').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -352,8 +353,6 @@ function renderRoutePicker() {
   el.querySelectorAll('.chip-remove').forEach(btn => {
     btn.addEventListener('click', () => removeQuickRoute(btn.dataset.remove));
   });
-  const addBtn = document.getElementById('chip-add-quick');
-  if (addBtn) addBtn.addEventListener('click', openQuickRouteSheet);
 }
 
 function updateRouteTitle() {
@@ -1384,6 +1383,7 @@ function removeQuickRoute(id) {
 
 document.getElementById('btn-quick-route-close').addEventListener('click', closeQuickRouteSheet);
 document.getElementById('btn-quick-route-add').addEventListener('click', addQuickRoute);
+document.getElementById('chip-add-quick').addEventListener('click', openQuickRouteSheet);
 
 // ── Settings panel ──────────────────────────────────────────────────
 function openSettings() {
