@@ -759,6 +759,49 @@ it might otherwise lean on, before writing it, or (b) be
 flagged to the visitor as needing a real on-device check, rather than
 reported as verified off of a Chromium-only pass.
 
+### When a UI change needs a real-device check — always hand over Termux steps
+
+The visitor's main browser is **Firefox for Android**, not desktop Chrome or
+iOS Safari — worth remembering as the primary real-device target for this
+kind of check, alongside whatever else might come up (this is exactly the
+browser that hit the `<datalist>` bug above). Whenever a change touches any
+non-trivial interactive widget — anything beyond a plain input/button/link,
+so dropdowns, comboboxes, custom pickers, anything relying on a native form
+control's rendering — and could plausibly render or behave differently
+between Chromium and Firefox for Android, **always give the visitor the
+concrete steps to check it themselves**, rather than assuming they'll
+remember the process or ask for it. Don't just say "please verify on your
+phone" — spell out the actual recipe every time, since re-deriving it isn't
+something to expect of the visitor between sessions.
+
+The recipe (confirmed workable — this is the one path that actually gets a
+real Firefox-for-Android/GeckoView session onto a live copy of a branch,
+after two others were tried and ruled out in this same investigation: an
+outbound tunnel from this sandbox to expose a local server publicly was
+blocked at the network-policy level — `localtunnel`'s relay port and
+`cloudflared`'s QUIC/HTTP2 tunnel transport were both confirmed unreachable
+here, only plain client-initiated HTTPS gets through — and a LAN-style test
+doesn't work either, since this sandbox isn't on the visitor's home network
+no matter what keeps a server process alive on this end):
+
+1. Install **Termux** (from F-Droid, not the Play Store build — outdated/
+   unmaintained there) on the Android phone itself.
+2. `pkg update -y && pkg install -y git python`
+3. `git clone https://github.com/quiet-fern-path/train-times.git && cd train-times`
+   (add a PAT into the URL, `https://<token>@github.com/...`, if the repo is
+   private — the same kind of fine-grained token already used for the route
+   builder works) then `git checkout <branch-name>`.
+4. `python -m http.server 8123`
+5. Open **Firefox for Android** on the same phone, navigate to
+   `http://127.0.0.1:8123/` (or `localhost`).
+
+This sidesteps every network restriction above entirely, because the server
+and the browser under test are the same device — no tunnel, no LAN, no
+sandbox egress policy involved. The only gotcha worth flagging up front:
+some Android builds suspend backgrounded apps aggressively, so if the server
+drops when switching to Firefox, either split-screen the two apps or use
+Termux's persistent notification to hold a wake lock while testing.
+
 ### Testing the live overlay end-to-end from a Claude Code sandbox
 
 If a visitor shares a real Darwin API key in-session to ask for live
