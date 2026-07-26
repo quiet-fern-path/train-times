@@ -14,6 +14,7 @@
   <div class="hrow">
     <div class="route-title" id="route-title">Loading…</div>
     <button id="btn-live-error" class="icon-btn live-error-btn" title="Live data error — tap for details" style="display:none">&#9888;</button>
+    <button id="chip-add-quick" class="icon-btn" title="Add a quick live route — this session only, no commit">+</button>
     <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
     <button id="btn-now" class="icon-btn btn-now" title="Jump to current time">Now</button>
   </div>
@@ -63,10 +64,15 @@
       just the next ~20 trains from Darwin. Gone when you close this tab or browser session
       (nothing is saved or committed anywhere).</p>
     <label for="quick-from-input">From</label>
-    <input id="quick-from-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Reading (RDG)">
+    <div class="station-field">
+      <input id="quick-from-input" autocomplete="off" placeholder="e.g. Reading (RDG)">
+      <div class="station-suggestions" id="quick-from-suggestions"></div>
+    </div>
     <label for="quick-to-input">To</label>
-    <input id="quick-to-input" list="quick-station-options" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
-    <datalist id="quick-station-options"></datalist>
+    <div class="station-field">
+      <input id="quick-to-input" autocomplete="off" placeholder="e.g. Bristol Temple Meads (BRI)">
+      <div class="station-suggestions" id="quick-to-suggestions"></div>
+    </div>
     <p id="quick-route-error" style="color:#b91c1c;font-weight:600"></p>
     <div class="row">
       <button class="btn-close" id="btn-quick-route-close">Cancel</button>

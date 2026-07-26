@@ -68,13 +68,27 @@ function buildRoute(from, to, names, opts) {
 }
 
 // Extract a CRS from a picker value that may be a bare code ("RDG") or the
-// "Name (RDG)" form used by the datalist options.
+// "Name (RDG)" form the station picker fills in on selection.
 function parseCrs(input) {
   if (!input) return '';
   var s = String(input).trim().toUpperCase();
   var m = s.match(/\(([A-Z0-9]{3})\)\s*$/);
   if (m) return m[1];
   if (/^[A-Z0-9]{3}$/.test(s)) return s;
+  return '';
+}
+
+// Falls back to an exact, case-insensitive station-name match when the input
+// isn't in either form parseCrs understands — covers a name typed without
+// ever picking a suggestion (e.g. autocomplete dismissed, or pasted text).
+function resolveCrs(input, stations) {
+  var crs = parseCrs(input);
+  if (crs && stations[crs]) return crs;
+  var s = String(input || '').trim().toLowerCase();
+  if (!s) return '';
+  for (var code in stations) {
+    if (Object.prototype.hasOwnProperty.call(stations, code) && stations[code].toLowerCase() === s) return code;
+  }
   return '';
 }
 
@@ -369,16 +383,75 @@ async function loadJson(url) {
   return r.json();
 }
 
-function renderStationOptions() {
-  var dl = el('station-options');
-  if (!dl) return;
-  var frag = document.createDocumentFragment();
-  Object.keys(STATIONS_ALL).forEach(function (crs) {
-    var o = document.createElement('option');
-    o.value = STATIONS_ALL[crs] + ' (' + crs + ')';
-    frag.appendChild(o);
+// Custom suggestions dropdown for a station-picker input, replacing a native
+// <datalist> (see styles.css's "STATION PICKER" comment for why). `stations`
+// is read live off the passed-in getter each keystroke, so it works whether
+// the station map has finished loading yet or not.
+function attachStationPicker(inputId, boxId, getStations) {
+  var input = el(inputId);
+  var box = el(boxId);
+  if (!input || !box) return;
+  var items = [];
+  var activeIdx = -1;
+
+  function renderMatches(matches) {
+    items = matches;
+    activeIdx = -1;
+    box.innerHTML = '';
+    matches.forEach(function (m) {
+      var d = document.createElement('div');
+      d.className = 'station-suggestion';
+      d.textContent = m.label;
+      // mousedown (not click) fires before the input's blur hides the box.
+      d.addEventListener('mousedown', function (ev) { ev.preventDefault(); pick(m); });
+      box.appendChild(d);
+    });
+    box.classList.toggle('open', matches.length > 0);
+  }
+
+  function pick(m) {
+    input.value = m.label;
+    box.classList.remove('open');
+  }
+
+  function highlight() {
+    Array.prototype.forEach.call(box.children, function (c, i) {
+      c.classList.toggle('active', i === activeIdx);
+    });
+  }
+
+  input.addEventListener('input', function () {
+    var stations = getStations();
+    var q = input.value.trim().toLowerCase();
+    if (!q) { renderMatches([]); return; }
+    var matches = [];
+    for (var crs in stations) {
+      if (!Object.prototype.hasOwnProperty.call(stations, crs)) continue;
+      var name = stations[crs];
+      var nameLower = name.toLowerCase();
+      var crsLower = crs.toLowerCase();
+      // Rank so a name/code *starting* with the query (e.g. "Oxford" for
+      // "oxf") outranks one that merely contains it elsewhere (e.g.
+      // "Foxfield") — a plain contains-match alone surfaced the wrong one first.
+      var rank = nameLower.indexOf(q) === 0 ? 0
+        : crsLower.indexOf(q) === 0 ? 1
+        : nameLower.indexOf(q) !== -1 || crsLower.indexOf(q) !== -1 ? 2
+        : -1;
+      if (rank !== -1) matches.push({ crs: crs, label: name + ' (' + crs + ')', rank: rank });
+    }
+    matches.sort(function (a, b) { return a.rank - b.rank; });
+    renderMatches(matches.slice(0, 8));
   });
-  dl.appendChild(frag);
+
+  input.addEventListener('keydown', function (ev) {
+    if (!box.classList.contains('open')) return;
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); highlight(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); highlight(); }
+    else if (ev.key === 'Enter') { if (activeIdx >= 0) { ev.preventDefault(); pick(items[activeIdx]); } }
+    else if (ev.key === 'Escape') { box.classList.remove('open'); }
+  });
+
+  input.addEventListener('blur', function () { box.classList.remove('open'); });
 }
 
 function routeLabel(r) {
@@ -519,8 +592,8 @@ function connectionOpts() {
   var toggle = el('connection-toggle');
   if (!toggle || !toggle.checked) return { opts: null };
 
-  var change = parseCrs(el('change-input').value);
-  if (!change || !STATIONS_ALL[change]) return { error: 'Pick a valid change station.' };
+  var change = resolveCrs(el('change-input').value, STATIONS_ALL);
+  if (!change) return { error: 'Pick a valid change station.' };
 
   var minConn = parseInt(el('min-conn-input').value, 10);
   if (!Number.isFinite(minConn) || minConn < 1) {
@@ -530,10 +603,10 @@ function connectionOpts() {
 }
 
 async function onAdd() {
-  var from = parseCrs(el('from-input').value);
-  var to = parseCrs(el('to-input').value);
-  if (!from || !STATIONS_ALL[from]) { setStatus('Pick a valid origin station.', 'err'); return; }
-  if (!to || !STATIONS_ALL[to]) { setStatus('Pick a valid destination station.', 'err'); return; }
+  var from = resolveCrs(el('from-input').value, STATIONS_ALL);
+  var to = resolveCrs(el('to-input').value, STATIONS_ALL);
+  if (!from) { setStatus('Pick a valid origin station.', 'err'); return; }
+  if (!to) { setStatus('Pick a valid destination station.', 'err'); return; }
   if (from === to) { setStatus('Origin and destination must differ.', 'err'); return; }
 
   var conn = connectionOpts();
@@ -691,9 +764,13 @@ async function initAddRoute() {
 
   updateTokenUi();
 
+  var getStations = function () { return STATIONS_ALL; };
+  attachStationPicker('from-input', 'from-suggestions', getStations);
+  attachStationPicker('to-input', 'to-suggestions', getStations);
+  attachStationPicker('change-input', 'change-suggestions', getStations);
+
   try {
     STATIONS_ALL = await loadJson('./stations_all.json');
-    renderStationOptions();
   } catch (e) {
     setStatus('Could not load the station list: ' + e.message, 'err');
   }

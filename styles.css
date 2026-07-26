@@ -37,8 +37,6 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .route-chip-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#34d399;margin-right:5px;vertical-align:middle}
 .chip-remove{flex-shrink:0;width:22px;height:22px;margin-left:-4px;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#cbd5e1;font-size:.9rem;line-height:1;cursor:pointer;font-family:inherit}
 .chip-remove:hover{background:rgba(255,255,255,.25)}
-.chip-add-quick{flex-shrink:0;width:30px;height:30px;padding:0;border-radius:50%;border:1px dashed rgba(255,255,255,.4);background:transparent;color:#cbd5e1;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit}
-.chip-add-quick:hover{background:rgba(255,255,255,.12)}
 
 /* TABS */
 .tab-bar{position:sticky;top:var(--header-h);z-index:99;display:flex;background:var(--navy-mid);box-shadow:0 2px 6px rgba(0,0,0,.25)}
@@ -126,6 +124,20 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .btn-save{background:var(--navy);color:#fff}
 .btn-close{background:#e5e7eb;color:var(--text)}
 .error-text{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.72rem;line-height:1.5;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;resize:vertical}
+
+/* STATION PICKER — custom dropdown, not a native <datalist>: iOS Safari
+   silently ignores the `list` attribute and shows no suggestions at all, so
+   this is rendered/filtered entirely in JS to work the same everywhere.
+   Deliberately in normal document flow, not position:absolute — these sheets
+   are short bottom sheets with little vertical gap before the next control
+   (e.g. the Add/Cancel row right after the To field), so an overlaid box
+   can visually cover a button below it and swallow the tap meant for it.
+   Pushing the sheet's own content down instead means the list can never
+   sit on top of anything else. */
+.station-suggestions{display:none;margin-top:4px;background:var(--surface);border:1px solid #ccc;border-radius:6px;box-shadow:var(--shadow);max-height:220px;overflow-y:auto}
+.station-suggestions.open{display:block}
+.station-suggestion{padding:9px 10px;font-size:.85rem;cursor:pointer}
+.station-suggestion:hover,.station-suggestion.active{background:#eef2ff}
 
 /* MANAGE-ROUTES PAGE (add-route.html) */
 .manage-main{max-width:640px;margin:0 auto;padding:12px 14px 60px}

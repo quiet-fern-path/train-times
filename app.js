@@ -324,9 +324,10 @@ function derivePlatformState(livePlatform, bookedPlatform, hidden) {
 }
 
 // ── Route picker / tabs ─────────────────────────────────────────────
-// The "+" add-quick-route control is deliberately its own class (not
-// `.route-chip`) so it's never swept up by the `.route-chip` click wiring
-// below, which assumes every match has a real `data-route` id.
+// The "+" add-quick-route control lives in the header next to the settings
+// gear (a static element, wired once below), not in this dynamically
+// rebuilt chip row — it's an action, not a route, so it doesn't need to
+// scroll away with the chips or get re-created on every render.
 function renderRoutePicker() {
   const el = document.getElementById('route-picker');
   el.innerHTML = ROUTES.map(r => {
@@ -339,7 +340,7 @@ function renderRoutePicker() {
       ? `<button class="chip-remove" data-remove="${r.id}" title="Remove this quick route">&times;</button>`
       : '';
     return chip + removeBtn;
-  }).join('') + `<button class="chip-add-quick" id="chip-add-quick" title="Add a quick live route — this session only, no commit">+</button>`;
+  }).join('');
 
   el.querySelectorAll('.route-chip').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -352,8 +353,6 @@ function renderRoutePicker() {
   el.querySelectorAll('.chip-remove').forEach(btn => {
     btn.addEventListener('click', () => removeQuickRoute(btn.dataset.remove));
   });
-  const addBtn = document.getElementById('chip-add-quick');
-  if (addBtn) addBtn.addEventListener('click', openQuickRouteSheet);
 }
 
 function updateRouteTitle() {
@@ -1226,17 +1225,12 @@ let QUICK_STATIONS = null;
 async function ensureQuickStations() {
   if (QUICK_STATIONS) return QUICK_STATIONS;
   QUICK_STATIONS = await loadJSON('./stations_all.json');
-  const dl = document.getElementById('quick-station-options');
-  if (dl) {
-    dl.innerHTML = Object.keys(QUICK_STATIONS)
-      .map(crs => `<option value="${QUICK_STATIONS[crs]} (${crs})"></option>`).join('');
-  }
   return QUICK_STATIONS;
 }
 
 // Extract a CRS from a picker value that may be a bare code ("RDG") or the
-// "Name (RDG)" form used by the datalist options above — same convention as
-// add-route.js's parseCrs.
+// "Name (RDG)" form the station picker fills in on selection — same
+// convention as add-route.js's parseCrs.
 function parseQuickCrs(input) {
   if (!input) return '';
   const s = String(input).trim().toUpperCase();
@@ -1244,6 +1238,92 @@ function parseQuickCrs(input) {
   if (m) return m[1];
   return /^[A-Z0-9]{3}$/.test(s) ? s : '';
 }
+
+// Falls back to an exact, case-insensitive station-name match when the input
+// isn't in either form parseQuickCrs understands — same convention as
+// add-route.js's resolveCrs.
+function resolveQuickCrs(input, stations) {
+  const crs = parseQuickCrs(input);
+  if (crs && stations[crs]) return crs;
+  const s = String(input || '').trim().toLowerCase();
+  if (!s) return '';
+  for (const code in stations) {
+    if (Object.prototype.hasOwnProperty.call(stations, code) && stations[code].toLowerCase() === s) return code;
+  }
+  return '';
+}
+
+// Custom suggestions dropdown for a station-picker input, replacing a native
+// <datalist> — iOS Safari silently ignores the `list` attribute and shows no
+// suggestions at all, so this is rendered/filtered entirely in JS to work
+// the same everywhere. Same convention as add-route.js's attachStationPicker.
+function attachStationPicker(inputId, boxId, getStations) {
+  const input = document.getElementById(inputId);
+  const box = document.getElementById(boxId);
+  if (!input || !box) return;
+  let items = [];
+  let activeIdx = -1;
+
+  function renderMatches(matches) {
+    items = matches;
+    activeIdx = -1;
+    box.innerHTML = '';
+    matches.forEach(m => {
+      const d = document.createElement('div');
+      d.className = 'station-suggestion';
+      d.textContent = m.label;
+      // mousedown (not click) fires before the input's blur hides the box.
+      d.addEventListener('mousedown', ev => { ev.preventDefault(); pick(m); });
+      box.appendChild(d);
+    });
+    box.classList.toggle('open', matches.length > 0);
+  }
+
+  function pick(m) {
+    input.value = m.label;
+    box.classList.remove('open');
+  }
+
+  function highlight() {
+    Array.prototype.forEach.call(box.children, (c, i) => c.classList.toggle('active', i === activeIdx));
+  }
+
+  input.addEventListener('input', () => {
+    const stations = getStations();
+    const q = input.value.trim().toLowerCase();
+    if (!q) { renderMatches([]); return; }
+    const matches = [];
+    for (const crs in stations) {
+      if (!Object.prototype.hasOwnProperty.call(stations, crs)) continue;
+      const name = stations[crs];
+      const nameLower = name.toLowerCase();
+      const crsLower = crs.toLowerCase();
+      // Rank so a name/code *starting* with the query (e.g. "Oxford" for
+      // "oxf") outranks one that merely contains it elsewhere (e.g.
+      // "Foxfield") — a plain contains-match alone surfaced the wrong one first.
+      const rank = nameLower.startsWith(q) ? 0
+        : crsLower.startsWith(q) ? 1
+        : nameLower.includes(q) || crsLower.includes(q) ? 2
+        : -1;
+      if (rank !== -1) matches.push({ crs, label: `${name} (${crs})`, rank });
+    }
+    matches.sort((a, b) => a.rank - b.rank);
+    renderMatches(matches.slice(0, 8));
+  });
+
+  input.addEventListener('keydown', ev => {
+    if (!box.classList.contains('open')) return;
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); highlight(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); highlight(); }
+    else if (ev.key === 'Enter') { if (activeIdx >= 0) { ev.preventDefault(); pick(items[activeIdx]); } }
+    else if (ev.key === 'Escape') { box.classList.remove('open'); }
+  });
+
+  input.addEventListener('blur', () => box.classList.remove('open'));
+}
+
+attachStationPicker('quick-from-input', 'quick-from-suggestions', () => QUICK_STATIONS || {});
+attachStationPicker('quick-to-input', 'quick-to-suggestions', () => QUICK_STATIONS || {});
 
 // Prefixed distinctly from curated ids (which are never "q-...") so a quick
 // route can never collide with — or be confused in the URL hash/persisted
@@ -1267,11 +1347,11 @@ function closeQuickRouteSheet() {
 
 function addQuickRoute() {
   const errEl = document.getElementById('quick-route-error');
-  const from = parseQuickCrs(document.getElementById('quick-from-input').value);
-  const to = parseQuickCrs(document.getElementById('quick-to-input').value);
   const stations = QUICK_STATIONS || {};
-  if (!from || !stations[from]) { errEl.textContent = 'Pick a valid origin station.'; return; }
-  if (!to || !stations[to]) { errEl.textContent = 'Pick a valid destination station.'; return; }
+  const from = resolveQuickCrs(document.getElementById('quick-from-input').value, stations);
+  const to = resolveQuickCrs(document.getElementById('quick-to-input').value, stations);
+  if (!from) { errEl.textContent = 'Pick a valid origin station.'; return; }
+  if (!to) { errEl.textContent = 'Pick a valid destination station.'; return; }
   if (from === to) { errEl.textContent = 'Origin and destination must differ.'; return; }
 
   const id = buildQuickRouteId(from, to);
@@ -1303,6 +1383,7 @@ function removeQuickRoute(id) {
 
 document.getElementById('btn-quick-route-close').addEventListener('click', closeQuickRouteSheet);
 document.getElementById('btn-quick-route-add').addEventListener('click', addQuickRoute);
+document.getElementById('chip-add-quick').addEventListener('click', openQuickRouteSheet);
 
 // ── Settings panel ──────────────────────────────────────────────────
 function openSettings() {

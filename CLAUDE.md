@@ -260,6 +260,38 @@ reintroduce a `!isConnection` gate around it.
 
 ## Known-correct-on-purpose things that look like bugs
 
+- **Station pickers (`add-route.html`'s From/To/Change-at, the quick-route
+  sheet's From/To) use a custom JS-rendered suggestions list
+  (`attachStationPicker()` in both `add-route.js` and `app.js`), not a native
+  `<input list="...">` + `<datalist>`.** This shipped as a datalist originally
+  and looked fine in testing (works in desktop Chromium/Firefox) but was a
+  real, live bug, and on more than one mobile browser, not just one: **iOS
+  Safari silently ignores the `list` attribute and renders zero suggestions,
+  ever**, and **Firefox for Android does the same — confirmed via Mozilla's
+  own tracker (`bugzilla.mozilla.org` #1840724, "Neither `<datalist>` nor its
+  `<option>`s are exposed in Firefox for Android") and multiple independent
+  user reports, not a one-off** — both treat the input as a plain text field,
+  no error, no fallback, no announcement that suggestions exist. Don't read
+  this as "an iOS thing" — it's a wider pattern: **mobile browsers have
+  historically underinvested in `<datalist>`'s native autocomplete UI full
+  stop**, across at least two unrelated engines (WebKit and Gecko), so treat
+  *any* mobile browser as suspect for this element rather than assuming
+  Chromium-based mobile browsers are safe merely because desktop Chromium is.
+  Since this app is explicitly designed to be used from a visitor's phone
+  (the Darwin key, the whole point of the settings ⚙ flow), that's not an
+  edge case. It also compounded with validation: typing a station name
+  without picking a datalist option failed with "pick a valid station" (only
+  the "Name (CRS)" form a datalist selection produces was accepted), so
+  affected visitors got no suggestions *and* a hard failure on typed input.
+  `resolveCrs()`/`resolveQuickCrs()` now also accept an exact, case-insensitive
+  name match as a fallback for the same reason. Don't reintroduce a
+  `<datalist>` for a station picker as a "simplification" — it silently
+  regresses to zero-suggestions on multiple real mobile browsers. The
+  suggestions box is deliberately in normal document flow, not
+  `position:absolute` — these are short bottom sheets with little vertical
+  gap before the next control (e.g. Add/Cancel right after the To field), and
+  an overlaid box tall enough to reach that row visually covers it, silently
+  swallowing a tap meant for the button underneath.
 - **`overtakers()` excludes `_cancelled` legs.** This was a real bug once:
   a cancelled train counted as a valid "faster alternative" and could hide
   a perfectly catchable real train. Don't remove the `!o._cancelled` check.
@@ -699,6 +731,76 @@ What's deliberately **not** covered here, because it needs a real browser/
 real HTTPS and can't be meaningfully mocked: the service worker's actual
 fetch-interception/caching behavior end-to-end, and the Darwin live-overlay
 fetch — see the manual recipe below for the latter.
+
+**This sandbox only has Chromium pre-installed, not WebKit, and not a real
+Firefox-for-Android build either** — so even the manual Playwright recipe
+below can't catch a bug that's specific to either of the app's actual
+visitor browsers. The station-picker bug this section exists to warn about
+wasn't a single-engine problem: it hit both iOS Safari (WebKit) *and*
+Firefox for Android (Gecko) — two unrelated rendering engines, independently
+confirmed (the latter via Mozilla's own bug tracker, not just guesswork).
+That's the real lesson: mobile-browser support for less-common native form
+controls (`<datalist>` here, but this generalizes) is inconsistent enough
+that "which mobile engine" isn't a safe way to scope the risk down — assume
+any of them might be the one that silently fails. This isn't hypothetical:
+the original `<datalist>`-based station pickers passed every unit test and
+looked correct end-to-end in a real, Playwright-driven Chromium session —
+the bug (zero suggestions, ever) only surfaced when actual visitors tried it
+on their own phones, on two different browsers. `npm install playwright`'s
+WebKit build isn't an option either — downloading a new browser binary isn't
+possible in this sandbox (`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` is set
+specifically to stop that) — and there's no Firefox-for-Android equivalent
+available here at all, real or emulated. Given this app's design center is a
+visitor's phone (the whole Darwin-key/settings-⚙ flow), any new non-trivial
+interactive widget (dropdowns, comboboxes, custom pickers — anything beyond
+a plain input/button) should either (a) be checked against known mobile
+support gaps — across engines, not just one — for whatever native element
+it might otherwise lean on, before writing it, or (b) be
+flagged to the visitor as needing a real on-device check, rather than
+reported as verified off of a Chromium-only pass.
+
+### When a UI change needs a real-device check — always hand over Termux steps
+
+The visitor's main browser is **Firefox for Android**, not desktop Chrome or
+iOS Safari — worth remembering as the primary real-device target for this
+kind of check, alongside whatever else might come up (this is exactly the
+browser that hit the `<datalist>` bug above). Whenever a change touches any
+non-trivial interactive widget — anything beyond a plain input/button/link,
+so dropdowns, comboboxes, custom pickers, anything relying on a native form
+control's rendering — and could plausibly render or behave differently
+between Chromium and Firefox for Android, **always give the visitor the
+concrete steps to check it themselves**, rather than assuming they'll
+remember the process or ask for it. Don't just say "please verify on your
+phone" — spell out the actual recipe every time, since re-deriving it isn't
+something to expect of the visitor between sessions.
+
+The recipe (confirmed workable — this is the one path that actually gets a
+real Firefox-for-Android/GeckoView session onto a live copy of a branch,
+after two others were tried and ruled out in this same investigation: an
+outbound tunnel from this sandbox to expose a local server publicly was
+blocked at the network-policy level — `localtunnel`'s relay port and
+`cloudflared`'s QUIC/HTTP2 tunnel transport were both confirmed unreachable
+here, only plain client-initiated HTTPS gets through — and a LAN-style test
+doesn't work either, since this sandbox isn't on the visitor's home network
+no matter what keeps a server process alive on this end):
+
+1. Install **Termux** (from F-Droid, not the Play Store build — outdated/
+   unmaintained there) on the Android phone itself.
+2. `pkg update -y && pkg install -y git python`
+3. `git clone https://github.com/quiet-fern-path/train-times.git && cd train-times`
+   (add a PAT into the URL, `https://<token>@github.com/...`, if the repo is
+   private — the same kind of fine-grained token already used for the route
+   builder works) then `git checkout <branch-name>`.
+4. `python -m http.server 8123`
+5. Open **Firefox for Android** on the same phone, navigate to
+   `http://127.0.0.1:8123/` (or `localhost`).
+
+This sidesteps every network restriction above entirely, because the server
+and the browser under test are the same device — no tunnel, no LAN, no
+sandbox egress policy involved. The only gotcha worth flagging up front:
+some Android builds suspend backgrounded apps aggressively, so if the server
+drops when switching to Firefox, either split-screen the two apps or use
+Termux's persistent notification to hold a wake lock while testing.
 
 ### Testing the live overlay end-to-end from a Claude Code sandbox
 
