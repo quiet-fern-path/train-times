@@ -14,6 +14,14 @@
     "change": null
   },
   {
+    "id": "coo-rdg",
+    "name": "Cookham ↔ Reading",
+    "from": "COO",
+    "to": "RDG",
+    "change": "MAI",
+    "minConnectionMins": 3
+  },
+  {
     "id": "rdg-oxf",
     "name": "Reading ↔ Oxford",
     "from": "RDG",
