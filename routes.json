@@ -19,7 +19,7 @@
     "from": "COO",
     "to": "RDG",
     "change": "MAI",
-    "minConnectionMins": 3
+    "minConnectionMins": 5
   },
   {
     "id": "rdg-oxf",
