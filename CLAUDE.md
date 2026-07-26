@@ -265,19 +265,28 @@ reintroduce a `!isConnection` gate around it.
   (`attachStationPicker()` in both `add-route.js` and `app.js`), not a native
   `<input list="...">` + `<datalist>`.** This shipped as a datalist originally
   and looked fine in testing (works in desktop Chromium/Firefox) but was a
-  real, live bug: **iOS Safari silently ignores the `list` attribute and
-  renders zero suggestions, ever** — no error, no fallback, just a plain text
-  input. Since this app is explicitly designed to be used from a visitor's
-  phone (the Darwin key, the whole point of the settings ⚙ flow), that's not
-  an edge case. It also compounded with validation: typing a station name
+  real, live bug, and on more than one mobile browser, not just one: **iOS
+  Safari silently ignores the `list` attribute and renders zero suggestions,
+  ever**, and **Firefox for Android does the same — confirmed via Mozilla's
+  own tracker (`bugzilla.mozilla.org` #1840724, "Neither `<datalist>` nor its
+  `<option>`s are exposed in Firefox for Android") and multiple independent
+  user reports, not a one-off** — both treat the input as a plain text field,
+  no error, no fallback, no announcement that suggestions exist. Don't read
+  this as "an iOS thing" — it's a wider pattern: **mobile browsers have
+  historically underinvested in `<datalist>`'s native autocomplete UI full
+  stop**, across at least two unrelated engines (WebKit and Gecko), so treat
+  *any* mobile browser as suspect for this element rather than assuming
+  Chromium-based mobile browsers are safe merely because desktop Chromium is.
+  Since this app is explicitly designed to be used from a visitor's phone
+  (the Darwin key, the whole point of the settings ⚙ flow), that's not an
+  edge case. It also compounded with validation: typing a station name
   without picking a datalist option failed with "pick a valid station" (only
   the "Name (CRS)" form a datalist selection produces was accepted), so
   affected visitors got no suggestions *and* a hard failure on typed input.
   `resolveCrs()`/`resolveQuickCrs()` now also accept an exact, case-insensitive
   name match as a fallback for the same reason. Don't reintroduce a
   `<datalist>` for a station picker as a "simplification" — it silently
-  regresses to zero-suggestions on every iOS browser (they're all WebKit
-  under the hood, so this isn't Safari-specific, it's iOS-specific). The
+  regresses to zero-suggestions on multiple real mobile browsers. The
   suggestions box is deliberately in normal document flow, not
   `position:absolute` — these are short bottom sheets with little vertical
   gap before the next control (e.g. Add/Cancel right after the To field), and
@@ -723,21 +732,30 @@ real HTTPS and can't be meaningfully mocked: the service worker's actual
 fetch-interception/caching behavior end-to-end, and the Darwin live-overlay
 fetch — see the manual recipe below for the latter.
 
-**This sandbox only has Chromium pre-installed, not WebKit** — so even the
-manual Playwright recipe below can't catch a bug that's specific to iOS
-Safari (all iOS browsers are WebKit under the hood, no matter what they're
-branded). This isn't hypothetical: the original `<datalist>`-based station
-pickers passed every unit test and looked correct end-to-end in a real,
-Playwright-driven Chromium session — the bug (zero suggestions, ever, on
-iOS) only surfaced when an actual visitor tried it on their phone. `npm
-install playwright`'s WebKit build isn't an option either — downloading a
-new browser binary isn't possible in this sandbox
-(`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` is set specifically to stop that).
-Given this app's design center is a visitor's phone (the whole Darwin-key/
-settings-⚙ flow), any new non-trivial interactive widget (dropdowns,
-comboboxes, custom pickers — anything beyond a plain input/button) should
-either (a) be checked against known WebKit/iOS support gaps for whatever
-native element it might otherwise lean on, before writing it, or (b) be
+**This sandbox only has Chromium pre-installed, not WebKit, and not a real
+Firefox-for-Android build either** — so even the manual Playwright recipe
+below can't catch a bug that's specific to either of the app's actual
+visitor browsers. The station-picker bug this section exists to warn about
+wasn't a single-engine problem: it hit both iOS Safari (WebKit) *and*
+Firefox for Android (Gecko) — two unrelated rendering engines, independently
+confirmed (the latter via Mozilla's own bug tracker, not just guesswork).
+That's the real lesson: mobile-browser support for less-common native form
+controls (`<datalist>` here, but this generalizes) is inconsistent enough
+that "which mobile engine" isn't a safe way to scope the risk down — assume
+any of them might be the one that silently fails. This isn't hypothetical:
+the original `<datalist>`-based station pickers passed every unit test and
+looked correct end-to-end in a real, Playwright-driven Chromium session —
+the bug (zero suggestions, ever) only surfaced when actual visitors tried it
+on their own phones, on two different browsers. `npm install playwright`'s
+WebKit build isn't an option either — downloading a new browser binary isn't
+possible in this sandbox (`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` is set
+specifically to stop that) — and there's no Firefox-for-Android equivalent
+available here at all, real or emulated. Given this app's design center is a
+visitor's phone (the whole Darwin-key/settings-⚙ flow), any new non-trivial
+interactive widget (dropdowns, comboboxes, custom pickers — anything beyond
+a plain input/button) should either (a) be checked against known mobile
+support gaps — across engines, not just one — for whatever native element
+it might otherwise lean on, before writing it, or (b) be
 flagged to the visitor as needing a real on-device check, rather than
 reported as verified off of a Chromium-only pass.
 
