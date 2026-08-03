@@ -26,5 +26,13 @@
     "from": "KGX",
     "to": "CBG",
     "change": null
+  },
+  {
+    "id": "rdg-nmc",
+    "name": "Reading ↔ New Mills Central",
+    "from": "RDG",
+    "to": "NMC",
+    "change": "MAN",
+    "minConnectionMins": 10
   }
 ]
