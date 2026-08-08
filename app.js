@@ -40,26 +40,74 @@ let scrollSaveTimer = null;
 // so nowM() must return 1440+ during those hours to compare correctly.
 const DAY_START_HOUR = 3;
 
-function todayStr() {
-  const d = new Date();
-  if (d.getHours() < DAY_START_HOUR) d.setDate(d.getDate() - 1);
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+// Every time in this app — depM/arrM in schedule.json, Darwin's live etd/st/
+// et strings — is a UK local wall-clock time (BST in summer, GMT in winter),
+// because that's what National Rail publishes. `new Date().getHours()` etc.
+// return the *visitor's device* timezone, which is only UK time by
+// coincidence (a visitor whose phone is set to a different zone — travelling
+// abroad, or simply configured that way — would get every now/next/countdown
+// comparison skewed by the difference between their device's offset and the
+// UK's). This app shipped that bug: todayStr()/nowM()/secsUntil() all used
+// to read the device clock directly. londonNow() reads the current instant
+// through Europe/London via Intl, which resolves BST/GMT correctly for
+// whatever the current date actually is — never hardcode a fixed "+1"
+// offset here, since that would be right for exactly half the year and
+// silently wrong the moment the UK's clocks change.
+const LONDON_TZ_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/London',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hourCycle: 'h23',
+});
+function londonNow(date) {
+  const parts = LONDON_TZ_FORMATTER.formatToParts(date || new Date());
+  const get = (type) => Number(parts.find(p => p.type === type).value);
+  return {
+    year: get('year'), month: get('month'), day: get('day'),
+    hour: get('hour'), minute: get('minute'), second: get('second'),
+  };
 }
+// "HH:MM" in UK local time, for display (e.g. the "Now HH:MM" divider) —
+// must not use toLocaleTimeString()'s default (device-timezone) formatting
+// for the same reason as londonNow() itself.
+function londonHm() {
+  const { hour, minute } = londonNow();
+  return String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
+}
+function todayStr() {
+  const { year, month, day, hour } = londonNow();
+  // Calendar-day arithmetic done in UTC-space purely to reuse setUTCDate()'s
+  // month/year rollover — year/month/day here are already the correct UK
+  // ones from londonNow(), this isn't a further timezone conversion.
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (hour < DAY_START_HOUR) d.setUTCDate(d.getUTCDate() - 1);
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+// Pure calendar-date arithmetic on an already-resolved "YYYY-MM-DD" string
+// (from the date picker or todayStr()) — no "now"/device-clock involved, so
+// this needs no UK-timezone handling: incrementing a bare calendar date by
+// N days is timezone-independent as long as construction and read-back use
+// the same (arbitrary, here UTC) reference.
 function addDays(s, n) {
-  const d = new Date(s + 'T00:00:00');
-  d.setDate(d.getDate() + n);
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const d = new Date(s + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
 }
 function nowM() {
-  const n = new Date();
-  const raw = n.getHours() * 60 + n.getMinutes();
-  return n.getHours() < DAY_START_HOUR ? raw + 1440 : raw;
+  const { hour, minute } = londonNow();
+  const raw = hour * 60 + minute;
+  return hour < DAY_START_HOUR ? raw + 1440 : raw;
 }
 function secsUntil(depM) {
-  const n = new Date();
-  const raw = n.getHours() * 60 + n.getMinutes();
-  const curM = n.getHours() < DAY_START_HOUR ? raw + 1440 : raw;
-  return (depM - curM) * 60 - n.getSeconds();
+  const { hour, minute, second } = londonNow();
+  const raw = hour * 60 + minute;
+  const curM = hour < DAY_START_HOUR ? raw + 1440 : raw;
+  // Seconds-within-the-minute don't need UK-zone correction: Europe/London's
+  // offset from UTC is always a whole number of hours (0 or +1), so it never
+  // shifts the minute/second components, only the hour (and, near midnight,
+  // the date) — see the getSeconds() uses elsewhere in this file for the
+  // same reasoning.
+  return (depM - curM) * 60 - second;
 }
 // Converts a live "HH:MM" ETD string into a depM-comparable minute value,
 // applying the same 3am day-boundary shift used for stored depM/arrM —
@@ -553,6 +601,20 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
   // the arrival sort/fetch happened to place first rather than picking
   // deterministically).
   if (isToday) {
+    // Clear every leg's stale _next flag from a previous render before
+    // recomputing — render() also does this globally, but only at the top
+    // of a full render() pass. renderLegList() itself runs again on its own
+    // (tickMinute's periodic re-render, refreshLiveOverlay()'s post-fetch
+    // re-render) without going through that clear, and now that "next" is
+    // picked by minimum effDepM rather than first-list-match, a live delay
+    // arriving between two such renders can genuinely change which leg
+    // qualifies — e.g. today's live-tested case: the scheduled-earliest
+    // departure lands a live delay that pushes it behind an on-time one
+    // that was originally scheduled a few minutes later. Real bug, caught
+    // live: without this clear, the old winner keeps its flag forever (only
+    // a full render() would blow it away) and TWO cards show "Next" at
+    // once.
+    legs.forEach(l => { delete l._next; });
     const isSlowerLeg = l => fasterMap.has(l) && fasterMap.get(l) !== null;
     const eligible = visible.filter(l => effDepM(l) >= curM && !l._cancelled);
     const preferred = eligible.filter(l => !isSlowerLeg(l));
@@ -578,7 +640,7 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
     const past = visible.filter(l => effDepM(l) < curM);
     const future = visible.filter(l => effDepM(l) >= curM);
     past.forEach(leg => parts.push(card(leg)));
-    const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    const hm = londonHm();
     parts.push(future.length ? `<div class="now-line">Now ${hm}</div>` : `<div class="now-line">${noMoreTrainsLabel(hm, route)}</div>`);
     future.forEach(leg => parts.push(card(leg)));
   } else {
@@ -629,7 +691,12 @@ function renderDirection(dir) {
   const routeData = SCHEDULE.routes[route.id] || { out: [], ret: [] };
   const isConnection = !!route.change;
   const legs = (routeData[dir] || []).filter(l => l.date === dateStr).sort(byArrival);
-  const dayLabel = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+  // Anchored to UTC (not the visitor's device tz, and deliberately not
+  // Europe/London either) purely so construction and formatting agree on
+  // the same reference — a calendar date's day-of-week doesn't actually
+  // depend on timezone as long as both sides use the same one; UTC just
+  // avoids ever having to reason about which one that is.
+  const dayLabel = new Date(dateStr + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' });
   const emptyHtml = `<div class="no-svc"><strong>No service data</strong>No trains found for ${dayLabel}. If this looks wrong, the weekly schedule refresh may not have run yet, or this date is beyond the current lookahead window.</div>`;
 
   renderLegList(listEl, legs, dir, isToday, curM, isConnection ? connectionCard : directCard, emptyHtml);

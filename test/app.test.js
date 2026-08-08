@@ -14,25 +14,57 @@ const { loadApp } = require('./loadApp.js');
 // prototype so plain-data comparisons work as expected.
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
+// Builds the epoch ms for a given UK-LOCAL wall-clock time, independent of
+// the host machine's own timezone — construction always goes through
+// Date.UTC, so these fixtures mean the same instant no matter what machine
+// or TZ env var the test suite runs under. `isBST` must be passed
+// explicitly by the caller (not computed) so each fixture is self-
+// documenting about which UK offset is in effect; get it wrong and the
+// nowM()/todayStr() assertions below simply won't match, since app.js
+// resolves the real offset itself via Intl/Europe-London, not from this
+// helper.
+function ukEpoch(y, m, d, h, min, isBST) {
+  return Date.UTC(y, m - 1, d, h - (isBST ? 1 : 0), min);
+}
+
 describe('3am timetable-day boundary (see CLAUDE.md — three things must stay in tandem)', () => {
-  test('todayStr() before 03:00 returns the previous calendar date', () => {
-    const ctx = loadApp({ now: new Date(2026, 6, 2, 2, 30).getTime() });
+  // 2 July is BST (UK clocks +1h). Regression: these fixtures used to be
+  // built via new Date(2026, 6, 2, 2, 30) — the *host* machine's local
+  // time, not UK time — which only ever matched by coincidence when the
+  // host's own tz happened to equal the UK's. todayStr()/nowM() now resolve
+  // the real UK wall clock via Europe/London regardless of host tz (see
+  // londonNow() in app.js), so the fixtures must state a UK time explicitly.
+  test('todayStr() before 03:00 BST returns the previous calendar date', () => {
+    const ctx = loadApp({ now: ukEpoch(2026, 7, 2, 2, 30, true) });
     assert.equal(ctx.todayStr(), '2026-07-01');
   });
 
-  test('todayStr() at/after 03:00 returns the current calendar date', () => {
-    const ctx = loadApp({ now: new Date(2026, 6, 2, 3, 0).getTime() });
+  test('todayStr() at/after 03:00 BST returns the current calendar date', () => {
+    const ctx = loadApp({ now: ukEpoch(2026, 7, 2, 3, 0, true) });
     assert.equal(ctx.todayStr(), '2026-07-02');
   });
 
-  test('nowM() before 03:00 adds the 1440 offset to match stored depM/arrM', () => {
-    const ctx = loadApp({ now: new Date(2026, 6, 2, 1, 30).getTime() });
+  test('nowM() before 03:00 BST adds the 1440 offset to match stored depM/arrM', () => {
+    const ctx = loadApp({ now: ukEpoch(2026, 7, 2, 1, 30, true) });
     assert.equal(ctx.nowM(), 1530); // 01:30 -> 90 + 1440
   });
 
-  test('nowM() at/after 03:00 is plain minutes-since-midnight', () => {
-    const ctx = loadApp({ now: new Date(2026, 6, 2, 13, 23).getTime() });
+  test('nowM() at/after 03:00 BST is plain minutes-since-midnight', () => {
+    const ctx = loadApp({ now: ukEpoch(2026, 7, 2, 13, 23, true) });
     assert.equal(ctx.nowM(), 803);
+  });
+
+  // Same two checks again but in winter (GMT, UK offset 0) — proves the fix
+  // reads the real per-instant UK offset via Intl rather than a hardcoded
+  // "+1", which would be right here and wrong in summer (or vice versa).
+  test('todayStr()/nowM() are correct in GMT (winter, no DST offset)', () => {
+    const beforeThree = loadApp({ now: ukEpoch(2026, 1, 15, 2, 30, false) });
+    assert.equal(beforeThree.todayStr(), '2026-01-14');
+    assert.equal(beforeThree.nowM(), 1590); // 02:30 -> 150 + 1440
+
+    const afterThree = loadApp({ now: ukEpoch(2026, 1, 15, 13, 23, false) });
+    assert.equal(afterThree.todayStr(), '2026-01-15');
+    assert.equal(afterThree.nowM(), 803);
   });
 
   test('liveMinute() applies the same 1440 offset as stored depM for post-midnight ETDs', () => {
@@ -46,6 +78,77 @@ describe('3am timetable-day boundary (see CLAUDE.md — three things must stay i
     const ctx = loadApp();
     assert.equal(ctx.addDays('2026-07-02', 1), '2026-07-03');
     assert.equal(ctx.addDays('2026-07-01', -1), '2026-06-30');
+  });
+});
+
+describe('UK time is resolved from the real instant, not the visitor\'s device clock (regression: used to read device-local time)', () => {
+  test('nowM()/todayStr() give the correct UK answer even when the process/device timezone is somewhere else entirely', () => {
+    // Simulates a visitor whose device is set to a non-UK timezone (abroad,
+    // or just configured that way) by actually changing the host process's
+    // own default tz before loading app.js — proving app.js's UK-time
+    // helpers don't depend on it at all (they hardcode Europe/London),
+    // unlike the plain new Date().getHours() reads this replaced.
+    const originalTz = process.env.TZ;
+    try {
+      process.env.TZ = 'Pacific/Auckland'; // UTC+12/+13 — about as far from the UK as it gets
+      const ctx = loadApp({ now: ukEpoch(2026, 7, 2, 2, 30, true) }); // 02:30 BST
+      assert.equal(ctx.todayStr(), '2026-07-01');
+      assert.equal(ctx.nowM(), 150 + 1440); // 02:30 -> 150 + 1440
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ; else process.env.TZ = originalTz;
+    }
+  });
+
+  test('the same UK wall-clock instant gives the same answer regardless of device timezone', () => {
+    // Two visitors looking at the app at the literal same moment, one on a
+    // UK device, one on a device set to Auckland — both must see the same
+    // "now", since the timetable itself is UK-local and doesn't care where
+    // the visitor's phone thinks it is.
+    const instant = ukEpoch(2026, 11, 20, 13, 23, false); // GMT (after the Oct DST change)
+    const originalTz = process.env.TZ;
+    try {
+      process.env.TZ = 'Europe/London';
+      const ukDevice = loadApp({ now: instant });
+      process.env.TZ = 'Pacific/Auckland';
+      const abroadDevice = loadApp({ now: instant });
+      assert.equal(ukDevice.nowM(), abroadDevice.nowM());
+      assert.equal(ukDevice.todayStr(), abroadDevice.todayStr());
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ; else process.env.TZ = originalTz;
+    }
+  });
+});
+
+describe('UK clock changes (BST <-> GMT) — nowM()/todayStr() must track the real transition, not a fixed offset', () => {
+  // Confirmed live via Intl for Europe/London: in 2026 clocks go forward
+  // 2026-03-29T01:00:00Z (01:00 GMT -> 02:00 BST) and back
+  // 2026-10-25T01:00:00Z (02:00 BST -> 01:00 GMT).
+  test('spring forward: the UK day still starts at the correct wall-clock 03:00 straddling the jump', () => {
+    const justBefore = loadApp({ now: Date.UTC(2026, 2, 29, 0, 30) }); // 00:30 GMT
+    assert.equal(justBefore.todayStr(), '2026-03-28');
+    assert.equal(justBefore.nowM(), 30 + 1440);
+
+    const justAfterJumpStillPre3am = loadApp({ now: Date.UTC(2026, 2, 29, 1, 30) }); // clocks just jumped -> 02:30 BST
+    assert.equal(justAfterJumpStillPre3am.todayStr(), '2026-03-28'); // still "yesterday": 02:30 < 03:00
+    assert.equal(justAfterJumpStillPre3am.nowM(), 150 + 1440);
+
+    const afterThreeBst = loadApp({ now: Date.UTC(2026, 2, 29, 2, 30) }); // 03:30 BST
+    assert.equal(afterThreeBst.todayStr(), '2026-03-29');
+    assert.equal(afterThreeBst.nowM(), 210);
+  });
+
+  test('fall back: the repeated 01:00-02:00 hour is still correctly "before 03:00"', () => {
+    const beforeFallback = loadApp({ now: Date.UTC(2026, 9, 25, 0, 30) }); // 01:30 BST
+    assert.equal(beforeFallback.todayStr(), '2026-10-24');
+    assert.equal(beforeFallback.nowM(), 90 + 1440);
+
+    const afterFallback = loadApp({ now: Date.UTC(2026, 9, 25, 1, 30) }); // clocks just fell back -> 01:30 GMT again
+    assert.equal(afterFallback.todayStr(), '2026-10-24'); // still the same UK day: 01:30 < 03:00, same as before the fallback
+    assert.equal(afterFallback.nowM(), 90 + 1440);
+
+    const afterThreeGmt = loadApp({ now: Date.UTC(2026, 9, 25, 3, 30) }); // 03:30 GMT
+    assert.equal(afterThreeGmt.todayStr(), '2026-10-25');
+    assert.equal(afterThreeGmt.nowM(), 210);
   });
 });
 
@@ -618,6 +721,34 @@ describe('renderLegList() — "Now" divider and "next" selection stay correct on
     ctx.renderLegList(fakeListEl(), [q, p], 'out', true, 650, () => '', '<empty>');
     assert.equal(p._next, true);
     assert.equal(q._next, undefined);
+  });
+
+  test('a stale _next flag from a previous render is cleared, not left stuck once "next" changes (real bug, caught live)', () => {
+    // Live-tested regression: render() clears _next globally, but
+    // renderLegList() also runs on its own via tickMinute()'s periodic
+    // re-render and refreshLiveOverlay()'s post-fetch re-render, neither of
+    // which goes through render()'s clear. Once "next" is picked by minimum
+    // effDepM (rather than first-list-match), a live delay landing between
+    // two such renders can genuinely change the winner — observed live: a
+    // train scheduled earliest picks up a delay that drops it behind an
+    // on-time one scheduled a few minutes later. Without renderLegList()
+    // clearing stale flags itself, both ended up flagged "next" at once.
+    const ctx = loadApp();
+    const early = { id: 'early', dep: '11:00', depM: 660, arr: '11:20', arrM: 680 };
+    const later = { id: 'later', dep: '11:07', depM: 667, arr: '11:35', arrM: 695 };
+
+    // First render: no live data yet, both on schedule — "early" (660) wins.
+    ctx.renderLegList(fakeListEl(), [early, later], 'out', true, 650, () => '', '<empty>');
+    assert.equal(early._next, true);
+    assert.equal(later._next, undefined);
+
+    // A live delay lands on "early" pushing it behind "later" — re-render
+    // (as refreshLiveOverlay()'s trailing renderDirection() call would, with
+    // no render()-level clear in between).
+    early._liveDepM = 668;
+    ctx.renderLegList(fakeListEl(), [early, later], 'out', true, 650, () => '', '<empty>');
+    assert.equal(later._next, true);
+    assert.equal(early._next, undefined); // must not still be flagged from the first render
   });
 });
 

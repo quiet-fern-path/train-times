@@ -100,6 +100,64 @@ service departs from its origin. For a service originating the previous day,
 this differs from the timetable day label. Using `leg.date` for the RTT URL
 would give a 404 for any such service.
 
+## "Now" is always UK time, never the visitor's device time
+
+Every time this app deals with — `depM`/`arrM` in schedule.json, Darwin's
+live `etd`/`st`/`et` strings — is a UK local wall-clock time (BST in summer,
+GMT in winter), because that's what National Rail publishes. This shipped as
+a real bug: `todayStr()`/`nowM()`/`secsUntil()` used to read `new Date().
+getHours()`/`getMinutes()` directly, which is the *visitor's device*
+timezone — only equal to UK time by coincidence. A visitor whose phone is
+set to a different zone (travelling abroad, or just configured that way)
+got every now/next/countdown/live-delay comparison skewed by the gap
+between their device's offset and the UK's. Confirmed live in this sandbox,
+whose container clock is UTC: with the old code, at 09:47 UTC (10:47 real
+UK/BST time) the app showed "Now 09:47" and matched live boards an hour
+behind where they should have been.
+
+Fixed via `londonNow()`/`londonHm()` in `app.js`: `Intl.DateTimeFormat`
+with an explicit `timeZone: 'Europe/London'` resolves the current instant's
+real UK wall-clock fields (year/month/day/hour/minute/second), correctly
+applying BST or GMT for whichever moment "now" actually is — and, because
+the zone is passed explicitly, this is **completely unaffected by the
+visitor's own device/OS timezone setting** (confirmed by temporarily
+forcing the test process's own `TZ` env var to `Pacific/Auckland` and
+checking the result was unchanged — see the "resolved from the real
+instant" test group in `test/app.test.js`). `todayStr()`, `nowM()`, and
+`secsUntil()` all now go through `londonNow()` instead of raw `new Date()`
+getters; the "Now HH:MM" divider label goes through the new `londonHm()`
+for the same reason instead of `toLocaleTimeString()`'s (also device-tz)
+default. **Never hardcode a fixed offset (e.g. "always add 1 hour") as a
+shortcut here** — that's right for exactly half the year and silently
+wrong the moment the UK's clocks change; `Intl`'s IANA tz data is what
+actually knows the real transition dates each year. Confirmed against the
+real 2026 transition instants (`2026-03-29T01:00:00Z` GMT→BST,
+`2026-10-25T01:00:00Z` BST→GMT) in the "UK clock changes" test group.
+
+**What deliberately didn't need fixing**, and why:
+- `addDays()` and the `dayLabel` weekday/day/month formatting
+  (`renderDirection()`) — both are pure calendar-date arithmetic/formatting
+  with no "now" involved, so they're timezone-*self-consistent* already
+  (construction and read-back always agree) regardless of which zone that
+  happens to be. `dayLabel` is anchored to UTC (not Europe/London) purely
+  so there's never any doubt about which zone that is — a calendar date's
+  day-of-week doesn't actually depend on timezone once you don't attach a
+  real moment-in-time meaning to it.
+- The `new Date().getSeconds()` reads for sub-minute countdown precision
+  (`directCard`/`connectionCard`/`scheduleNextMinute()`) — Europe/London's
+  offset from UTC is always a whole number of hours (0 or +1), so it never
+  shifts the minute/second components, only the hour (and, near midnight,
+  the date). These don't need `londonNow()`.
+- `liveMinute()` — pure string-to-minutes parsing of an already-UK-local
+  `HH:MM`, no `Date` object involved at all.
+- Live data itself: `overlayDirectLive`/`overlayConnectionLive` only ever
+  fetch live boards for `dateStr === todayStr()` (see `refreshLiveOverlay()`
+  — live is "today only" by design), so a future date on the other side of
+  a DST transition never reaches the live-overlay path; the only thing that
+  needs the DST-transition-safe `londonNow()` is figuring out what "today"
+  and "now" actually are at the moment the code runs, which it now does
+  correctly on both sides of any transition.
+
 ## New RTT API (data.rtt.io)
 
 The script uses the new-generation API, not the old `api.rtt.io` endpoint.
