@@ -437,6 +437,29 @@ confirmed against the live API:
   (missing field, or an unmapped TOC), it still falls back to first-match,
   same as before — so this doesn't add a new failure mode, only fixes the
   known one for the routes where TOC is populated.
+- **TOC alone doesn't disambiguate two same-operator services at the same
+  minute** — `rdg-pad` also has real parallel-platform GWR departures at the
+  same minute (a fast and a stopper, e.g. both booked 10:13 ex-Reading), so
+  `toc` ties between candidates too. This shipped as a real bug: the old
+  `candidates.find(operatorCode === toc)` returned the *first* same-operator
+  candidate regardless of which leg (fast or stopper) was being resolved, so
+  both legs' cards showed identical live status (platform/delay/on-time)
+  copied from whichever one the board happened to list first — confirmed
+  from a live screenshot where the slower, dimmed/overtaken leg and the
+  faster leg both showed "Plat 15A" / "On time" even though the faster train
+  was actually running late with no platform change shown. `matchByTime()`
+  now takes a `destCrs`/`arrHHMM` pair (the change-station or final
+  destination CRS and that leg's scheduled arrival there) as a second
+  disambiguation tier: when the toc tier still leaves more than one
+  candidate, it breaks the tie by comparing each candidate's own
+  `subsequentCallingPoints` scheduled arrival (`st`) at that stop against
+  `arrHHMM` — genuinely different between two same-operator services even
+  when std/toc collide, and free (same `findCallingPoint()` data every call
+  site already has in hand, no extra API call). Still falls back to
+  first-match-wins if that tier can't resolve it either (e.g. the board
+  didn't return calling points, or two services somehow share all three of
+  std/toc/scheduled-arrival), so this doesn't add a new failure mode, only
+  fixes the known one everywhere destCrs/arrHHMM are populated.
 - **The `platform` field in `schedule.json` is a mix of two different RTT
   fields depending on how far out the leg is** — `planned` (a real
   WTT-booked platform) for legs on the calendar day the Action happened to

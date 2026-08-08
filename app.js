@@ -719,20 +719,42 @@ async function fetchBoard(crs, filterCrs, filterType) {
 // Two services can share an exact scheduled departure minute (e.g. a GWR and
 // an Elizabeth line train both booked at 18:48 Paddington-Reading) — std
 // alone doesn't disambiguate them. When `toc` (the RTT-sourced ATOC operator
-// code, e.g. "GW"/"XR") is given and more than one candidate shares hhmm,
-// prefer the one whose Darwin operatorCode matches it. Falls back to
-// first-match-wins (the pre-existing behaviour) when there's no toc to
-// compare against or none of the candidates' operatorCode matches it, so a
-// missing/differently-cased operator code degrades no worse than before.
-function matchByTime(board, hhmm, toc) {
+// code, e.g. "GW"/"XR") is given, narrow to candidates whose Darwin
+// operatorCode matches it (not just the first such candidate — a genuine
+// GWR-vs-GWR clash, see below, needs every same-operator candidate kept in
+// the pool for the next tier, not just whichever one a naive `.find` hit
+// first). This alone isn't enough for two services from the *same* operator
+// booked at the same minute (e.g. Reading has real parallel-platform GWR
+// departures at :13 past the hour, a fast and a stopper to Paddington) — std
+// and toc are then identical for both, so a real live-data mismatch shipped
+// here: both legs matched whichever candidate the board happened to list
+// first, so both cards showed the same platform/delay regardless of which
+// train it actually belonged to. When `destCrs`/`arrHHMM` are given and the
+// toc tier still leaves more than one candidate, break the tie by scheduled
+// arrival time (`st`) at that downstream calling point — genuinely different
+// between two same-operator services even when std/toc aren't. Falls back to
+// first-match-wins at whichever tier runs out of information, so a missing
+// toc, missing destCrs/arrHHMM, or no candidate carrying that calling point
+// all degrade no worse than before.
+function matchByTime(board, hhmm, toc, destCrs, arrHHMM) {
   if (!board || !board.trainServices) return null;
   const candidates = board.trainServices.filter(s => s.std === hhmm);
   if (candidates.length === 0) return null;
-  if (candidates.length > 1 && toc) {
-    const byToc = candidates.find(s => s.operatorCode === toc);
-    if (byToc) return byToc;
+  if (candidates.length === 1) return candidates[0];
+
+  let pool = candidates;
+  if (toc) {
+    const byToc = candidates.filter(s => s.operatorCode === toc);
+    if (byToc.length) pool = byToc;
   }
-  return candidates[0];
+  if (pool.length > 1 && destCrs && arrHHMM) {
+    const byArr = pool.find(s => {
+      const cp = findCallingPoint(s, destCrs);
+      return cp && cp.st === arrHHMM;
+    });
+    if (byArr) return byArr;
+  }
+  return pool[0];
 }
 
 // A departure board's matched service carries subsequentCallingPoints — the
@@ -1055,7 +1077,7 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
   if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
-    const svc = matchByTime(board, leg.dep, leg.toc);
+    const svc = matchByTime(board, leg.dep, leg.toc, destCrs, leg.arr);
     if (!svc) continue;
     leg._liveChecked = true;
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
@@ -1117,7 +1139,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
 
     if (boardA) {
-      const s1 = matchByTime(boardA, leg.dep, leg.toc1);
+      const s1 = matchByTime(boardA, leg.dep, leg.toc1, changeCrs, leg.changeArr);
       if (s1) {
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
@@ -1152,7 +1174,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
       }
     }
     if (boardB) {
-      const s2 = matchByTime(boardB, leg.changeDep, leg.toc2);
+      const s2 = matchByTime(boardB, leg.changeDep, leg.toc2, destCrs, leg.arr);
       if (s2) {
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;

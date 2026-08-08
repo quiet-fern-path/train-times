@@ -173,6 +173,39 @@ describe('matchByTime()', () => {
       assert.equal(ctx.matchByTime(board, '07:03', 'XR').operatorCode, 'GW');
     });
   });
+
+  describe('scheduled-arrival disambiguation — regression for two same-operator services sharing a scheduled minute', () => {
+    // Reading has real parallel-platform GWR departures at the same minute
+    // (a fast and a stopper to Paddington), so toc alone still ties. This
+    // shipped as a real bug: both legs' cards showed identical live status,
+    // copied from whichever candidate the board happened to list first,
+    // regardless of which train (fast/slow) was actually being resolved.
+    const stopper = {
+      std: '10:13', operatorCode: 'GW', etd: 'On time', platform: '15A',
+      subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '10:51', et: 'On time' }] }],
+    };
+    const fast = {
+      std: '10:13', operatorCode: 'GW', etd: '15 late', platform: '10',
+      subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '10:39', et: '10:54' }] }],
+    };
+    const board = { trainServices: [stopper, fast] };
+
+    test('breaks a same-toc tie by scheduled arrival (st) at the given destination', () => {
+      const ctx = loadApp();
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '10:51').etd, 'On time');
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '10:39').etd, '15 late');
+    });
+
+    test('falls back to first-match-wins when destCrs/arrHHMM are omitted', () => {
+      const ctx = loadApp();
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW').etd, 'On time');
+    });
+
+    test('falls back to first-match-wins when no candidate carries a matching calling point', () => {
+      const ctx = loadApp();
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '11:00').etd, 'On time');
+    });
+  });
 });
 
 describe('findCallingPoint() — live arrival data at a downstream stop, no extra API call', () => {
