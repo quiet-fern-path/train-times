@@ -530,6 +530,95 @@ describe('formatting helpers', () => {
     assert.equal(ctx.effDepM({ depM: 400 }), 400);
     assert.equal(ctx.effDepM({ depM: 400, _liveDepM: 405 }), 405);
   });
+
+  test('effArrM() prefers the live-adjusted arrival (a "HH:MM" string) when present, else falls back to scheduled arrM, else depM', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.effArrM({ arrM: 460 }), 460);
+    assert.equal(ctx.effArrM({ arrM: 460, _liveArr: '08:15' }), ctx.liveMinute('08:15'));
+    assert.equal(ctx.effArrM({ depM: 400, arrM: null }), 400);
+  });
+});
+
+describe('byArrival() — train list display order, live-aware so it reorders itself as delays come in', () => {
+  test('sorts by effective (live-adjusted) arrival, not scheduled departure order', () => {
+    const ctx = loadApp();
+    // A fast 10:13 (sched. arr 10:39) and a stopper 10:13 (sched. arr 10:51) —
+    // departure order ties, so only arrival order distinguishes them.
+    const fast = { dep: '10:13', depM: 613, arr: '10:39', arrM: 639 };
+    const stopper = { dep: '10:13', depM: 613, arr: '10:51', arrM: 651 };
+    assert.deepEqual([stopper, fast].sort(ctx.byArrival), [fast, stopper]);
+  });
+
+  test('reorders once the fast train is delayed past the stopper\'s arrival', () => {
+    const ctx = loadApp();
+    const fast = { dep: '10:13', depM: 613, arr: '10:39', arrM: 639, _liveArr: '10:55' }; // now due after the stopper
+    const stopper = { dep: '10:13', depM: 613, arr: '10:51', arrM: 651 };
+    assert.deepEqual([fast, stopper].sort(ctx.byArrival), [stopper, fast]);
+  });
+
+  test('ties on effective arrival fall back to scheduled departure for stable ordering', () => {
+    const ctx = loadApp();
+    const a = { dep: '10:13', depM: 613, arrM: 700 };
+    const b = { dep: '10:20', depM: 620, arrM: 700 };
+    assert.deepEqual([b, a].sort(ctx.byArrival), [a, b]);
+  });
+});
+
+describe('renderLegList() — "Now" divider and "next" selection stay correct once list order is by arrival', () => {
+  function fakeListEl() {
+    const parts = [];
+    return { set innerHTML(html) { parts.push(html); }, get innerHTML() { return parts[parts.length - 1]; } };
+  }
+
+  test('the divider lands at a single clean boundary even though a departed and a not-yet-departed leg interleave in arrival order', () => {
+    const ctx = loadApp();
+    // curM = 650. pastA departed and arrived very early; futureA hasn't
+    // departed yet; pastB departed but arrives very late (e.g. it's booked
+    // to terminate a long way past its usual stop today). Sorted by arrival
+    // that's [pastA, futureA, pastB] — a departed leg (pastB) sorts AFTER a
+    // not-yet-departed one (futureA), so a naive single forward scan for the
+    // first effDepM >= curM (the old departure-order approach) would drop
+    // the divider between futureA and pastB, putting a struck-through
+    // departed leg below the "Now" line. Chosen so no pair triggers
+    // overtakers()'s 2-beaters hide threshold (futureA beats pastB once,
+    // which only dims it — dimmed legs stay in the list).
+    const pastA = { id: 'pastA', dep: '10:00', depM: 600, arr: '10:05', arrM: 605 };
+    const futureA = { id: 'futureA', dep: '11:10', depM: 670, arr: '11:30', arrM: 690 };
+    const pastB = { id: 'pastB', dep: '10:10', depM: 610, arr: '15:00', arrM: 900 };
+    const legsByArrival = [pastA, futureA, pastB];
+
+    const listEl = fakeListEl();
+    ctx.renderLegList(listEl, legsByArrival, 'out', true, 650, (leg) => `<card id="${leg.id}">`, '<empty>');
+    const html = listEl.innerHTML;
+    const dividerIdx = html.indexOf('now-line');
+    assert.ok(dividerIdx > -1, 'expected a now-line divider');
+    const before = html.slice(0, dividerIdx);
+    const after = html.slice(dividerIdx);
+    assert.match(before, /pastA/);
+    assert.match(before, /pastB/);
+    assert.doesNotMatch(before, /futureA/);
+    assert.match(after, /futureA/);
+    assert.doesNotMatch(after, /past/);
+  });
+
+  test('"next" is the leg with the soonest effective departure, even when it no longer sorts first in the arrival-ordered list', () => {
+    const ctx = loadApp();
+    // curM = 650. Q and P are scheduled with no overtaking relation between
+    // them (both dep and arr strictly earlier for Q), so both are eligible,
+    // undimmed candidates for "next" — this isn't about overtaking. Q's live
+    // departure has since slipped to 710 (e.g. Darwin has reported the
+    // departure delay but not yet an updated arrival estimate, so Q keeps
+    // sorting on its unchanged scheduled arrival, 650, ahead of P). A
+    // first-match-in-list-order pick would wrongly land on Q; the actual
+    // soonest departure now is P's, unaffected, at 660.
+    const q = { id: 'q', dep: '10:10', depM: 610, arr: '10:50', arrM: 650, _liveDepM: 710 };
+    const p = { id: 'p', dep: '11:00', depM: 660, arr: '11:40', arrM: 700 };
+    assert.deepEqual([q, p].sort(ctx.byArrival), [q, p]); // confirms q still sorts first by arrival
+
+    ctx.renderLegList(fakeListEl(), [q, p], 'out', true, 650, () => '', '<empty>');
+    assert.equal(p._next, true);
+    assert.equal(q._next, undefined);
+  });
 });
 
 describe('legCacheKey() — direct vs connection legs keyed differently for the live cache', () => {

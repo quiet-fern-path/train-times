@@ -203,6 +203,50 @@ If you add new static files the app depends on, add them to the `urls`
 array in that bootstrap script too, or first-ever offline visits won't have
 them cached.
 
+## Train list is ordered by arrival, not departure — and reorders live
+
+`renderDirection()` sorts each direction's legs with `byArrival()`
+(`effArrM(a) - effArrM(b)`, tiebroken by scheduled `depM`), not by
+departure. `effArrM()` mirrors `effDepM()`: it prefers the live-adjusted
+arrival (`leg._liveArr`, set by `applyDirectOverlay`/`applyConnectionOverlay`/
+`synthesizeLiveLegs`) over the scheduled `arrM`. Since `refreshLiveOverlay()`
+already calls `renderDirection()` after every successful poll (including the
+once-a-minute one from `tickMinute()`), this is enough on its own to make
+the list reorder itself as a delay comes in — no separate "watch for
+reorder" logic needed, it falls out of re-sorting on every render.
+
+This was a deliberate response to a real live-overlay mismatch (see the
+`matchByTime()` disambiguation entries above): two same-minute departures
+with different journey times need to be tellable apart by more than "which
+one currently sorts first", and ordering by arrival is also just the more
+useful reading for "which train gets me there soonest" — overtaking already
+tells you this per-card via the dimmed/"Faster:" treatment, this makes the
+list itself reflect it.
+
+Switching the sort key off departure order broke two things that quietly
+depended on it, both fixed in `renderLegList()`:
+
+- **"Next" train selection.** With a departure-ordered list, the first leg
+  in list order with `effDepM(leg) >= curM` was necessarily the
+  soonest-departing one. With an arrival-ordered list that's no longer true
+  (a leg that arrives later can still depart sooner), so `renderLegList()`
+  now filters to eligible legs first, then picks the *minimum* `effDepM`
+  among them via `reduce()`, rather than the first list match.
+- **The "Now" divider's position.** A single forward scan that inserts the
+  divider at the first leg with `effDepM(leg) >= curM` assumed past and
+  future legs were contiguous runs — true under departure order, not
+  guaranteed under arrival order (a departed leg can sort after a
+  not-yet-departed one). `renderLegList()` now splits `visible` into a past
+  group and a future group by `effDepM` vs `curM` first (each keeping its
+  existing arrival-sorted relative order), renders past, the divider, then
+  future — so the divider still lands at exactly one clean boundary and a
+  struck-through past leg can never appear below it.
+
+`overtakers()` itself is untouched and still compares scheduled `depM`/`arrM`
+only (see its own comment) — it answers "is this leg beaten on the
+timetable", a different question from "what order does live running put
+these legs in on screen right now".
+
 ## Route types: direct vs connection
 
 `routes.json`'s `change` field (null vs a CRS code) determines which code

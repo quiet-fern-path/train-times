@@ -76,6 +76,20 @@ function liveMinute(hhmm) {
 function effDepM(leg) {
   return leg._liveDepM != null ? leg._liveDepM : leg.depM;
 }
+// The arrM to use for display ordering: the live-adjusted arrival minute
+// when we have one (leg._liveArr, an HH:MM string set by applyDirectOverlay/
+// applyConnectionOverlay/synthesizeLiveLegs), otherwise the scheduled one.
+// This is what makes the train list reorder itself as delays come in — a
+// leg whose live arrival has slipped past another leg's now sorts after it,
+// same as overtakers() already dims it as "beaten", just reflected in
+// display order too. Falls back to depM (not arrM) only in the genuinely
+// unreachable case where neither an arrival estimate nor a scheduled arrM
+// exists, so a comparator never sees NaN/undefined and legs don't jump to
+// the top or bottom of the list.
+function effArrM(leg) {
+  if (leg._liveArr != null) return liveMinute(leg._liveArr);
+  return leg.arrM != null ? leg.arrM : leg.depM;
+}
 function countdownText(secs) {
   if (secs <= 0) return 'Departing now';
   if (secs < 180) {
@@ -530,10 +544,20 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
   visible = legs.filter(leg => !(fasterMap.has(leg) && fasterMap.get(leg) === null));
   slowerCount = visible.filter(leg => fasterMap.has(leg)).length;
 
+  // "Next" is the soonest-departing eligible leg, found by minimum effDepM
+  // rather than the first list match — visible is sorted by arrival now, not
+  // departure, so list order is no longer a reliable proxy for "leaves
+  // soonest" (most concretely: two legs tied on scheduled departure, like
+  // the same-minute-departures case above, only differ in arrival order, and
+  // picking "first in list" for those would silently depend on whichever one
+  // the arrival sort/fetch happened to place first rather than picking
+  // deterministically).
   if (isToday) {
     const isSlowerLeg = l => fasterMap.has(l) && fasterMap.get(l) !== null;
-    let next = visible.find(l => effDepM(l) >= curM && !l._cancelled && !isSlowerLeg(l));
-    if (!next) next = visible.find(l => effDepM(l) >= curM && !l._cancelled); // fall back to a slower train if that's all there is
+    const eligible = visible.filter(l => effDepM(l) >= curM && !l._cancelled);
+    const preferred = eligible.filter(l => !isSlowerLeg(l));
+    const pool = preferred.length ? preferred : eligible; // fall back to a slower train if that's all there is
+    const next = pool.length ? pool.reduce((a, b) => effDepM(a) <= effDepM(b) ? a : b) : null;
     if (next) next._next = true;
   }
 
@@ -544,18 +568,21 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
 
   const route = currentRoute();
   const parts = [];
-  let nowDone = false;
-  for (const leg of visible) {
-    if (isToday && !nowDone && effDepM(leg) >= curM) {
-      const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-      parts.push(`<div class="now-line">Now ${hm}</div>`);
-      nowDone = true;
-    }
-    parts.push(cardBuilder(leg, route, dir, isToday, curM, fasterMap.get(leg)));
-  }
-  if (isToday && !nowDone) {
+  const card = leg => cardBuilder(leg, route, dir, isToday, curM, fasterMap.get(leg));
+  if (isToday) {
+    // Split into departed/not-yet-departed groups (each keeping visible's
+    // existing arrival order) so the "Now" divider still lands at a single
+    // clean boundary — a plain single-pass scan over an arrival-sorted list
+    // could hit a still-to-depart leg before a later-in-arrival-order but
+    // already-departed one, putting a struck-through past leg below the line.
+    const past = visible.filter(l => effDepM(l) < curM);
+    const future = visible.filter(l => effDepM(l) >= curM);
+    past.forEach(leg => parts.push(card(leg)));
     const hm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-    parts.push(`<div class="now-line">${noMoreTrainsLabel(hm, route)}</div>`);
+    parts.push(future.length ? `<div class="now-line">Now ${hm}</div>` : `<div class="now-line">${noMoreTrainsLabel(hm, route)}</div>`);
+    future.forEach(leg => parts.push(card(leg)));
+  } else {
+    visible.forEach(leg => parts.push(card(leg)));
   }
   listEl.innerHTML = parts.join('');
 
@@ -574,6 +601,15 @@ function liveOnlyEmptyHtml() {
     : `<div class="no-svc"><strong>This is a quick route</strong>It has no timetable of its own — it only shows live departures. Add your free Darwin key (tap ⚙) to see anything here.</div>`;
 }
 
+// Display order is by (live-adjusted) arrival, not departure — a leg whose
+// live arrival slips past another's now sorts after it, so the list
+// reorders itself as delays come in. depM is only a tiebreak for two legs
+// arriving in the same minute, so ordering stays stable rather than
+// depending on incidental array order from the fetch/board.
+function byArrival(a, b) {
+  return (effArrM(a) - effArrM(b)) || (a.depM - b.depM);
+}
+
 function renderDirection(dir) {
   const route = currentRoute();
   if (!route) return;
@@ -581,7 +617,7 @@ function renderDirection(dir) {
 
   if (route.liveOnly) {
     const board = LIVE_ONLY_BOARDS[route.id] || {};
-    const legs = (board[dir] || []).slice().sort((a, b) => a.depM - b.depM);
+    const legs = (board[dir] || []).slice().sort(byArrival);
     renderLegList(listEl, legs, dir, true, nowM(), directCard, liveOnlyEmptyHtml());
     return;
   }
@@ -592,7 +628,7 @@ function renderDirection(dir) {
 
   const routeData = SCHEDULE.routes[route.id] || { out: [], ret: [] };
   const isConnection = !!route.change;
-  const legs = (routeData[dir] || []).filter(l => l.date === dateStr).sort((a, b) => a.depM - b.depM);
+  const legs = (routeData[dir] || []).filter(l => l.date === dateStr).sort(byArrival);
   const dayLabel = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
   const emptyHtml = `<div class="no-svc"><strong>No service data</strong>No trains found for ${dayLabel}. If this looks wrong, the weekly schedule refresh may not have run yet, or this date is beyond the current lookahead window.</div>`;
 
