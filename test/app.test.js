@@ -180,6 +180,8 @@ describe('matchByTime()', () => {
     // shipped as a real bug: both legs' cards showed identical live status,
     // copied from whichever candidate the board happened to list first,
     // regardless of which train (fast/slow) was actually being resolved.
+    // arrM is minutes since the 3am day boundary (liveMinute('10:51') === 651),
+    // matching the same representation as schedule.json's leg.arrM/changeArrM.
     const stopper = {
       std: '10:13', operatorCode: 'GW', etd: 'On time', platform: '15A',
       subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '10:51', et: 'On time' }] }],
@@ -192,18 +194,37 @@ describe('matchByTime()', () => {
 
     test('breaks a same-toc tie by scheduled arrival (st) at the given destination', () => {
       const ctx = loadApp();
-      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '10:51').etd, 'On time');
-      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '10:39').etd, '15 late');
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 651).etd, 'On time');
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 639).etd, '15 late');
     });
 
-    test('falls back to first-match-wins when destCrs/arrHHMM are omitted', () => {
+    // RTT and Darwin are independently-sourced schedules and have been
+    // observed to disagree on a service's scheduled arrival by a minute or
+    // two (WTT-derived vs public-timetable rounding) — an exact match would
+    // silently miss the right candidate on exactly the routes this tier
+    // exists to fix, so the comparison tolerates up to MATCH_ARR_TOLERANCE_MINS.
+    test('still resolves correctly when RTT and Darwin scheduled arrivals differ by up to the tolerance', () => {
+      const ctx = loadApp();
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 650).etd, 'On time'); // 1 min off stopper's 651
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 653).etd, 'On time'); // 2 min off stopper's 651
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 637).etd, '15 late'); // 2 min off fast's 639
+    });
+
+    test('beyond the tolerance, falls back to first-match-wins rather than a wrong-but-plausible match', () => {
+      const ctx = loadApp();
+      // 654 is 3 min off stopper's 651 (over tolerance) and nowhere near
+      // fast's 639, so neither candidate matches within tolerance.
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 654).etd, 'On time');
+    });
+
+    test('falls back to first-match-wins when destCrs/arrM are omitted', () => {
       const ctx = loadApp();
       assert.equal(ctx.matchByTime(board, '10:13', 'GW').etd, 'On time');
     });
 
     test('falls back to first-match-wins when no candidate carries a matching calling point', () => {
       const ctx = loadApp();
-      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', '11:00').etd, 'On time');
+      assert.equal(ctx.matchByTime(board, '10:13', 'GW', 'PAD', 660).etd, 'On time');
     });
   });
 });

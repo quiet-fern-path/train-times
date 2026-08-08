@@ -448,18 +448,25 @@ confirmed against the live API:
   from a live screenshot where the slower, dimmed/overtaken leg and the
   faster leg both showed "Plat 15A" / "On time" even though the faster train
   was actually running late with no platform change shown. `matchByTime()`
-  now takes a `destCrs`/`arrHHMM` pair (the change-station or final
-  destination CRS and that leg's scheduled arrival there) as a second
-  disambiguation tier: when the toc tier still leaves more than one
-  candidate, it breaks the tie by comparing each candidate's own
-  `subsequentCallingPoints` scheduled arrival (`st`) at that stop against
-  `arrHHMM` — genuinely different between two same-operator services even
-  when std/toc collide, and free (same `findCallingPoint()` data every call
-  site already has in hand, no extra API call). Still falls back to
-  first-match-wins if that tier can't resolve it either (e.g. the board
-  didn't return calling points, or two services somehow share all three of
-  std/toc/scheduled-arrival), so this doesn't add a new failure mode, only
-  fixes the known one everywhere destCrs/arrHHMM are populated.
+  now takes a `destCrs`/`arrM` pair (the change-station or final destination
+  CRS and that leg's scheduled arrival there, in minutes — `leg.arrM`/
+  `leg.changeArrM`, the same day-boundary-relative representation used
+  everywhere else) as a second disambiguation tier: when the toc tier still
+  leaves more than one candidate, it breaks the tie by comparing each
+  candidate's own `subsequentCallingPoints` scheduled arrival (`st`) at that
+  stop against `arrM`, within `MATCH_ARR_TOLERANCE_MINS` (2) rather than
+  requiring an exact match — RTT and Darwin are independently-sourced
+  schedules and have been observed live to disagree on the same service's
+  scheduled arrival by a minute or two (WTT-derived vs public-timetable
+  rounding), and an exact match would silently miss the right candidate on
+  exactly the ambiguous routes this tier exists to fix, falling back to
+  first-match-wins for the case it's supposed to resolve. This is free (same
+  `findCallingPoint()` data every call site already has in hand, no extra
+  API call). Still falls back to first-match-wins if that tier can't resolve
+  it either (e.g. the board didn't return calling points, or two services
+  somehow share std/toc and land within tolerance of each other at the same
+  stop), so this doesn't add a new failure mode, only fixes the known one
+  everywhere destCrs/arrM are populated.
 - **The `platform` field in `schedule.json` is a mix of two different RTT
   fields depending on how far out the leg is** — `planned` (a real
   WTT-booked platform) for legs on the calendar day the Action happened to

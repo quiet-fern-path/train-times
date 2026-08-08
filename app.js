@@ -729,14 +729,21 @@ async function fetchBoard(crs, filterCrs, filterType) {
 // and toc are then identical for both, so a real live-data mismatch shipped
 // here: both legs matched whichever candidate the board happened to list
 // first, so both cards showed the same platform/delay regardless of which
-// train it actually belonged to. When `destCrs`/`arrHHMM` are given and the
-// toc tier still leaves more than one candidate, break the tie by scheduled
+// train it actually belonged to. When `destCrs`/`arrM` are given and the toc
+// tier still leaves more than one candidate, break the tie by scheduled
 // arrival time (`st`) at that downstream calling point — genuinely different
-// between two same-operator services even when std/toc aren't. Falls back to
-// first-match-wins at whichever tier runs out of information, so a missing
-// toc, missing destCrs/arrHHMM, or no candidate carrying that calling point
-// all degrade no worse than before.
-function matchByTime(board, hhmm, toc, destCrs, arrHHMM) {
+// between two same-operator services even when std/toc aren't. Compared as
+// minutes within MATCH_ARR_TOLERANCE_MINS, not exact string equality: RTT
+// and Darwin are two independently-sourced schedules and have been observed
+// to disagree on the same service's scheduled arrival by a minute or two
+// (e.g. WTT-derived vs public-timetable rounding) — an exact match would
+// silently miss the very candidate this tier exists to find and fall back
+// to first-match-wins for the ambiguous case that's supposed to be fixed.
+// Falls back to first-match-wins at whichever tier runs out of information,
+// so a missing toc, missing destCrs/arrM, or no candidate carrying that
+// calling point within tolerance all degrade no worse than before.
+const MATCH_ARR_TOLERANCE_MINS = 2;
+function matchByTime(board, hhmm, toc, destCrs, arrM) {
   if (!board || !board.trainServices) return null;
   const candidates = board.trainServices.filter(s => s.std === hhmm);
   if (candidates.length === 0) return null;
@@ -747,10 +754,10 @@ function matchByTime(board, hhmm, toc, destCrs, arrHHMM) {
     const byToc = candidates.filter(s => s.operatorCode === toc);
     if (byToc.length) pool = byToc;
   }
-  if (pool.length > 1 && destCrs && arrHHMM) {
+  if (pool.length > 1 && destCrs && arrM != null) {
     const byArr = pool.find(s => {
       const cp = findCallingPoint(s, destCrs);
-      return cp && cp.st === arrHHMM;
+      return cp && /^\d{2}:\d{2}$/.test(cp.st) && Math.abs(liveMinute(cp.st) - arrM) <= MATCH_ARR_TOLERANCE_MINS;
     });
     if (byArr) return byArr;
   }
@@ -1077,7 +1084,7 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
   if (!board) return; // fetch failed this round — leave legs' existing live state untouched
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
-    const svc = matchByTime(board, leg.dep, leg.toc, destCrs, leg.arr);
+    const svc = matchByTime(board, leg.dep, leg.toc, destCrs, leg.arrM);
     if (!svc) continue;
     leg._liveChecked = true;
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
@@ -1139,7 +1146,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
 
     if (boardA) {
-      const s1 = matchByTime(boardA, leg.dep, leg.toc1, changeCrs, leg.changeArr);
+      const s1 = matchByTime(boardA, leg.dep, leg.toc1, changeCrs, leg.changeArrM);
       if (s1) {
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
@@ -1174,7 +1181,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
       }
     }
     if (boardB) {
-      const s2 = matchByTime(boardB, leg.changeDep, leg.toc2, destCrs, leg.arr);
+      const s2 = matchByTime(boardB, leg.changeDep, leg.toc2, destCrs, leg.arrM);
       if (s2) {
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
