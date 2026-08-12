@@ -539,44 +539,53 @@ past a certain number of detailed services. It does not truncate and it does
 not tell you the limit — it fails the whole request, so one over-large ask
 takes out an entire direction's live data.
 
-Confirmed live at Paddington on 2026-08-12 (all reproduced twice):
+Measured live at Paddington on 2026-08-12, a day of **weather disruption**
+(all reproduced twice):
 
-| request | result |
-|---|---|
-| `PAD?numRows=23` (unfiltered) | 200 |
-| `PAD?numRows=24` (unfiltered) | 500 |
-| `PAD?filterCrs=RDG&numRows=9` | 200 |
-| `PAD?filterCrs=RDG&numRows=10` | 500 |
-| `PAD?filterCrs=RDG&numRows=20&timeWindow=15` | 200 |
-| `PAD?filterCrs=RDG&numRows=20&timeWindow=25` | 500 |
-| `PAD?filterCrs=MAI&numRows=20` | 500 |
-| `RDG?filterCrs=PAD&numRows=20` | 200 |
-| `KGX?filterCrs=CBG&numRows=50` | 200 |
+| request | 18:46 (disrupted) | 19:37 (calm) |
+|---|---|---|
+| `PAD?numRows=23` (unfiltered) | 200 | 200 |
+| `PAD?numRows=24` (unfiltered) | 500 | 200 |
+| `PAD?numRows=30` (unfiltered) | 500 | 200 |
+| `PAD?filterCrs=RDG&numRows=9` | 200 | 200 |
+| `PAD?filterCrs=RDG&numRows=10` | 500 | 200 |
+| `PAD?filterCrs=RDG&numRows=20` | 500 | 200 |
+| `PAD?filterCrs=MAI&numRows=20` | 500 | — |
+| `RDG?filterCrs=PAD&numRows=20` | 200 | 200 |
+| `KGX?filterCrs=CBG&numRows=50` | 200 | — |
 
-Three things follow, and all three matter:
+**What drives it is live-forecast volume, not departure density and not
+response size.** This was initially written up here as a density/peak effect
+and that was wrong — the two boards either side of the fix say so directly:
+
+| | services | span | rate | size | delayed | cancelled | calling points with revised times | ceiling |
+|---|---|---|---|---|---|---|---|---|
+| 18:46 | 23 | 48 min | 29/hr | 111KB | 7 | 4 | 40 | fails at 24 |
+| 19:37 | 23 | 43 min | 32/hr | 108KB | 3 | 0 | 10 | fine at 30 |
+
+The calm board is **denser** and the same size, and copes with far more rows.
+Every delayed or cancelled service makes Darwin re-estimate each of that
+service's downstream calling points and attach `cancelReason` /
+`currentOrigins` — work *per service*, not bytes, which is consistent with a
+server-side timeout rather than a payload limit. Two corollaries:
 
 1. **`filterCrs` doesn't dodge it.** The filter is applied *after* the board
-   is built, so a filtered request has to scan far enough to find `numRows`
-   matches and hits the same wall from the other side. That's why a *sparse*
-   destination off a busy station (`PAD→MAI`) fails at a numRows a *dense*
-   one (`PAD→RDG`) survives: what counts is services scanned, not services
-   returned.
-2. **It's a property of the station's departure density, not the station.**
-   Reading, Kings Cross and Maidenhead are all fine at `numRows=20`.
-   Paddington is fine off-peak. This is exactly why it read as "live data is
-   just flaky on this one route" rather than an outright breakage.
-3. **The threshold moves, so a tuned constant can't work.** On the same
-   board twelve minutes apart: at 18:46 filtered `numRows=9` succeeded and
-   `10` failed; at 18:58 only `numRows≤4` succeeded, and unfiltered
-   `numRows=20` — fine at 18:46 — had started failing too. Any constant
-   picked from one measurement is wrong at the next.
+   is built, so a filtered request scans just as far and hits the same wall
+   from the other side. Hence a sparse destination off a busy station
+   (`PAD→MAI`) failing where a dense one (`PAD→RDG`) survives.
+2. **The safe numRows collapses exactly when the network is disrupted** —
+   i.e. exactly when live data matters most, and exactly why this read as
+   "live data is just flaky at Paddington" rather than a breakage. Within one
+   evening the ceiling moved from 9 to 4 to unlimited-as-far-as-tested.
 
 Hence `BOARD_ROW_LADDER` in `app.js`: ask for `20`, and on a **5xx only**
-step down through `12, 8, 5, 3` until one comes back. A short board of the
+step down through `12, 8, 5, 3, 2` until one comes back. A short board of the
 *nearest* departures is worth incomparably more than no live data, and the
-nearest departures are the ones being looked at. Don't replace this with a
-single smaller constant — that both under-serves every quiet board and still
-breaks at the peak.
+nearest departures are the ones being looked at. The floor is deliberately as
+low as 2: severe disruption is the case this exists for, and two trains'
+worth of live data still answers "what is my next train actually doing".
+Don't replace this with a single smaller constant — that both under-serves
+every calm board and still breaks in a storm.
 
 Two cost controls keep the ladder from becoming a rate-limit problem, since
 the app re-polls every minute:
@@ -595,6 +604,19 @@ An unfiltered board plus client-side filtering via `findCallingPoint()` was
 considered as a fallback and rejected on measurement: unfiltered `numRows=20`
 at PAD returned 200 at 18:46 and 500 at 19:00, so it's subject to the same
 moving ceiling and isn't the reliable escape hatch it looks like.
+
+Because the trigger is disruption, **the degraded states below will show up
+precisely during disruption** — so the status bar must never let "no delays
+shown" be read as "no delays". That's the other half of this fix.
+
+The one untried lever is `GetDepartureBoard` (the non-`WithDetails`
+operation), which wouldn't assemble calling points at all and so shouldn't
+hit this. It's a *different* Rail Data Marketplace product (separate
+subscription, unverified on this key) and it returns no
+`subsequentCallingPoints`, which `_liveArr`, the change-station arrival and
+`matchByTime`'s arrival tie-break all depend on — so it isn't a drop-in, and
+it would cost a second call per board to keep those. Worth revisiting only if
+the ladder's floor stops being enough.
 
 ## "Live" in the status bar means live data reached a card
 

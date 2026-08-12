@@ -1038,12 +1038,15 @@ describe('quick-route sessionStorage (loadUserRoutes/saveUserRoutes/mergeUserRou
   });
 });
 
-// Darwin's GetDepBoardWithDetails 500s outright once the board it has to
-// assemble/scan exceeds roughly 23 detailed services, rather than returning
-// a shorter one — confirmed live at Paddington on 2026-08-12 (unfiltered
-// numRows=23 -> 200, 24 -> 500; PAD?filterCrs=RDG numRows=9 -> 200, 10 ->
-// 500). A fixed numRows=20 therefore worked everywhere except the busiest
-// board on the busiest route, where it killed the whole return direction.
+// Darwin's GetDepBoardWithDetails 500s outright, rather than returning a
+// shorter board, once the board costs too much to assemble — driven by how
+// much live forecast data it carries (delays, cancellations and their
+// downstream re-estimated calling points), not by how many trains the
+// station runs. Measured live at Paddington on 2026-08-12 during weather
+// disruption: unfiltered numRows=23 -> 200, 24 -> 500; filtered to Reading,
+// numRows=9 -> 200, 10 -> 500. An hour later, on a *denser* but calm board,
+// numRows=30 was fine. A fixed numRows=20 therefore held up on ordinary days
+// and killed the whole return direction exactly when it was most needed.
 // See fetchBoard()'s comment in app.js for the full evidence.
 describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a big one', () => {
   // Mimics the real ceiling: any request above `maxRows` fails the way the
@@ -1128,7 +1131,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     const ctx = loadApp();
     const calls = stubDarwin(ctx, { maxRows: 0 });
     assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
-    assert.deepEqual(calls, [20, 12, 8, 5, 3]);
+    assert.deepEqual(calls, [20, 12, 8, 5, 3, 2]);
   });
 
   test('a board 500ing on every rung costs one call next poll, not the whole ladder again', async () => {
@@ -1139,7 +1142,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     await ctx.fetchBoard('PAD', 'RDG', 'to');
     calls.length = 0;
     await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.deepEqual(calls, [3]);
+    assert.deepEqual(calls, [2]);
   });
 
   test('a network failure does not clamp the next poll to a small board', async () => {

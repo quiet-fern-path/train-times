@@ -799,36 +799,41 @@ function scrollToNext(panelEl) {
 // ── Live overlay (Darwin / LDBWS via Rail Data Marketplace) ─────────
 function apiKey() { return localStorage.getItem('darwinApiKey') || ''; }
 
-// Darwin's GetDepBoardWithDetails has a hard, undocumented ceiling on how
-// many detailed services it will assemble for one request: past roughly 23
-// it returns HTTP 500 `{"Message":"The service is currently unavailable"}`
-// instead of a shorter board. Confirmed live at Paddington (2026-08-12,
-// 18:45): unfiltered numRows=23 -> 200, numRows=24 -> 500, reproducibly,
-// two runs each. `filterCrs` does not dodge it — the filter is applied
-// *after* the board is built, so a filtered request has to scan far enough
-// to find numRows matches and hits the same ceiling from the other side:
-// PAD?filterCrs=RDG&numRows=9 -> 200 (≈21 services scanned), numRows=10 ->
-// 500 (≈24+). Bounding the scan with timeWindow moves the same boundary
-// (timeWindow=15 -> 200, timeWindow=25 -> 500), and a sparser destination
-// off the same busy station fails sooner still (PAD?filterCrs=MAI&
-// numRows=20 -> 500), which confirms it tracks *services scanned*, not the
-// station, the filter, or the number finally returned.
+// Darwin's GetDepBoardWithDetails will refuse to assemble a board it finds
+// too expensive, returning HTTP 500 `{"Message":"The service is currently
+// unavailable"}` for the whole request rather than a shorter board. Measured
+// live at Paddington on 2026-08-12, a day of weather disruption: at 18:46
+// unfiltered numRows=23 -> 200 and 24 -> 500; filtered to Reading, numRows=9
+// -> 200 and 10 -> 500. `filterCrs` doesn't dodge it (the filter is applied
+// *after* the board is built, so a filtered request scans just as far), and
+// a sparser destination off the same station fails sooner still
+// (PAD?filterCrs=MAI&numRows=20 -> 500).
 //
-// So no single fixed numRows can be right: 20 is fine at Reading, Kings
-// Cross and Maidenhead, and fatal at Paddington at peak — which is exactly
-// why this looked like an intermittent, route-specific "live data just
-// doesn't work" rather than an outright breakage. Ask for the largest board
-// first and step down on a 5xx until one comes back: a short board of the
-// *nearest* departures is worth incomparably more than no live data at all,
-// and the nearest departures are the ones being looked at anyway.
-// The ceiling is not a fixed number — it drifts with how busy the station is
-// minute to minute, so the ladder has to reach genuinely low rather than stop
-// at a tuned constant. Measured at Paddington on one evening: at 18:46
-// filtered numRows=9 succeeded and 10 failed; by 18:58, on the same board,
-// only numRows≤4 succeeded (and unfiltered numRows=20, fine twelve minutes
-// earlier, had started failing too). A constant picked from the first
-// measurement would have been broken by the second — hence a ladder.
-const BOARD_ROW_LADDER = [20, 12, 8, 5, 3];
+// What actually drives it is the amount of live *forecast* data the board
+// carries, NOT how many trains the station runs and NOT the response size:
+//
+//   18:46  23 services / 48 min (29 dep/hr), 111KB — 7 delayed, 4 cancelled,
+//          40 downstream calling points carrying revised times → 500 at 24
+//   19:37  23 services / 43 min (32 dep/hr), 108KB — 3 delayed, 0 cancelled,
+//          10 revised calling points → fine at 30
+//
+// The later board is *denser* and the same size, and it copes with far more
+// rows. Every delayed or cancelled service means Darwin re-estimates each of
+// its downstream calling points (and attaches cancelReason/currentOrigins),
+// which is work per service, not bytes — consistent with a server-side
+// timeout rather than a payload limit. So the ceiling collapses exactly when
+// the network is disrupted, which is exactly when live data matters most and
+// exactly why this looked like "live data is just flaky at Paddington".
+//
+// Hence a ladder rather than a tuned constant: no fixed numRows can be right
+// when the safe value is 20+ on a calm evening and 3 in a storm. Ask for the
+// largest board first and step down on a 5xx until one comes back — a short
+// board of the *nearest* departures is worth incomparably more than no live
+// data, and the nearest departures are the ones being looked at anyway. The
+// floor is deliberately low (2) because severe disruption is the case this
+// exists for: two trains' worth of live data still answers "what is my next
+// train actually doing", which is the whole question during a storm.
+const BOARD_ROW_LADDER = [20, 12, 8, 5, 3, 2];
 // Whichever rung last worked for a given board is where the next poll
 // starts, so the steady-state cost stays at one call per board per minute
 // rather than replaying the whole ladder every time. Re-probed from the top
