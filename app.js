@@ -444,9 +444,19 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 
   const nextHtml = `<div class="next-row"><span class="next-badge">Next</span><span class="next-mins">${isNext ? label : ''}</span></div>`;
 
-  const delayTag = leg._delayMins > 0
-    ? `<span class="delay-tag">${leg._delayMins} min late</span>`
-    : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
+  // Cancelled has to be checked before the delay tags, not after: Darwin
+  // reports a cancelled service with no estimated departure, so _delayMins
+  // is 0 and _liveChecked is true, and the "on time" branch below would
+  // otherwise put a green "On time" badge on a cancelled train. (Only
+  // visible once live data actually reached these cards — connectionCard
+  // already had its own cancelled tag and never had the problem.) The
+  // strike-through/red-border treatment alone doesn't say the word, so
+  // spell it out here the same way connectionCard does.
+  const delayTag = isCancelled
+    ? `<span class="delay-tag">Cancelled</span>`
+    : leg._delayMins > 0
+      ? `<span class="delay-tag">${leg._delayMins} min late</span>`
+      : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
 
   const rttDate = leg.serviceDate || leg.date;
   const rttLink = leg.uid
@@ -789,33 +799,105 @@ function scrollToNext(panelEl) {
 // ── Live overlay (Darwin / LDBWS via Rail Data Marketplace) ─────────
 function apiKey() { return localStorage.getItem('darwinApiKey') || ''; }
 
+// Darwin's GetDepBoardWithDetails has a hard, undocumented ceiling on how
+// many detailed services it will assemble for one request: past roughly 23
+// it returns HTTP 500 `{"Message":"The service is currently unavailable"}`
+// instead of a shorter board. Confirmed live at Paddington (2026-08-12,
+// 18:45): unfiltered numRows=23 -> 200, numRows=24 -> 500, reproducibly,
+// two runs each. `filterCrs` does not dodge it — the filter is applied
+// *after* the board is built, so a filtered request has to scan far enough
+// to find numRows matches and hits the same ceiling from the other side:
+// PAD?filterCrs=RDG&numRows=9 -> 200 (≈21 services scanned), numRows=10 ->
+// 500 (≈24+). Bounding the scan with timeWindow moves the same boundary
+// (timeWindow=15 -> 200, timeWindow=25 -> 500), and a sparser destination
+// off the same busy station fails sooner still (PAD?filterCrs=MAI&
+// numRows=20 -> 500), which confirms it tracks *services scanned*, not the
+// station, the filter, or the number finally returned.
+//
+// So no single fixed numRows can be right: 20 is fine at Reading, Kings
+// Cross and Maidenhead, and fatal at Paddington at peak — which is exactly
+// why this looked like an intermittent, route-specific "live data just
+// doesn't work" rather than an outright breakage. Ask for the largest board
+// first and step down on a 5xx until one comes back: a short board of the
+// *nearest* departures is worth incomparably more than no live data at all,
+// and the nearest departures are the ones being looked at anyway.
+// The ceiling is not a fixed number — it drifts with how busy the station is
+// minute to minute, so the ladder has to reach genuinely low rather than stop
+// at a tuned constant. Measured at Paddington on one evening: at 18:46
+// filtered numRows=9 succeeded and 10 failed; by 18:58, on the same board,
+// only numRows≤4 succeeded (and unfiltered numRows=20, fine twelve minutes
+// earlier, had started failing too). A constant picked from the first
+// measurement would have been broken by the second — hence a ladder.
+const BOARD_ROW_LADDER = [20, 12, 8, 5, 3];
+// Whichever rung last worked for a given board is where the next poll
+// starts, so the steady-state cost stays at one call per board per minute
+// rather than replaying the whole ladder every time. Re-probed from the top
+// after this long, so a board clamped during the evening peak climbs back to
+// 20 once the station quietens down instead of staying short all session.
+const BOARD_ROWS_REPROBE_MS = 10 * 60 * 1000;
+const boardRowsHint = {};
+
 async function fetchBoard(crs, filterCrs, filterType) {
   const key = apiKey();
   if (!key) return null;
-  let url = `https://api1.raildata.org.uk/1010-live-departure-board-dep/LDBWS/api/20220120/GetDepBoardWithDetails/${crs}`;
+  const hintKey = `${crs}|${filterCrs || ''}|${filterType || ''}`;
+  const hint = boardRowsHint[hintKey];
+  const startIdx = hint && (Date.now() - hint.at) < BOARD_ROWS_REPROBE_MS ? hint.idx : 0;
+  for (let idx = startIdx; idx < BOARD_ROW_LADDER.length; idx++) {
+    const { board, retryable } = await fetchBoardOnce(crs, filterCrs, filterType, BOARD_ROW_LADDER[idx], key);
+    if (board) {
+      boardRowsHint[hintKey] = { idx, at: Date.now() };
+      return board;
+    }
+    if (!retryable) {
+      // Offline, CORS, a 4xx, a bad key — nothing to do with board size, and
+      // nothing a smaller request fixes. Drop the hint so the next poll
+      // starts from a full board rather than inheriting a clamp that a
+      // momentary network blip had no business imposing.
+      delete boardRowsHint[hintKey];
+      return null;
+    }
+  }
+  // Every rung 500'd. Park at the smallest so the next poll costs one call
+  // instead of replaying the whole ladder each minute against a board that's
+  // currently refusing everything; the re-probe timer above still walks it
+  // back up to a full-size request once the station quietens down.
+  boardRowsHint[hintKey] = { idx: BOARD_ROW_LADDER.length - 1, at: Date.now() };
+  return null;
+}
+
+function fetchBoardUrl(crs, filterCrs, filterType, numRows) {
   const params = new URLSearchParams();
   if (filterCrs) { params.set('filterCrs', filterCrs); params.set('filterType', filterType || 'to'); }
-  params.set('numRows', '20');
-  url += '?' + params.toString();
+  params.set('numRows', String(numRows));
+  return `https://api1.raildata.org.uk/1010-live-departure-board-dep/LDBWS/api/20220120/GetDepBoardWithDetails/${crs}?${params.toString()}`;
+}
+
+// One attempt at one board size. `retryable` means "a smaller board might
+// succeed where this one didn't" — true only for 5xx, which is what the
+// size ceiling above reports. A 4xx is a request we got wrong (or a key
+// problem) and shrinking it would just burn calls against the rate limit.
+async function fetchBoardOnce(crs, filterCrs, filterType, numRows, key) {
+  const label = `GET ${crs} board${filterCrs ? ` (${filterType || 'to'} ${filterCrs})` : ''} numRows=${numRows}`;
   try {
-    const r = await fetch(url, { headers: { 'x-apikey': key } });
+    const r = await fetch(fetchBoardUrl(crs, filterCrs, filterType, numRows), { headers: { 'x-apikey': key } });
     if (r.status === 401 || r.status === 403) {
       liveAuthError = true;
-      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}`.trim());
-      return null;
+      liveErrorDetails.push(`${label} -> HTTP ${r.status} ${r.statusText || ''}`.trim());
+      return { board: null, retryable: false };
     }
     if (!r.ok) {
       let bodySnippet = '';
       try { bodySnippet = (await r.text()).slice(0, 300); } catch (e2) { /* body already consumed or unreadable */ }
-      liveErrorDetails.push(`GET ${crs} board -> HTTP ${r.status} ${r.statusText || ''}${bodySnippet ? '\n  ' + bodySnippet : ''}`.trim());
-      return null;
+      liveErrorDetails.push(`${label} -> HTTP ${r.status} ${r.statusText || ''}${bodySnippet ? '\n  ' + bodySnippet : ''}`.trim());
+      return { board: null, retryable: r.status >= 500 };
     }
-    return await r.json();
+    return { board: await r.json(), retryable: false };
   } catch (e) {
     // offline, or CORS/network failure — fall back to scheduled silently,
     // but keep the detail for the error panel in case it's not obvious.
-    liveErrorDetails.push(`GET ${crs} board -> ${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`);
-    return null;
+    liveErrorDetails.push(`${label} -> ${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`);
+    return { board: null, retryable: false };
   }
 }
 
@@ -1067,6 +1149,22 @@ function updateLiveErrorIndicator() {
   document.getElementById('btn-live-error').style.display = lastLiveErrorReport ? '' : 'none';
 }
 
+// Does this route still have a train to come today that live data could
+// have landed on? Used to tell "the boards matched nothing, something is
+// wrong" apart from "there is simply nothing left to match" — after the last
+// train of the day every board legitimately matches zero legs, and flagging
+// that as a fault every night would train the warning right out of being
+// noticed. A quick route is excluded because its legs *are* the board: there
+// is no separate schedule to have upcoming legs in.
+function hasUpcomingLegs(route, dateStr) {
+  if (route.liveOnly) return false;
+  const data = SCHEDULE.routes[route.id];
+  if (!data) return false;
+  const curM = nowM();
+  return ['out', 'ret'].some(dir =>
+    (data[dir] || []).some(l => l.date === dateStr && l.depM >= curM));
+}
+
 async function refreshLiveOverlay() {
   const route = currentRoute();
   if (!route) return;
@@ -1100,28 +1198,48 @@ async function refreshLiveOverlay() {
   // (e.g. someone on a train losing signal in a tunnel) still wants to see
   // the last known state, just clearly marked as not current.
   liveAuthError = false;
-  let ok = false;
+  let outcome = NO_LIVE_OUTCOME;
   try {
-    ok = route.liveOnly
+    outcome = route.liveOnly
       ? await overlayLiveOnlyRoute(route)
       : route.change
         ? await overlayConnectionLive(route, dateStr)
         : await overlayDirectLive(route, dateStr);
   } catch (e) {
-    ok = false;
+    outcome = NO_LIVE_OUTCOME;
     liveErrorDetails.push(`Unexpected error in refreshLiveOverlay: ${e && e.stack ? e.stack : e}`);
   }
 
-  if (ok) {
+  const gotSomething = outcome.boardsOk > 0 && outcome.matched > 0;
+  if (gotSomething) {
     liveEverSucceeded[route.id] = true;
     lastLiveSuccessAt[route.id] = Date.now();
-    setLiveStatus('on', route.liveOnly ? 'Live departures' : 'Live platforms & delays');
     saveLiveCache(route, dateStr);
+  }
+
+  if (gotSomething && outcome.boardsFailed === 0) {
+    setLiveStatus('on', route.liveOnly ? 'Live departures' : 'Live platforms & delays');
   } else if (liveAuthError) {
     // Distinct from a generic/transient failure: Darwin rejected the key
     // itself, so retrying on its own won't help — the visitor needs to fix
     // the key in Settings.
     setLiveStatus('error', 'Invalid API key — check Settings ⚙');
+  } else if (gotSomething) {
+    // Some boards landed and some didn't. The trains the working board(s)
+    // covered really are live; the rest are sitting on scheduled times. Say
+    // so rather than showing green — a whole direction can be dead in this
+    // state (see fetchBoard's size-ceiling note), and green claiming
+    // otherwise is exactly the failure that made this unreportable.
+    setLiveStatus('stale', 'Live data incomplete — some trains not updating (tap ⚠)');
+  } else if (outcome.boardsOk > 0 && hasUpcomingLegs(route, dateStr)) {
+    // Every board came back, none of them matched a train that hasn't left
+    // yet. Not a network problem — a matching one (see matchByTime), and
+    // still not something to paint green.
+    setLiveStatus('stale', 'Live data fetched but matched no trains (tap ⚠)');
+  } else if (outcome.boardsOk > 0) {
+    // Boards fine, nothing left to overlay today — the normal state after
+    // the last train, not a fault.
+    setLiveStatus('on', route.liveOnly ? 'Live departures' : 'Live platforms & delays');
   } else if (liveEverSucceeded[route.id]) {
     setLiveStatus('stale', staleLiveLabel(route.id));
   } else {
@@ -1130,13 +1248,18 @@ async function refreshLiveOverlay() {
     setLiveStatus('error', route.liveOnly ? 'No live data yet — check your connection' : 'Scheduled times (live update failed)');
   }
 
-  if (!ok && liveErrorDetails.length) {
+  // Built whenever anything went wrong, not only on total failure — a
+  // partial failure is the case most in need of an explanation, since the
+  // app still has plenty to show and nothing else on screen says which half
+  // of it is stale.
+  if (liveErrorDetails.length) {
     lastLiveErrorReport = [
       `Train Times — live data error report`,
       `Time: ${new Date().toString()}`,
       `Route: ${route.id} (${route.name})`,
       `Date viewed: ${dateStr}`,
       `Status shown: ${document.getElementById('live-label').textContent}`,
+      `Boards: ${outcome.boardsOk} ok, ${outcome.boardsFailed} failed · legs given live data: ${outcome.matched}`,
       `Online: ${navigator.onLine}`,
       'Details:',
       ...liveErrorDetails.map(d => '- ' + d),
@@ -1166,29 +1289,52 @@ function mergeLiveOnlyBoard(existing, outBoard, retBoard, route) {
 // mergeLiveOnlyBoard — there's no schedule leg to overlay onto, this fully
 // replaces LIVE_ONLY_BOARDS[route.id] each round (except where a board fetch
 // failed, see above).
+// How a round of live fetching actually went, as opposed to whether any
+// request came back at all. `boardsFailed` and `matched` are what let
+// refreshLiveOverlay() tell "live data is on screen" apart from "a fetch
+// returned something" — the two used to be conflated (`!!(outBoard ||
+// retBoard)`), which is precisely how a direction whose board 500s every
+// time sat behind a green "Live platforms & delays" dot with every card on
+// scheduled times and no error report available to explain it.
+function boardOutcome(boards, matched) {
+  return {
+    boardsOk: boards.filter(Boolean).length,
+    boardsFailed: boards.filter(b => !b).length,
+    matched,
+  };
+}
+
+const NO_LIVE_OUTCOME = { boardsOk: 0, boardsFailed: 0, matched: 0 };
+
 async function overlayLiveOnlyRoute(route) {
   const outBoard = await fetchBoard(route.from, route.to, 'to');
   const retBoard = await fetchBoard(route.to, route.from, 'to');
-  LIVE_ONLY_BOARDS[route.id] = mergeLiveOnlyBoard(LIVE_ONLY_BOARDS[route.id], outBoard, retBoard, route);
-  return !!(outBoard || retBoard);
+  const merged = mergeLiveOnlyBoard(LIVE_ONLY_BOARDS[route.id], outBoard, retBoard, route);
+  LIVE_ONLY_BOARDS[route.id] = merged;
+  // A quick route's legs *are* the board, so "matched" is just how many legs
+  // the synthesis produced.
+  return boardOutcome([outBoard, retBoard], (merged.out || []).length + (merged.ret || []).length);
 }
 
 async function overlayDirectLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
-  if (!data) return false;
+  if (!data) return NO_LIVE_OUTCOME;
   const outBoard = await fetchBoard(route.from, route.to, 'to');
   const retBoard = await fetchBoard(route.to, route.from, 'to');
-  applyDirectOverlay(data.out, dateStr, outBoard, route.to);
-  applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
-  return !!(outBoard || retBoard);
+  const matched = applyDirectOverlay(data.out, dateStr, outBoard, route.to)
+    + applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
+  return boardOutcome([outBoard, retBoard], matched);
 }
 
+// Returns the number of legs that actually received live data this round.
 function applyDirectOverlay(legs, dateStr, board, destCrs) {
-  if (!board) return; // fetch failed this round — leave legs' existing live state untouched
+  if (!board) return 0; // fetch failed this round — leave legs' existing live state untouched
+  let matched = 0;
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
     const svc = matchByTime(board, leg.dep, leg.toc, destCrs, leg.arrM);
     if (!svc) continue;
+    matched++;
     leg._liveChecked = true;
     leg._cancelled = svc.isCancelled || svc.etd === 'Cancelled' || false;
     leg._liveDep = svc.etd && svc.etd !== 'On time' && svc.etd !== 'Cancelled' ? svc.etd : leg.dep;
@@ -1220,22 +1366,27 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
       }
     }
   }
+  return matched;
 }
 
 async function overlayConnectionLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
-  if (!data) return false;
+  if (!data) return NO_LIVE_OUTCOME;
   const outA = await fetchBoard(route.from, route.change, 'to');
   const outB = await fetchBoard(route.change, route.to, 'to');
   const retA = await fetchBoard(route.to, route.change, 'to');
   const retB = await fetchBoard(route.change, route.from, 'to');
-  applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to);
-  applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
-  return !!(outA || outB || retA || retB);
+  const matched = applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to)
+    + applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
+  return boardOutcome([outA, outB, retA, retB], matched);
 }
 
+// Returns the number of legs that received live data for at least one of
+// their two sub-legs this round (a leg whose leg-1 matched but whose leg-2
+// didn't is still a leg showing live data, so it counts once).
 function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCrs) {
-  if (!boardA && !boardB) return; // both fetches failed — leave legs' existing live state untouched
+  if (!boardA && !boardB) return 0; // both fetches failed — leave legs' existing live state untouched
+  let matched = 0;
   for (const leg of legs) {
     if (leg.date !== dateStr) continue;
 
@@ -1247,10 +1398,12 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     let liveDelay1 = leg._liveDepM != null ? leg._liveDepM - leg.depM : 0;
     let liveDep2M = null;
     let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
+    let legMatched = false;
 
     if (boardA) {
       const s1 = matchByTime(boardA, leg.dep, leg.toc1, changeCrs, leg.changeArrM);
       if (s1) {
+        legMatched = true;
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
         const platform1State = derivePlatformState(s1.platform, leg.platform1, s1.platformIsHidden);
@@ -1286,6 +1439,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     if (boardB) {
       const s2 = matchByTime(boardB, leg.changeDep, leg.toc2, destCrs, leg.arrM);
       if (s2) {
+        legMatched = true;
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
         const platform2State = derivePlatformState(s2.platform, leg.platform2, s2.platformIsHidden);
@@ -1325,7 +1479,9 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
       const dep2M = liveDep2M != null ? liveDep2M : leg.changeArrM + leg.changeMins;
       leg._liveChangeMins = dep2M - estimatedArr;
     }
+    if (legMatched) matched++;
   }
+  return matched;
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────

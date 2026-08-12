@@ -1037,3 +1037,243 @@ describe('quick-route sessionStorage (loadUserRoutes/saveUserRoutes/mergeUserRou
     assert.deepEqual(plain(merged).map((r) => r.id), ['rdg-pad', 'q-rdg-bri']);
   });
 });
+
+// Darwin's GetDepBoardWithDetails 500s outright once the board it has to
+// assemble/scan exceeds roughly 23 detailed services, rather than returning
+// a shorter one — confirmed live at Paddington on 2026-08-12 (unfiltered
+// numRows=23 -> 200, 24 -> 500; PAD?filterCrs=RDG numRows=9 -> 200, 10 ->
+// 500). A fixed numRows=20 therefore worked everywhere except the busiest
+// board on the busiest route, where it killed the whole return direction.
+// See fetchBoard()'s comment in app.js for the full evidence.
+describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a big one', () => {
+  // Mimics the real ceiling: any request above `maxRows` fails the way the
+  // live API does, anything at or below it returns a board.
+  function stubDarwin(ctx, { maxRows, status = 500 } = {}) {
+    const calls = [];
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    ctx.fetch = (url) => {
+      const rows = Number(new ctx.URL(url).searchParams.get('numRows'));
+      calls.push(rows);
+      if (rows > maxRows) {
+        return Promise.resolve({
+          ok: false, status, statusText: 'Internal Server Error',
+          text: () => Promise.resolve('{"Message":"The service is currently unavailable"}'),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [], numRows: rows }) });
+    };
+    return calls;
+  }
+
+  test('returns a board by retrying smaller after a 500, instead of giving up', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 9 });
+    const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.notEqual(board, null, 'a smaller board should have been fetched');
+    assert.equal(board.numRows, 8);
+    assert.deepEqual(calls, [20, 12, 8]); // ladder walks down until one fits
+  });
+
+  test('a board that fits first time makes exactly one call', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 100 });
+    await ctx.fetchBoard('RDG', 'PAD', 'to');
+    assert.deepEqual(calls, [20]);
+  });
+
+  test('the working rung is remembered, so the next poll does not replay the ladder', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 9 });
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    calls.length = 0;
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(calls, [8], 'should start straight at the rung that worked');
+  });
+
+  test('the remembered rung is per board, not global', async () => {
+    // Only Paddington is over the ceiling — Reading is not, and must not
+    // inherit Paddington's clamp (the two boards are fetched back to back
+    // every poll, so a global hint would needlessly halve the good one).
+    const ctx = loadApp();
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    const calls = [];
+    ctx.fetch = (url) => {
+      const rows = Number(new ctx.URL(url).searchParams.get('numRows'));
+      const busy = url.includes('/PAD?');
+      calls.push([busy ? 'PAD' : 'RDG', rows]);
+      if (busy && rows > 9) return Promise.resolve({ ok: false, status: 500, statusText: '', text: () => Promise.resolve('') });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [] }) });
+    };
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    calls.length = 0;
+    await ctx.fetchBoard('RDG', 'PAD', 'to');
+    assert.deepEqual(calls, [['RDG', 20]], 'a different board starts from a full-size request');
+  });
+
+  test('a 4xx is not retried smaller — shrinking a request we got wrong just burns rate limit', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 9, status: 400 });
+    assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
+    assert.deepEqual(calls, [20]);
+  });
+
+  test('an auth failure is not retried smaller either, and is flagged as an auth error', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 9, status: 403 });
+    assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
+    assert.deepEqual(calls, [20]);
+  });
+
+  test('every rung failing returns null rather than a partial result', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 0 });
+    assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
+    assert.deepEqual(calls, [20, 12, 8, 5, 3]);
+  });
+
+  test('a board 500ing on every rung costs one call next poll, not the whole ladder again', async () => {
+    // Otherwise a board that stays broken through the peak replays five
+    // requests a minute against the rate limit for no possible gain.
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 0 });
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    calls.length = 0;
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(calls, [3]);
+  });
+
+  test('a network failure does not clamp the next poll to a small board', async () => {
+    // A momentary blip says nothing about board size, so it must not leave
+    // the board stuck on a short request for the next ten minutes.
+    const ctx = loadApp();
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    ctx.fetch = () => Promise.reject(new Error('offline'));
+    assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
+    const calls = stubDarwin(ctx, { maxRows: 100 });
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(calls, [20]);
+  });
+
+  test('no API key means no request at all', async () => {
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 100 });
+    ctx.localStorage.removeItem('darwinApiKey');
+    assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
+    assert.deepEqual(calls, []);
+  });
+
+  test('the filter is carried on every rung, not just the first', async () => {
+    const ctx = loadApp();
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    const urls = [];
+    ctx.fetch = (url) => {
+      urls.push(url);
+      const rows = Number(new ctx.URL(url).searchParams.get('numRows'));
+      if (rows > 9) return Promise.resolve({ ok: false, status: 500, statusText: '', text: () => Promise.resolve('') });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [] }) });
+    };
+    await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.equal(urls.length, 3);
+    urls.forEach((u) => {
+      assert.match(u, /filterCrs=RDG/);
+      assert.match(u, /filterType=to/);
+      assert.match(u, /GetDepBoardWithDetails\/PAD/);
+    });
+  });
+});
+
+// "A fetch came back" and "live data is on a card" are different things, and
+// conflating them is what let a 500ing Paddington board sit behind a green
+// "Live platforms & delays" dot with every card on scheduled times.
+describe('live-round outcome — success means live data actually landed on a leg', () => {
+  test('applyDirectOverlay returns how many legs it gave live data to', () => {
+    const ctx = loadApp();
+    const legs = [
+      { date: '2026-07-02', dep: '07:03', depM: 423 },
+      { date: '2026-07-02', dep: '07:33', depM: 453 },
+      { date: '2026-07-02', dep: '08:03', depM: 483 }, // not on the board
+    ];
+    const board = { trainServices: [{ std: '07:03', etd: 'On time' }, { std: '07:33', etd: '07:40' }] };
+    assert.equal(ctx.applyDirectOverlay(legs, '2026-07-02', board), 2);
+  });
+
+  test('applyDirectOverlay returns 0 for a board that matched nothing', () => {
+    const ctx = loadApp();
+    const legs = [{ date: '2026-07-02', dep: '07:03', depM: 423 }];
+    assert.equal(ctx.applyDirectOverlay(legs, '2026-07-02', { trainServices: [{ std: '09:99' }] }), 0);
+  });
+
+  test('applyDirectOverlay returns 0 for a failed fetch', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.applyDirectOverlay([{ date: '2026-07-02', dep: '07:03', depM: 423 }], '2026-07-02', null), 0);
+  });
+
+  test('applyConnectionOverlay counts a leg once even when both its sub-legs match', () => {
+    const ctx = loadApp();
+    const legs = [{
+      date: '2026-07-02', dep: '07:03', depM: 423, changeArr: '07:12', changeArrM: 432,
+      changeDep: '07:15', changeMins: 3, arrM: 445,
+    }];
+    const boardA = { trainServices: [{ std: '07:03', etd: 'On time' }] };
+    const boardB = { trainServices: [{ std: '07:15', etd: 'On time' }] };
+    assert.equal(ctx.applyConnectionOverlay(legs, '2026-07-02', boardA, boardB, 'TWY', 'HOH'), 1);
+  });
+
+  test('applyConnectionOverlay still counts a leg whose leg-2 board missed', () => {
+    const ctx = loadApp();
+    const legs = [{
+      date: '2026-07-02', dep: '07:03', depM: 423, changeArr: '07:12', changeArrM: 432,
+      changeDep: '07:15', changeMins: 3, arrM: 445,
+    }];
+    const boardA = { trainServices: [{ std: '07:03', etd: 'On time' }] };
+    assert.equal(ctx.applyConnectionOverlay(legs, '2026-07-02', boardA, null, 'TWY', 'HOH'), 1);
+  });
+
+  test('applyConnectionOverlay returns 0 when both boards failed', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.applyConnectionOverlay([{ date: '2026-07-02', dep: '07:03' }], '2026-07-02', null, null, 'TWY', 'HOH'), 0);
+  });
+
+  test('boardOutcome separates boards that worked from boards that did not', () => {
+    const ctx = loadApp();
+    assert.deepEqual(plain(ctx.boardOutcome([{ trainServices: [] }, null], 4)),
+      { boardsOk: 1, boardsFailed: 1, matched: 4 });
+    assert.deepEqual(plain(ctx.boardOutcome([{ trainServices: [] }, { trainServices: [] }], 9)),
+      { boardsOk: 2, boardsFailed: 0, matched: 9 });
+    assert.deepEqual(plain(ctx.boardOutcome([null, null], 0)),
+      { boardsOk: 0, boardsFailed: 0 + 2, matched: 0 });
+  });
+});
+
+describe('directCard() — a cancelled train must never be labelled "On time"', () => {
+  // Darwin reports a cancellation with no estimated departure time, so
+  // _delayMins lands at 0 with _liveChecked true — the same shape as a
+  // genuinely punctual train. Only reachable once live data actually
+  // reaches a card, which is why it went unnoticed while the busiest
+  // board was silently 500ing.
+  const route = { id: 'rdg-pad', from: 'RDG', to: 'PAD' };
+  const cancelledLeg = {
+    date: '2026-07-02', dep: '18:57', depM: 1137, arr: '19:21', arrM: 1161,
+    _liveChecked: true, _cancelled: true, _delayMins: 0,
+  };
+
+  test('shows a Cancelled tag instead of the on-time badge', () => {
+    const ctx = loadApp();
+    const html = ctx.directCard(cancelledLeg, route, 'ret', true, 1130, null);
+    assert.match(html, /Cancelled<\/span>/);
+    assert.doesNotMatch(html, /On time/);
+  });
+
+  test('a genuinely punctual train still gets its On time badge', () => {
+    const ctx = loadApp();
+    const html = ctx.directCard({ ...cancelledLeg, _cancelled: false }, route, 'ret', true, 1130, null);
+    assert.match(html, /On time/);
+    assert.doesNotMatch(html, /Cancelled<\/span>/);
+  });
+
+  test('a delayed train still reports its delay', () => {
+    const ctx = loadApp();
+    const html = ctx.directCard({ ...cancelledLeg, _cancelled: false, _delayMins: 10 }, route, 'ret', true, 1130, null);
+    assert.match(html, /10 min late/);
+  });
+});

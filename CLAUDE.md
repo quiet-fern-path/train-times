@@ -394,6 +394,16 @@ reintroduce a `!isConnection` gate around it.
   gap before the next control (e.g. Add/Cancel right after the To field), and
   an overlaid box tall enough to reach that row visually covers it, silently
   swallowing a tap meant for the button underneath.
+- **`directCard()` checks `isCancelled` *before* the delay tags, not after.**
+  Darwin reports a cancelled service with no estimated departure time, so
+  `_delayMins` lands at 0 with `_liveChecked` true — structurally identical
+  to a punctual train — and the "on time" branch used to put a green
+  **"On time" badge on a cancelled train**. It also never said the word
+  "Cancelled" anywhere: the strike-through and red border were the only
+  cue. (`connectionCard()` always had its own explicit cancelled tag and
+  never had the problem.) This was only reachable once live data actually
+  reached these cards, which is why it sat unnoticed behind the 500ing
+  board above. Don't reorder these branches.
 - **`overtakers()` excludes `_cancelled` legs.** This was a real bug once:
   a cancelled train counted as a valid "faster alternative" and could hide
   a perfectly catchable real train. Don't remove the `!o._cancelled` check.
@@ -521,13 +531,114 @@ confirmed against the live API:
   confirmed/changed logic in `derivePlatformState()` if the real platform
   differs.
 
+## Darwin's board-size ceiling — why `fetchBoard()` retries smaller
+
+`GetDepBoardWithDetails` refuses, with **HTTP 500
+`{"Message":"The service is currently unavailable"}`**, to assemble a board
+past a certain number of detailed services. It does not truncate and it does
+not tell you the limit — it fails the whole request, so one over-large ask
+takes out an entire direction's live data.
+
+Confirmed live at Paddington on 2026-08-12 (all reproduced twice):
+
+| request | result |
+|---|---|
+| `PAD?numRows=23` (unfiltered) | 200 |
+| `PAD?numRows=24` (unfiltered) | 500 |
+| `PAD?filterCrs=RDG&numRows=9` | 200 |
+| `PAD?filterCrs=RDG&numRows=10` | 500 |
+| `PAD?filterCrs=RDG&numRows=20&timeWindow=15` | 200 |
+| `PAD?filterCrs=RDG&numRows=20&timeWindow=25` | 500 |
+| `PAD?filterCrs=MAI&numRows=20` | 500 |
+| `RDG?filterCrs=PAD&numRows=20` | 200 |
+| `KGX?filterCrs=CBG&numRows=50` | 200 |
+
+Three things follow, and all three matter:
+
+1. **`filterCrs` doesn't dodge it.** The filter is applied *after* the board
+   is built, so a filtered request has to scan far enough to find `numRows`
+   matches and hits the same wall from the other side. That's why a *sparse*
+   destination off a busy station (`PAD→MAI`) fails at a numRows a *dense*
+   one (`PAD→RDG`) survives: what counts is services scanned, not services
+   returned.
+2. **It's a property of the station's departure density, not the station.**
+   Reading, Kings Cross and Maidenhead are all fine at `numRows=20`.
+   Paddington is fine off-peak. This is exactly why it read as "live data is
+   just flaky on this one route" rather than an outright breakage.
+3. **The threshold moves, so a tuned constant can't work.** On the same
+   board twelve minutes apart: at 18:46 filtered `numRows=9` succeeded and
+   `10` failed; at 18:58 only `numRows≤4` succeeded, and unfiltered
+   `numRows=20` — fine at 18:46 — had started failing too. Any constant
+   picked from one measurement is wrong at the next.
+
+Hence `BOARD_ROW_LADDER` in `app.js`: ask for `20`, and on a **5xx only**
+step down through `12, 8, 5, 3` until one comes back. A short board of the
+*nearest* departures is worth incomparably more than no live data, and the
+nearest departures are the ones being looked at. Don't replace this with a
+single smaller constant — that both under-serves every quiet board and still
+breaks at the peak.
+
+Two cost controls keep the ladder from becoming a rate-limit problem, since
+the app re-polls every minute:
+
+- **The rung that worked is remembered** per `(crs, filterCrs, filterType)`
+  and is where the next poll starts, so steady state stays at one call per
+  board. It's re-probed from the top after `BOARD_ROWS_REPROBE_MS` (10 min)
+  so an evening-peak clamp lifts itself once the station quietens down.
+- **A board that 500s on every rung parks at the smallest one**, so the next
+  poll spends one call rather than replaying five. A *non*-5xx failure
+  (offline, CORS, 4xx, bad key) deletes the hint instead — it says nothing
+  about board size, and must not leave a good board clamped for ten minutes
+  because of one dropped request.
+
+An unfiltered board plus client-side filtering via `findCallingPoint()` was
+considered as a fallback and rejected on measurement: unfiltered `numRows=20`
+at PAD returned 200 at 18:46 and 500 at 19:00, so it's subject to the same
+moving ceiling and isn't the reliable escape hatch it looks like.
+
+## "Live" in the status bar means live data reached a card
+
+`refreshLiveOverlay()` used to call the round a success on
+`!!(outBoard || retBoard)` — true if *any* board fetch returned anything.
+Combined with the ceiling above this produced the bug that led here: the
+Reading board succeeded, the Paddington board 500'd every single time, and
+the app showed a green "Live platforms & delays" dot over a Return tab where
+every card was on scheduled times — real delays, a real platform change and
+a real cancellation all invisible. Worse, `lastLiveErrorReport` was only
+built `if (!ok)`, so the ⚠ diagnostics button stayed hidden and the captured
+500s were discarded: the one state most in need of an explanation was the
+one state that couldn't produce one.
+
+So the overlay functions now report an **outcome**, not a boolean —
+`boardOutcome()` returns `{boardsOk, boardsFailed, matched}`, where `matched`
+is the number of legs that actually received live data (`applyDirectOverlay`
+/ `applyConnectionOverlay` each return their own count). Green requires
+`boardsFailed === 0 && matched > 0`. Everything else gets its own honest
+state:
+
+- some boards up, some down → `stale`, "Live data incomplete — some trains
+  not updating (tap ⚠)"
+- all boards up, nothing matched, but trains still to come today
+  (`hasUpcomingLegs()`) → `stale`, "Live data fetched but matched no trains"
+- all boards up, nothing left to match today → green, because after the last
+  train zero matches is the correct answer, not a fault. Flagging it nightly
+  would train the warning out of being noticed.
+
+`lastLiveErrorReport` is now built whenever `liveErrorDetails` is non-empty
+regardless of outcome, and carries the board/match tally, so a screenshot of
+that panel is self-diagnosing. Don't collapse these states back into one
+boolean — "a fetch returned something" and "live data is on screen" are
+genuinely different questions, and only the second is what the dot claims.
+
 ## Known limitations, not bugs
 
 - Darwin's departure board returns roughly the next 20 services from "now."
   On the busiest stretch of the Paddington line at peak times, trains later
   in the day may simply never get live data — they stay correctly in
   scheduled-only state, this isn't an error case to handle, just a ceiling
-  on live-data freshness for dense routes.
+  on live-data freshness for dense routes. At the very peak that ceiling is
+  much lower than 20 and is imposed by the API refusing to build a board
+  that big at all — see "Darwin's board-size ceiling" below.
 - Live↔schedule matching is by scheduled departure time string, disambiguated
   by TOC (`operatorCode` from the Darwin board vs. `toc`/`toc1`/`toc2` from
   RTT in schedule.json) when more than one service shares an exact scheduled
