@@ -29,6 +29,9 @@ let liveAuthError = false;
 // round (network error, unexpected HTTP status, etc.) — reset at the start
 // of each round, read at the end to build lastLiveErrorReport.
 let liveErrorDetails = [];
+// Route+date key of the live round currently in flight, so a poll landing
+// mid-round can skip rather than duplicate it (see refreshLiveOverlay).
+let liveRoundInFlight = null;
 // Full copyable text for the error-details panel, or null when the last
 // round had nothing to report (hides the header's alert button).
 let lastLiveErrorReport = null;
@@ -1243,6 +1246,21 @@ async function refreshLiveOverlay() {
   const route = currentRoute();
   if (!route) return;
 
+  const dateStr = document.getElementById('vdate').value || todayStr();
+
+  // The once-a-minute poll can land while a previous round for the same
+  // route is still walking its boards — a connection route fetches four, and
+  // the ladder can add rungs to each — which doubles the Darwin calls and
+  // lets two rounds interleave their writes into liveErrorDetails, i.e. into
+  // the very report meant to explain what went wrong. Observed live on
+  // rdg-nmc: eight requests for four boards, interleaved A,A,B,B,C,C,D,D.
+  // Keyed by route+date rather than a bare flag so switching route or day
+  // never waits on a round belonging to the previous one. Everything between
+  // this check and the assignment below is synchronous, so no second round
+  // can slip past it.
+  const roundKey = `${route.id}|${dateStr}`;
+  if (liveRoundInFlight === roundKey) return;
+
   // Cleared unconditionally up front so a stale alert from a previous route/
   // date never lingers into a state where live data isn't even being checked.
   liveErrorDetails = [];
@@ -1259,7 +1277,6 @@ async function refreshLiveOverlay() {
     return;
   }
 
-  const dateStr = document.getElementById('vdate').value || todayStr();
   if (!route.liveOnly && dateStr !== todayStr()) {
     setLiveStatus('off', 'Scheduled times (live only available for today)');
     return;
@@ -1273,6 +1290,7 @@ async function refreshLiveOverlay() {
   // the last known state, just clearly marked as not current.
   liveAuthError = false;
   let outcome = NO_LIVE_OUTCOME;
+  liveRoundInFlight = roundKey;
   try {
     outcome = route.liveOnly
       ? await overlayLiveOnlyRoute(route)
@@ -1282,6 +1300,8 @@ async function refreshLiveOverlay() {
   } catch (e) {
     outcome = NO_LIVE_OUTCOME;
     liveErrorDetails.push(`Unexpected error in refreshLiveOverlay: ${e && e.stack ? e.stack : e}`);
+  } finally {
+    liveRoundInFlight = null;
   }
 
   const gotSomething = outcome.boardsOk > 0 && outcome.matched > 0;

@@ -642,6 +642,15 @@ the app re-polls every minute:
   (offline, CORS, 4xx, bad key) deletes the hint instead — it says nothing
   about board size, and must not leave a good board clamped for ten minutes
   because of one dropped request.
+- **Only one live round per route+date runs at a time** (`liveRoundInFlight`).
+  `tickMinute()`'s poll can otherwise land while a round is still walking its
+  boards — a connection route fetches four, and the ladder can add rungs to
+  each — which both doubles the calls and lets two rounds interleave their
+  writes into `liveErrorDetails`, corrupting the one report meant to explain
+  what went wrong. Confirmed live on `rdg-nmc`: eight requests for four
+  boards, interleaved `A,A,B,B,C,C,D,D`. The key is route+date, not a bare
+  flag, so switching route or day is never blocked by the previous route's
+  in-flight round (also confirmed live).
 
 This file previously said the unfiltered fallback had been "considered and
 rejected on measurement", on the grounds that unfiltered `numRows=20` at PAD
