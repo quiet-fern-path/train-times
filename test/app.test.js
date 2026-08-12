@@ -1051,19 +1051,27 @@ describe('quick-route sessionStorage (loadUserRoutes/saveUserRoutes/mergeUserRou
 describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a big one', () => {
   // Mimics the real ceiling: any request above `maxRows` fails the way the
   // live API does, anything at or below it returns a board.
-  function stubDarwin(ctx, { maxRows, status = 500 } = {}) {
+  // A service that calls at RDG, so an unfiltered rung survives client-side
+  // narrowing. `filtered` records whether the request carried filterCrs.
+  const svcToRdg = (std) => ({
+    std, etd: 'On time',
+    subsequentCallingPoints: [{ callingPoint: [{ crs: 'RDG', st: '19:20', et: 'On time' }] }],
+  });
+
+  function stubDarwin(ctx, { maxRows, status = 500, services = [svcToRdg('19:00')] } = {}) {
     const calls = [];
     ctx.localStorage.setItem('darwinApiKey', 'test-key');
     ctx.fetch = (url) => {
-      const rows = Number(new ctx.URL(url).searchParams.get('numRows'));
-      calls.push(rows);
+      const params = new ctx.URL(url).searchParams;
+      const rows = Number(params.get('numRows'));
+      calls.push(params.get('filterCrs') ? rows : -rows); // negative = unfiltered rung
       if (rows > maxRows) {
         return Promise.resolve({
           ok: false, status, statusText: 'Internal Server Error',
           text: () => Promise.resolve('{"Message":"The service is currently unavailable"}'),
         });
       }
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [], numRows: rows }) });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: services, numRows: rows }) });
     };
     return calls;
   }
@@ -1074,7 +1082,8 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
     assert.notEqual(board, null, 'a smaller board should have been fetched');
     assert.equal(board.numRows, 8);
-    assert.deepEqual(calls, [20, 12, 8]); // ladder walks down until one fits
+    // filtered 20 fails, unfiltered 25 fails, filtered 8 fits
+    assert.deepEqual(calls, [20, -25, 8]);
   });
 
   test('a board that fits first time makes exactly one call', async () => {
@@ -1131,7 +1140,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     const ctx = loadApp();
     const calls = stubDarwin(ctx, { maxRows: 0 });
     assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
-    assert.deepEqual(calls, [20, 12, 8, 5, 3, 2]);
+    assert.deepEqual(calls, [20, -25, 8, -12, 5, 3, 2]);
   });
 
   test('a board 500ing on every rung costs one call next poll, not the whole ladder again', async () => {
@@ -1165,7 +1174,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     assert.deepEqual(calls, []);
   });
 
-  test('the filter is carried on every rung, not just the first', async () => {
+  test('server-filtered rungs carry the filter; unfiltered rungs deliberately drop it', async () => {
     const ctx = loadApp();
     ctx.localStorage.setItem('darwinApiKey', 'test-key');
     const urls = [];
@@ -1173,15 +1182,67 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
       urls.push(url);
       const rows = Number(new ctx.URL(url).searchParams.get('numRows'));
       if (rows > 9) return Promise.resolve({ ok: false, status: 500, statusText: '', text: () => Promise.resolve('') });
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [] }) });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [svcToRdg('19:00')] }) });
     };
     await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.equal(urls.length, 3);
-    urls.forEach((u) => {
-      assert.match(u, /filterCrs=RDG/);
-      assert.match(u, /filterType=to/);
-      assert.match(u, /GetDepBoardWithDetails\/PAD/);
-    });
+    assert.deepEqual(urls.map((u) => /filterCrs=RDG/.test(u)), [true, false, true]);
+    urls.forEach((u) => assert.match(u, /GetDepBoardWithDetails\/PAD/));
+    urls.filter((u) => /filterCrs/.test(u)).forEach((u) => assert.match(u, /filterType=to/));
+  });
+
+  // matchByTime() assumes every service on the board calls at the
+  // destination — with a server-filtered board that's free, so an unfiltered
+  // rung has to reproduce it before handing the board back, or a same-minute
+  // departure heading elsewhere could match a leg.
+  test('an unfiltered rung is narrowed client-side to services calling at the destination', async () => {
+    const ctx = loadApp();
+    const elsewhere = { std: '19:00', etd: 'On time', subsequentCallingPoints: [{ callingPoint: [{ crs: 'OXF', st: '19:40' }] }] };
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    // The filtered rung 500s (the real failure mode), so the unfiltered rung
+    // serves this round and its board has to be narrowed here.
+    ctx.fetch = (url) => {
+      if (new ctx.URL(url).searchParams.get('filterCrs')) {
+        return Promise.resolve({ ok: false, status: 500, statusText: '', text: () => Promise.resolve('') });
+      }
+      return Promise.resolve({
+        ok: true, status: 200,
+        json: () => Promise.resolve({ trainServices: [svcToRdg('18:55'), elsewhere, svcToRdg('19:05')] }),
+      });
+    };
+    const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(board.trainServices.map((s) => s.std), ['18:55', '19:05']);
+  });
+
+  test('an unfiltered rung with nothing going our way keeps laddering to a filtered one', async () => {
+    // A big unfiltered board on a sparse route (RDG->MAI yields 8%) can
+    // legitimately contain zero usable services; a smaller *filtered* board
+    // searches further ahead and is the better answer there.
+    const ctx = loadApp();
+    const elsewhere = { std: '19:00', subsequentCallingPoints: [{ callingPoint: [{ crs: 'OXF', st: '19:40' }] }] };
+    const calls = [];
+    ctx.localStorage.setItem('darwinApiKey', 'test-key');
+    ctx.fetch = (url) => {
+      const params = new ctx.URL(url).searchParams;
+      const rows = Number(params.get('numRows'));
+      const filtered = !!params.get('filterCrs');
+      calls.push(filtered ? rows : -rows);
+      if (filtered && rows > 9) return Promise.resolve({ ok: false, status: 500, statusText: '', text: () => Promise.resolve('') });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: filtered ? [svcToRdg('20:30')] : [elsewhere] }) });
+    };
+    const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(calls, [20, -25, 8]);
+    assert.deepEqual(board.trainServices.map((s) => s.std), ['20:30']);
+  });
+
+  test('an empty server-filtered board is accepted as definitive, not laddered past', async () => {
+    // Darwin searched its own window for that destination and found nothing
+    // — the normal state after the last train. Walking the rest of the
+    // ladder every minute all night would be pure waste.
+    const ctx = loadApp();
+    const calls = stubDarwin(ctx, { maxRows: 100, services: [] });
+    const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
+    assert.deepEqual(board.trainServices, []);
+    assert.deepEqual(calls, [20]);
   });
 });
 

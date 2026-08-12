@@ -826,14 +826,47 @@ function apiKey() { return localStorage.getItem('darwinApiKey') || ''; }
 // exactly why this looked like "live data is just flaky at Paddington".
 //
 // Hence a ladder rather than a tuned constant: no fixed numRows can be right
-// when the safe value is 20+ on a calm evening and 3 in a storm. Ask for the
-// largest board first and step down on a 5xx until one comes back — a short
-// board of the *nearest* departures is worth incomparably more than no live
-// data, and the nearest departures are the ones being looked at anyway. The
-// floor is deliberately low (2) because severe disruption is the case this
-// exists for: two trains' worth of live data still answers "what is my next
-// train actually doing", which is the whole question during a storm.
-const BOARD_ROW_LADDER = [20, 12, 8, 5, 3, 2];
+// when the safe value is 20+ on a calm evening and 3 in a storm.
+//
+// The ladder alternates between two *kinds* of request, because `filterCrs`
+// is the expensive half of the problem, not the cheap one:
+//
+//   - **Server-filtered** (`filterCrs=RDG&numRows=20`) is the best result
+//     when it works — 20 trains that actually go where you're going,
+//     spanning 1h45m at Paddington. It's also the request that has to scan
+//     deepest, so it's the first to fall over.
+//   - **Unfiltered** (`numRows=25`) is bounded work: exactly N departures,
+//     no searching. Measured at 18:46, unfiltered numRows=20 returned 200 at
+//     the same moment filtered numRows=10 was returning 500. We then keep
+//     only the services that call at the destination ourselves, via
+//     findCallingPoint() — data every call site already has in hand, and no
+//     extra request.
+//
+// Client-side filtering was checked against the server's own filter across
+// seven station pairs and agreed exactly on six. On the seventh it returned
+// a **superset**: Darwin's filtered board silently omitted a fully-cancelled
+// Maidenhead→Reading service that the unfiltered board reported with
+// `etd: "Cancelled"` and every calling point cancelled (stable over three
+// runs; partially-cancelled services survive the filter, so the rule looks
+// like "no usable call left at the destination" — mechanism inferred, not
+// documented). A wholly cancelled train is the single most important thing
+// this app can tell someone, so picking it up is a straight gain, not drift.
+//
+// Which kind wins depends on how much of the station's traffic goes your way
+// — measured yields: PAD→RDG 36%, KGX→CBG 35%, RDG→PAD 29%, PAD→MAI 16%,
+// RDG→OXF 12%, RDG→MAI 8%. So on a dense route an unfiltered board of 25
+// still yields ~9 usable trains (far better than a filtered board shrunk to
+// 3), while on a sparse one it yields almost nothing and a small filtered
+// board is the better answer. Hence both, interleaved, largest value first.
+const BOARD_LADDER = [
+  { rows: 20, serverFilter: true },
+  { rows: 25, serverFilter: false }, // 25 is Darwin's own cap on an unfiltered board; asking for more is a no-op
+  { rows: 8, serverFilter: true },
+  { rows: 12, serverFilter: false },
+  { rows: 5, serverFilter: true },
+  { rows: 3, serverFilter: true },
+  { rows: 2, serverFilter: true },
+];
 // Whichever rung last worked for a given board is where the next poll
 // starts, so the steady-state cost stays at one call per board per minute
 // rather than replaying the whole ladder every time. Re-probed from the top
@@ -842,17 +875,53 @@ const BOARD_ROW_LADDER = [20, 12, 8, 5, 3, 2];
 const BOARD_ROWS_REPROBE_MS = 10 * 60 * 1000;
 const boardRowsHint = {};
 
+// Keeps only the services that call at destCrs, reproducing what
+// `filterCrs`/`filterType=to` does server-side. Every caller of fetchBoard()
+// passes the destination as filterCrs, and matchByTime() relies on every
+// service on the board actually calling there, so an unfiltered rung has to
+// be narrowed here before it's handed back — otherwise a same-minute
+// departure heading somewhere else could match a leg.
+function filterBoardTo(board, destCrs) {
+  if (!board || !destCrs) return board;
+  return Object.assign({}, board, {
+    trainServices: (board.trainServices || []).filter(s => findCallingPoint(s, destCrs)),
+  });
+}
+
 async function fetchBoard(crs, filterCrs, filterType) {
   const key = apiKey();
   if (!key) return null;
   const hintKey = `${crs}|${filterCrs || ''}|${filterType || ''}`;
   const hint = boardRowsHint[hintKey];
   const startIdx = hint && (Date.now() - hint.at) < BOARD_ROWS_REPROBE_MS ? hint.idx : 0;
-  for (let idx = startIdx; idx < BOARD_ROW_LADDER.length; idx++) {
-    const { board, retryable } = await fetchBoardOnce(crs, filterCrs, filterType, BOARD_ROW_LADDER[idx], key);
+  let emptyFallback = null;
+  for (let idx = startIdx; idx < BOARD_LADDER.length; idx++) {
+    const rung = BOARD_LADDER[idx];
+    // With no destination to filter on, the two kinds of rung are the same
+    // request — don't spend a call proving it.
+    if (!filterCrs && !rung.serverFilter) continue;
+    const { board, retryable } = await fetchBoardOnce(
+      crs, rung.serverFilter ? filterCrs : null, filterType, rung.rows, key);
+
     if (board) {
-      boardRowsHint[hintKey] = { idx, at: Date.now() };
-      return board;
+      if (rung.serverFilter || !filterCrs) {
+        // Darwin searched its own window for this destination, so even an
+        // empty result is a definitive answer ("nothing more today"), not a
+        // reason to keep spending calls.
+        boardRowsHint[hintKey] = { idx, at: Date.now() };
+        return board;
+      }
+      const narrowed = filterBoardTo(board, filterCrs);
+      if ((narrowed.trainServices || []).length) {
+        boardRowsHint[hintKey] = { idx, at: Date.now() };
+        return narrowed;
+      }
+      // An unfiltered board with nothing going our way only means "none in
+      // the next N departures" — on a sparse route that's expected, and a
+      // smaller *filtered* rung searches further ahead. Keep it in case
+      // everything below also fails, but carry on.
+      emptyFallback = emptyFallback || narrowed;
+      continue;
     }
     if (!retryable) {
       // Offline, CORS, a 4xx, a bad key — nothing to do with board size, and
@@ -860,15 +929,15 @@ async function fetchBoard(crs, filterCrs, filterType) {
       // starts from a full board rather than inheriting a clamp that a
       // momentary network blip had no business imposing.
       delete boardRowsHint[hintKey];
-      return null;
+      return emptyFallback;
     }
   }
   // Every rung 500'd. Park at the smallest so the next poll costs one call
   // instead of replaying the whole ladder each minute against a board that's
   // currently refusing everything; the re-probe timer above still walks it
   // back up to a full-size request once the station quietens down.
-  boardRowsHint[hintKey] = { idx: BOARD_ROW_LADDER.length - 1, at: Date.now() };
-  return null;
+  boardRowsHint[hintKey] = { idx: BOARD_LADDER.length - 1, at: Date.now() };
+  return emptyFallback;
 }
 
 function fetchBoardUrl(crs, filterCrs, filterType, numRows) {

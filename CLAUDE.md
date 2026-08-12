@@ -578,14 +578,57 @@ server-side timeout rather than a payload limit. Two corollaries:
    "live data is just flaky at Paddington" rather than a breakage. Within one
    evening the ceiling moved from 9 to 4 to unlimited-as-far-as-tested.
 
-Hence `BOARD_ROW_LADDER` in `app.js`: ask for `20`, and on a **5xx only**
-step down through `12, 8, 5, 3, 2` until one comes back. A short board of the
-*nearest* departures is worth incomparably more than no live data, and the
-nearest departures are the ones being looked at. The floor is deliberately as
-low as 2: severe disruption is the case this exists for, and two trains'
-worth of live data still answers "what is my next train actually doing".
-Don't replace this with a single smaller constant — that both under-serves
-every calm board and still breaks in a storm.
+### `BOARD_LADDER` — two kinds of request, not just smaller ones
+
+`filterCrs` is the *expensive* half of this, not the cheap one, so the ladder
+in `app.js` alternates between two shapes of request rather than only
+shrinking `numRows`:
+
+| | cost | what you get |
+|---|---|---|
+| **server-filtered** (`filterCrs=RDG&numRows=20`) | deep scan — first to fall over | 20 trains that actually go there, spanning 1h45m at PAD |
+| **unfiltered** (`numRows=25`) | bounded — exactly N departures, no search | ~N × the destination's share of departures, narrowed client-side |
+
+At 18:46, unfiltered `numRows=20` returned **200 at the same moment** filtered
+`numRows=10` was returning **500**. So the unfiltered board is a genuinely
+stronger rung than a shrunken filtered one on a dense route — and we can do
+the filtering ourselves with `findCallingPoint()`, which every call site
+already has in hand and needs anyway for arrival times. No extra request.
+
+Measured destination yields (share of a station's departures that call there):
+PAD→RDG 36%, KGX→CBG 35%, RDG→PAD 29%, PAD→MAI 16%, RDG→OXF 12%, RDG→MAI 8%.
+So neither shape dominates: on a dense route an unfiltered 25 still yields ~9
+usable trains (much better than a filtered board shrunk to 3), while on a
+sparse one it yields almost nothing and a small filtered board — which
+searches much further ahead — is the better answer. Hence both, interleaved,
+largest value first: filtered 20, unfiltered 25, filtered 8, unfiltered 12,
+filtered 5, 3, 2. Don't collapse this to a single shape or a single constant:
+one under-serves every calm board, the other breaks in a storm.
+
+**Client-side filtering was verified against Darwin's own filter** across
+seven station pairs: identical on six. On the seventh it returned a
+**superset** — Darwin's filtered MAI board silently omitted a
+**fully-cancelled** Maidenhead→Reading service that the unfiltered board
+reported with `etd: "Cancelled"` and all seven calling points cancelled
+(stable over three consecutive runs, so not a race). Partially-cancelled
+services *do* survive the filter (two at PAD, one with its Reading call
+itself cancelled), so the rule looks like "no usable call left at the
+destination" — mechanism inferred from three samples, not documented, so
+don't rely on the exact boundary. The consequence is what matters: **the
+server-side filter can hide a wholly cancelled train**, which is the single
+most important thing this app can tell someone, and the unfiltered path picks
+it up. Treat that as a reason to prefer client-side narrowing, not drift to
+be corrected.
+
+Two rules keep the mixed ladder honest:
+
+- **An empty *server-filtered* board is accepted as definitive** — Darwin
+  searched its own window for that destination and found nothing, i.e. "no
+  more trains today". Walking the rest of the ladder every minute all night
+  would be pure waste.
+- **An empty *unfiltered* board is not** — it only means "none in the next N
+  departures", which on a sparse route is expected. Keep it as a fallback and
+  carry on to a filtered rung that searches further ahead.
 
 Two cost controls keep the ladder from becoming a rate-limit problem, since
 the app re-polls every minute:
@@ -595,15 +638,19 @@ the app re-polls every minute:
   board. It's re-probed from the top after `BOARD_ROWS_REPROBE_MS` (10 min)
   so an evening-peak clamp lifts itself once the station quietens down.
 - **A board that 500s on every rung parks at the smallest one**, so the next
-  poll spends one call rather than replaying five. A *non*-5xx failure
+  poll spends one call rather than replaying the whole ladder. A *non*-5xx failure
   (offline, CORS, 4xx, bad key) deletes the hint instead — it says nothing
   about board size, and must not leave a good board clamped for ten minutes
   because of one dropped request.
 
-An unfiltered board plus client-side filtering via `findCallingPoint()` was
-considered as a fallback and rejected on measurement: unfiltered `numRows=20`
-at PAD returned 200 at 18:46 and 500 at 19:00, so it's subject to the same
-moving ceiling and isn't the reliable escape hatch it looks like.
+This file previously said the unfiltered fallback had been "considered and
+rejected on measurement", on the grounds that unfiltered `numRows=20` at PAD
+returned 200 at 18:46 and 500 at 19:00 and so was subject to the same moving
+ceiling. That reasoning was wrong and the conclusion with it: a fallback rung
+doesn't have to be immune to the ceiling, only *better than the rung it
+replaces* — and it can be laddered too. The unfiltered board is strictly
+cheaper for the same row count, and it survived at 18:46 precisely when the
+filtered one didn't.
 
 Because the trigger is disruption, **the degraded states below will show up
 precisely during disruption** — so the status bar must never let "no delays
