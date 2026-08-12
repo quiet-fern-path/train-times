@@ -609,6 +609,47 @@ Because the trigger is disruption, **the degraded states below will show up
 precisely during disruption** — so the status bar must never let "no delays
 shown" be read as "no delays". That's the other half of this fix.
 
+### How confident is any of this, and what would falsify it
+
+Three things are solidly established and worth not re-litigating:
+
+- **The failures were deterministic, not random.** Two identical
+  back-to-back requests were made at each of six sizes; every size gave the
+  same result both times (6/6). So this is not the API being intermittently
+  flaky under load, and — importantly — **an immediate same-size retry does
+  not recover it**. That negative result is what justifies the ladder
+  *shrinking* rather than just retrying at 20, which would cost no coverage.
+  If the ⚠ reports ever show a same-size retry succeeding, revisit that.
+- **Smaller genuinely helps, independent of elapsed time.** The in-browser
+  ladder runs *descending* (20, 12, 8, 5, 3) and succeeded on its **last and
+  smallest** attempt in three separate runs. A "the service was just having
+  a bad minute" model predicts the opposite ordering.
+- **It is not a global outage.** PAD returned 500 while RDG and KGX returned
+  200 for equivalent requests, repeatedly, across ~40 minutes.
+
+What is *not* established is that request size is the whole story. The
+threshold itself moves with conditions, so the honest model is an
+**interaction — request cost × whatever server headroom exists at that
+moment** — and "demand/server strain during disruption" is the second half of
+that, not a competing theory. It could not be separated further because by
+the time the controlled experiment was designed the board had recovered and
+the failure was no longer reproducible.
+
+Two traps for whoever picks this up next:
+
+- **Sweep sizes in interleaved or random order, never ascending.** Several of
+  the original sweeps went `for n in 6 7 8 9 10 12`, which confounds "bigger
+  request" with "later in time" — an ascending sweep cannot by itself
+  distinguish a size ceiling from a service degrading mid-sweep. Only the
+  descending in-browser runs actually break that confound.
+- **`numRows` above ~25 is a no-op on an unfiltered board.** Darwin caps the
+  assembled board at 25 services (confirmed: `numRows` of 26, 30, 50 and 150
+  all return exactly the same 25-service, 105KB board, and `timeWindow=120`
+  doesn't extend it). So an A/B of `numRows=150` vs `20` is really 25 vs 20
+  and proves much less than it looks like. A *filtered* board is not capped
+  the same way — `PAD?filterCrs=RDG&numRows=20` returns 20 matches spanning
+  1h45m, which is why the filtered scan is the expensive one.
+
 The one untried lever is `GetDepartureBoard` (the non-`WithDetails`
 operation), which wouldn't assemble calling points at all and so shouldn't
 hit this. It's a *different* Rail Data Marketplace product (separate
