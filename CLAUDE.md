@@ -651,6 +651,17 @@ the app re-polls every minute:
   boards, interleaved `A,A,B,B,C,C,D,D`. The key is route+date, not a bare
   flag, so switching route or day is never blocked by the previous route's
   in-flight round (also confirmed live).
+- **A round's boards are fetched concurrently** (`fetchBoards()`), not one
+  after the next. They're independent requests — nothing in one informs
+  another — and serially a round cost the *sum* of every board's latency,
+  with each board able to walk several ladder rungs before it lands. That
+  sum is what the visitor waits through between "Updating live data…" and
+  the delays appearing, and on a connection route (four boards) during
+  disruption it could run to most of a minute. Concurrency is bounded by the
+  route shape (2 boards direct/quick, 4 connection) and the poll only runs
+  once a minute, so this is well inside Darwin's limits. Don't put the
+  `await`s back in sequence as a "simplification" — the ladder means a slow
+  board is *slower* than it looks, not faster.
 
 This file previously said the unfiltered fallback had been "considered and
 rejected on measurement", on the grounds that unfiltered `numRows=20` at PAD
@@ -748,6 +759,55 @@ regardless of outcome, and carries the board/match tally, so a screenshot of
 that panel is self-diagnosing. Don't collapse these states back into one
 boolean — "a fetch returned something" and "live data is on screen" are
 genuinely different questions, and only the second is what the dot claims.
+
+### A round only reports if it's still the round that matters
+
+The same "the dot must not claim more than the cards show" rule has a timing
+half, and getting it wrong is what produced a reported ~1-minute lag between
+the indicator going green and the updates actually appearing.
+
+`refreshLiveOverlay()` is `async`, so by the time its awaits resolve the view
+can have moved on — the reader switched route or day, or (the common one)
+`sw.js`'s stale-while-revalidate hot-reload swapped `SCHEDULE` out from under
+it. It used to write its status and re-render **unconditionally** at that
+point, and clear `liveRoundInFlight` in a `finally`. Both are wrong for a
+round that has been superseded: it reports an outcome for legs that are no
+longer on screen (green dot, scheduled-times cards), and it unlocks the guard
+belonging to the *newer* round, so the next `tickMinute()` poll fires a
+duplicate.
+
+So a round now takes a `liveRoundSeq` ticket when it starts and checks it
+before reporting: `if (mySeq !== liveRoundSeq) return;` — no status write, no
+re-render, and `liveRoundInFlight` left alone because it belongs to whoever
+superseded it. `invalidateLiveRound()` bumps the sequence and clears the key,
+which is how a caller says "whatever is in flight is now writing into legs
+that no longer exist". The round itself keeps running to completion; there's
+no `AbortController` threaded through the ladder, and adding one would buy a
+couple of cancelled requests a minute at the cost of plumbing it through
+every rung.
+
+**The in-place data hot-reload has to do three things in order** — see
+`applyDataUpdate()`, split out of the service-worker message listener purely
+so this sequence is testable (the listener isn't, it only exists when a real
+SW does). Reloading `data/schedule.json` replaces **every leg object**, and
+the fresh ones carry no `_live*` fields at all, so on its own the swap silently
+throws away the whole live overlay:
+
+1. reload the changed file;
+2. `ROUTES.forEach(restoreLiveCacheForRoute)` — replay the last successful
+   round's live fields onto the new leg objects, so the cards never visibly
+   drop back to scheduled times (this is the same cache that already survives
+   a page reload; it just also has to survive a swap);
+3. `invalidateLiveRound()` **before** `render()` — otherwise `render()`'s own
+   `refreshLiveOverlay()` call is skipped as a duplicate of the in-flight
+   round, and nothing re-fetches until the next minute tick. That skip, plus
+   the orphaned round going on to paint the dot green, *is* the minute-long
+   green-but-stale window.
+
+Note what makes this fire in normal use rather than rarely:
+`checkForDataUpdates()` re-issues all three data fetches on every tab focus,
+and `refresh-platforms.yml` commits a new `schedule.json` daily — so the first
+focus after each daily commit takes exactly this path.
 
 ## Known limitations, not bugs
 

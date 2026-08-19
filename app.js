@@ -32,6 +32,12 @@ let liveErrorDetails = [];
 // Route+date key of the live round currently in flight, so a poll landing
 // mid-round can skip rather than duplicate it (see refreshLiveOverlay).
 let liveRoundInFlight = null;
+// Monotonic id of the most recently *started* live round. A round that
+// finishes when this no longer matches its own id has been superseded — by a
+// route/date switch, or by the schedule data underneath it being swapped out
+// (see invalidateLiveRound) — and must not touch the status bar or re-render,
+// because the legs it just wrote into are no longer the legs on screen.
+let liveRoundSeq = 0;
 // Full copyable text for the error-details panel, or null when the last
 // round had nothing to report (hides the header's alert button).
 let lastLiveErrorReport = null;
@@ -223,6 +229,17 @@ async function loadAll() {
 const DATA_RELOAD_HANDLERS = {
   [new URL('./data/schedule.json', location.href).href]: async () => {
     SCHEDULE = await loadJSON('./data/schedule.json');
+    // Every leg object just got replaced, and the fresh ones carry no _live*
+    // fields at all — so without this the cards drop straight back to plain
+    // scheduled times, with the status bar still green from the last round,
+    // until the next successful fetch lands (up to a minute away via
+    // tickMinute). Replaying the live cache onto the new legs restores the
+    // last known delays/platforms in the same tick as the swap; the fresh
+    // round that render() kicks off below then updates them as normal.
+    // Quick routes are skipped: they have no schedule.json entry to have been
+    // swapped, and their cached payload is a whole board rather than a sparse
+    // diff, so replaying it here could only put back an older one.
+    ROUTES.filter(r => !r.liveOnly).forEach(restoreLiveCacheForRoute);
   },
   [new URL('./routes.json', location.href).href]: async () => {
     ROUTES = mergeUserRoutes(await loadJSON('./routes.json'));
@@ -232,17 +249,30 @@ const DATA_RELOAD_HANDLERS = {
     STATIONS = await loadJSON('./stations.json');
   },
 };
+// Split out from the message listener below so the swap-then-re-render
+// sequence is directly testable — the listener itself can't be, since it's
+// only registered when a real service worker exists.
+async function applyDataUpdate(url) {
+  const handler = DATA_RELOAD_HANDLERS[url];
+  if (!handler) return;
+  try {
+    await handler();
+  } catch (e) {
+    // Reload attempt failed (e.g. went offline mid-fetch) — harmless, the
+    // next background revalidation will notify again if it's still stale.
+    return;
+  }
+  // A round started before the swap is now writing into legs (or against a
+  // route object) that no longer exist — drop it so it can't report a green
+  // "live" status over data it never actually reached, and so render()'s own
+  // refreshLiveOverlay() call isn't skipped as a duplicate of it.
+  invalidateLiveRound();
+  render();
+}
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.addEventListener('message', async (event) => {
-    const handler = event.data && event.data.type === 'content-updated' && DATA_RELOAD_HANDLERS[event.data.url];
-    if (!handler) return;
-    try {
-      await handler();
-      render();
-    } catch (e) {
-      // Reload attempt failed (e.g. went offline mid-fetch) — harmless, the
-      // next background revalidation will notify again if it's still stale.
-    }
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (!event.data || event.data.type !== 'content-updated') return;
+    applyDataUpdate(event.data.url);
   });
 }
 
@@ -891,6 +921,20 @@ function filterBoardTo(board, destCrs) {
   });
 }
 
+// A round's boards are independent requests — nothing in one informs
+// another — so they go out together rather than one after the next. This is
+// what the visitor actually waits through between "Updating live data…" and
+// the delays appearing: serially, a round cost the sum of every board's
+// latency, and each board can itself walk several ladder rungs before it
+// lands (see BOARD_LADDER), so a connection route in disruption could spend
+// most of a minute before anything reached the screen. Concurrency is
+// bounded by the route shape — 2 boards for a direct or quick route, 4 for a
+// connection — and the poll only runs once a minute, so this is well inside
+// Darwin's limits.
+function fetchBoards(specs) {
+  return Promise.all(specs.map(([crs, filterCrs, filterType]) => fetchBoard(crs, filterCrs, filterType)));
+}
+
 async function fetchBoard(crs, filterCrs, filterType) {
   const key = apiKey();
   if (!key) return null;
@@ -1242,6 +1286,18 @@ function hasUpcomingLegs(route, dateStr) {
     (data[dir] || []).some(l => l.date === dateStr && l.depM >= curM));
 }
 
+// Abandons whatever live round is in flight: it keeps running (there's no
+// way to cancel an in-flight fetch chain mid-ladder without threading an
+// AbortController through every rung), but its results are dropped on
+// arrival and it no longer blocks a fresh round from starting immediately.
+// Call this whenever the data a round is writing into stops being the data
+// on screen — currently only the SW's in-place data hot-reload, which
+// replaces SCHEDULE wholesale with brand-new leg objects.
+function invalidateLiveRound() {
+  liveRoundSeq++;
+  liveRoundInFlight = null;
+}
+
 async function refreshLiveOverlay() {
   const route = currentRoute();
   if (!route) return;
@@ -1291,6 +1347,7 @@ async function refreshLiveOverlay() {
   liveAuthError = false;
   let outcome = NO_LIVE_OUTCOME;
   liveRoundInFlight = roundKey;
+  const mySeq = ++liveRoundSeq;
   try {
     outcome = route.liveOnly
       ? await overlayLiveOnlyRoute(route)
@@ -1300,9 +1357,18 @@ async function refreshLiveOverlay() {
   } catch (e) {
     outcome = NO_LIVE_OUTCOME;
     liveErrorDetails.push(`Unexpected error in refreshLiveOverlay: ${e && e.stack ? e.stack : e}`);
-  } finally {
-    liveRoundInFlight = null;
   }
+
+  // Superseded while we were awaiting: another round started (route/date
+  // switch) or the schedule legs this round wrote into were replaced under
+  // it (see invalidateLiveRound). Either way the overlay just applied is not
+  // what's on screen, so reporting it would paint the status bar green over
+  // cards showing plain scheduled times — the exact "indicator says live,
+  // display says otherwise" failure this whole outcome machinery exists to
+  // prevent. Bail without touching the status bar, the error report, or the
+  // in-flight key (which belongs to the newer round now).
+  if (mySeq !== liveRoundSeq) return;
+  liveRoundInFlight = null;
 
   const gotSomething = outcome.boardsOk > 0 && outcome.matched > 0;
   if (gotSomething) {
@@ -1401,8 +1467,10 @@ function boardOutcome(boards, matched) {
 const NO_LIVE_OUTCOME = { boardsOk: 0, boardsFailed: 0, matched: 0 };
 
 async function overlayLiveOnlyRoute(route) {
-  const outBoard = await fetchBoard(route.from, route.to, 'to');
-  const retBoard = await fetchBoard(route.to, route.from, 'to');
+  const [outBoard, retBoard] = await fetchBoards([
+    [route.from, route.to, 'to'],
+    [route.to, route.from, 'to'],
+  ]);
   const merged = mergeLiveOnlyBoard(LIVE_ONLY_BOARDS[route.id], outBoard, retBoard, route);
   LIVE_ONLY_BOARDS[route.id] = merged;
   // A quick route's legs *are* the board, so "matched" is just how many legs
@@ -1413,8 +1481,10 @@ async function overlayLiveOnlyRoute(route) {
 async function overlayDirectLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
   if (!data) return NO_LIVE_OUTCOME;
-  const outBoard = await fetchBoard(route.from, route.to, 'to');
-  const retBoard = await fetchBoard(route.to, route.from, 'to');
+  const [outBoard, retBoard] = await fetchBoards([
+    [route.from, route.to, 'to'],
+    [route.to, route.from, 'to'],
+  ]);
   const matched = applyDirectOverlay(data.out, dateStr, outBoard, route.to)
     + applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
   return boardOutcome([outBoard, retBoard], matched);
@@ -1466,10 +1536,12 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
 async function overlayConnectionLive(route, dateStr) {
   const data = SCHEDULE.routes[route.id];
   if (!data) return NO_LIVE_OUTCOME;
-  const outA = await fetchBoard(route.from, route.change, 'to');
-  const outB = await fetchBoard(route.change, route.to, 'to');
-  const retA = await fetchBoard(route.to, route.change, 'to');
-  const retB = await fetchBoard(route.change, route.from, 'to');
+  const [outA, outB, retA, retB] = await fetchBoards([
+    [route.from, route.change, 'to'],
+    [route.change, route.to, 'to'],
+    [route.to, route.change, 'to'],
+    [route.change, route.from, 'to'],
+  ]);
   const matched = applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to)
     + applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
   return boardOutcome([outA, outB, retA, retB], matched);

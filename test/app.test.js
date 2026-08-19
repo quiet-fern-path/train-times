@@ -1341,3 +1341,153 @@ describe('directCard() — a cancelled train must never be labelled "On time"', 
     assert.match(html, /10 min late/);
   });
 });
+
+// The three tests below drive whole live-overlay *rounds* rather than a
+// single pure function, because the bugs they cover are ordering bugs
+// between a round finishing and the DOM it writes into — invisible to any
+// test that only calls applyDirectOverlay() directly. Setting a round up
+// means writing app.js's top-level `let` bindings (ROUTES, SCHEDULE,
+// activeRouteId), which are lexical and so aren't on the context's global
+// object the way `function` declarations are — vm.runInContext shares that
+// same lexical scope, so a string of code is how the tests reach them.
+const vm = require('node:vm');
+
+function setUpLiveRound(ctx, { schedule, routes, activeId }) {
+  vm.runInContext(`
+    ROUTES = ${JSON.stringify(routes)};
+    activeRouteId = ${JSON.stringify(activeId)};
+    activeDir = 'out';
+    SCHEDULE = ${JSON.stringify(schedule)};
+    localStorage.setItem('darwinApiKey', 'test-key');
+    document.getElementById('vdate').value = todayStr();
+  `, ctx);
+}
+// A minimal but realistic GetDepBoardWithDetails payload: one service, with
+// the subsequentCallingPoints entry every overlay path reads for the
+// destination arrival.
+function depBoard({ std, etd, platform, destCrs, destSt, destEt }) {
+  return {
+    trainServices: [{
+      std, etd, platform, operatorCode: 'GW',
+      subsequentCallingPoints: [{ callingPoint: [{ crs: destCrs, st: destSt, et: destEt }] }],
+    }],
+  };
+}
+const liveLabel = (ctx) => ctx.__elements.get('live-label').textContent;
+const liveDot = (ctx) => ctx.__elements.get('live-dot').className;
+
+describe('a superseded live round must not report over the round that replaced it', () => {
+  // Real failure mode this fixes: the status bar going green while the cards
+  // underneath still showed plain scheduled times, and staying that way for
+  // up to a minute (until tickMinute()'s next poll). refreshLiveOverlay()
+  // used to write its status/re-render unconditionally when its awaits
+  // resolved, and to clear liveRoundInFlight in a `finally` — so a slow round
+  // finishing after the view had moved on both reported its own (irrelevant)
+  // outcome over the current one and unlocked a duplicate round.
+  test('a slow round finishing after a route switch leaves the newer round\'s status alone', async () => {
+    const ctx = loadApp();
+    const routes = [
+      { id: 'slow', name: 'Slow', from: 'RDG', to: 'PAD', change: null },
+      { id: 'fast', name: 'Fast', from: 'KGX', to: 'CBG', change: null },
+    ];
+    let resolveSlow;
+    const slowPending = new Promise((res) => { resolveSlow = res; });
+    ctx.fetch = (url) => {
+      const board = /KGX|CBG/.test(url)
+        // The fast route's board matches nothing, so its round lands on a
+        // clearly distinguishable status rather than the same green.
+        ? { ok: true, status: 200, json: async () => ({ trainServices: [] }) }
+        : { ok: true, status: 200, json: async () => depBoard({ std: '10:13', etd: '10:25', platform: '4', destCrs: 'PAD', destSt: '10:40', destEt: '10:52' }) };
+      return /KGX|CBG/.test(url) ? Promise.resolve(board) : slowPending.then(() => board);
+    };
+    const today = vm.runInContext('todayStr()', ctx);
+    setUpLiveRound(ctx, {
+      routes, activeId: 'slow',
+      schedule: { routes: {
+        slow: { out: [{ date: today, uid: 's1', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 }], ret: [] },
+        fast: { out: [{ date: today, uid: 'f1', toc: 'GW', dep: '10:20', depM: 620, arr: '11:20', arrM: 680 }], ret: [] },
+      } },
+    });
+
+    vm.runInContext('refreshLiveOverlay();', ctx);        // round 1 (slow route), hangs
+    vm.runInContext('activeRouteId = "fast"; refreshLiveOverlay();', ctx); // round 2 supersedes it
+    await new Promise((r) => setImmediate(r));
+    assert.match(liveLabel(ctx), /matched no trains/); // round 2 reported
+
+    resolveSlow();                                        // round 1 finally lands
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.match(liveLabel(ctx), /matched no trains/, 'the stale round overwrote the current status');
+    assert.equal(liveDot(ctx), 'live-dot stale', 'the stale round painted the dot green over the current route');
+  });
+});
+
+describe('applyDataUpdate() — an in-place schedule swap must not strand the live overlay', () => {
+  // sw.js's stale-while-revalidate posts "content-updated" when the network
+  // copy of data/schedule.json differs from the cached one, and app.js
+  // reloads it in place. That replaces every leg object, and the fresh ones
+  // carry no _live* fields — so the cards dropped straight back to scheduled
+  // times while the status bar stayed green from the previous round, and a
+  // round already in flight then reported success having written its overlay
+  // into the discarded legs. Nothing recovered until the next minute's poll,
+  // which is exactly the "indicator green, updates a minute behind" symptom.
+  test('live fields are replayed from the cache onto the freshly-loaded legs', async () => {
+    const ctx = loadApp();
+    const route = { id: 'r', name: 'R', from: 'RDG', to: 'PAD', change: null };
+    const today = vm.runInContext('todayStr()', ctx);
+    const leg = { date: today, uid: 'u1', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 };
+    const schedule = { routes: { r: { out: [leg], ret: [] } } };
+    setUpLiveRound(ctx, { routes: [route], activeId: 'r', schedule });
+    // A previous round's live state, saved exactly as saveLiveCache() would.
+    ctx.localStorage.setItem('liveCache:r', JSON.stringify({
+      date: today, savedAt: Date.now(),
+      out: { u1: { _liveChecked: true, _delayMins: 12, _liveDep: '10:25', _liveDepM: 625 } },
+      ret: {},
+    }));
+    ctx.fetch = () => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(schedule)) });
+
+    await vm.runInContext('applyDataUpdate(new URL("./data/schedule.json", location.href).href)', ctx);
+    const reloaded = vm.runInContext('SCHEDULE.routes.r.out[0]', ctx);
+    assert.notEqual(reloaded, leg, 'expected the swap to have replaced the leg object');
+    assert.equal(reloaded._delayMins, 12, 'live state was lost across the in-place schedule swap');
+    assert.equal(reloaded._liveDepM, 625);
+  });
+
+  test('the swap drops any round in flight so the fresh one is not skipped as a duplicate', async () => {
+    const ctx = loadApp();
+    const route = { id: 'r', name: 'R', from: 'RDG', to: 'PAD', change: null };
+    const today = vm.runInContext('todayStr()', ctx);
+    const schedule = { routes: { r: { out: [{ date: today, uid: 'u1', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 }], ret: [] } } };
+    setUpLiveRound(ctx, { routes: [route], activeId: 'r', schedule });
+    ctx.fetch = () => new Promise(() => {}); // a board round that never lands
+
+    vm.runInContext('refreshLiveOverlay();', ctx);
+    assert.equal(vm.runInContext('liveRoundInFlight', ctx), 'r|' + today);
+
+    vm.runInContext('invalidateLiveRound();', ctx);
+    assert.equal(vm.runInContext('liveRoundInFlight', ctx), null,
+      'a fresh round would be skipped as a duplicate of the abandoned one');
+  });
+});
+
+describe('fetchBoards() — a round\'s boards go out together, not one after the next', () => {
+  // Serially, a round cost the sum of every board's latency, and each board
+  // can walk several BOARD_LADDER rungs before it lands — so a connection
+  // route (four boards) during disruption could spend most of a minute
+  // between "Updating live data…" and anything reaching the screen. The
+  // boards are independent requests; nothing in one informs another.
+  test('all four boards of a connection route are requested before any resolves', async () => {
+    const ctx = loadApp();
+    let inFlight = 0, maxInFlight = 0;
+    ctx.fetch = () => {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((res) => setImmediate(() => {
+        inFlight--;
+        res({ ok: true, status: 200, json: async () => ({ trainServices: [] }) });
+      }));
+    };
+    vm.runInContext('localStorage.setItem("darwinApiKey", "test-key");', ctx);
+    await ctx.fetchBoards([['RDG', 'TWY', 'to'], ['TWY', 'HOH', 'to'], ['HOH', 'TWY', 'to'], ['TWY', 'RDG', 'to']]);
+    assert.equal(maxInFlight, 4);
+  });
+});
