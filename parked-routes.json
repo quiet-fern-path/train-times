@@ -14,5 +14,13 @@
     "to": "HOT",
     "change": "TWY",
     "minConnectionMins": 3
+  },
+  {
+    "id": "rdg-mlw",
+    "name": "Reading ↔ Marlow",
+    "from": "RDG",
+    "to": "MLW",
+    "change": "MAI",
+    "minConnectionMins": 1
   }
 ]
