@@ -7,13 +7,6 @@
     "change": null
   },
   {
-    "id": "rdg-mai",
-    "name": "Reading ↔ Maidenhead",
-    "from": "RDG",
-    "to": "MAI",
-    "change": null
-  },
-  {
     "id": "rdg-oxf",
     "name": "Reading ↔ Oxford",
     "from": "RDG",
@@ -21,10 +14,10 @@
     "change": null
   },
   {
-    "id": "kgx-cbg",
-    "name": "Kings Cross ↔ Cambridge",
-    "from": "KGX",
-    "to": "CBG",
+    "id": "rdg-mai",
+    "name": "Reading ↔ Maidenhead",
+    "from": "RDG",
+    "to": "MAI",
     "change": null
   },
   {
@@ -34,5 +27,13 @@
     "to": "NMC",
     "change": "MAN",
     "minConnectionMins": 10
+  },
+  {
+    "id": "rdg-hxx",
+    "name": "Reading ↔ Heathrow Terminals 2 & 3 Rail",
+    "from": "RDG",
+    "to": "HXX",
+    "change": "HAY",
+    "minConnectionMins": 2
   }
 ]

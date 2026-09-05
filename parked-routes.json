@@ -22,5 +22,12 @@
     "to": "MLW",
     "change": "MAI",
     "minConnectionMins": 1
+  },
+  {
+    "id": "kgx-cbg",
+    "name": "Kings Cross ↔ Cambridge",
+    "from": "KGX",
+    "to": "CBG",
+    "change": null
   }
 ]
