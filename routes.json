@@ -21,14 +21,6 @@
     "change": null
   },
   {
-    "id": "rdg-nmc",
-    "name": "Reading ↔ New Mills Central",
-    "from": "RDG",
-    "to": "NMC",
-    "change": "MAN",
-    "minConnectionMins": 10
-  },
-  {
     "id": "rdg-hxx",
     "name": "Reading ↔ Heathrow Terminals 2 & 3 Rail",
     "from": "RDG",
