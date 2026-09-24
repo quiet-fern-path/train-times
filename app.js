@@ -215,11 +215,6 @@ async function loadAll() {
   ]);
   ROUTES = mergeUserRoutes(routes);
   activeRouteId = ROUTES[0].id;
-  // This load *is* a schedule check (sw.js revalidates in the background off
-  // the back of it), so the focus-driven cooldown below starts from here
-  // rather than from zero — otherwise the very first tab focus after a load
-  // would immediately re-request the largest file in the app for nothing.
-  lastScheduleCheckAt = Date.now();
 }
 
 // ── Live data hot-reload ────────────────────────────────────────────
@@ -301,55 +296,53 @@ if ('serviceWorker' in navigator) {
 // nothing changed, in-place hot-reload if something did. Debounced so rapid
 // tab-switching doesn't fire it repeatedly.
 //
-// `routes.json`/`stations.json` are a few KB and are what actually detect a
-// route being added or removed, so they stay on every focus. `schedule.json`
-// does NOT: it's ~15MB and growing, and re-requesting it every time the tab
-// comes forward is the single most expensive thing this app does on a phone.
-// It gets its own, much slower cadence (see checkForScheduleUpdate) with an
-// explicit escape hatch so a newly added route never has to wait for it.
+// All three, including the ~15MB schedule: a revalidation is cheap, and
+// deliberately isn't throttled by hand here. See the schedule-check note
+// below for why the obvious "check the big one less often" is the wrong
+// lever.
 let lastFocusCheckAt = 0;
 function checkForDataUpdates() {
   const now = Date.now();
   if (now - lastFocusCheckAt < 20000) return;
   lastFocusCheckAt = now;
-  ['./routes.json', './stations.json'].forEach(url => {
+  ['./routes.json', './stations.json', './data/schedule.json'].forEach(url => {
     fetch(url).catch(() => {}); // response is unused — sw.js's own fetch handler does the compare/notify
   });
-  checkForScheduleUpdate();
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') checkForDataUpdates();
 });
 window.addEventListener('focus', checkForDataUpdates);
 
-// ── Schedule revalidation policy ────────────────────────────────────
-// Two different jobs, deliberately not one cadence:
+// ── Waiting on a newly added route's schedule ───────────────────────
+// Re-checking data/schedule.json often is NOT expensive, which is why
+// checkForDataUpdates() above doesn't throttle it: GitHub Pages sends an
+// ETag and `Cache-Control: max-age=600`, so inside ten minutes the browser
+// answers from its own HTTP cache without touching the network, and after
+// that a revalidation is a 304 with an empty body (both measured against the
+// real deployment). sw.js no longer re-stores an unchanged response either,
+// so the 15MB Cache Storage write that used to happen on every check is gone.
+// A hand-rolled cooldown on top of that would only add staleness: the server
+// already states its own freshness policy, and honouring that is strictly
+// better than guessing a number here.
 //
-//   Routine freshness. `refresh-platforms.yml` commits a new schedule.json
-//   once a day, so re-checking a 15MB file every time the tab is focused
-//   buys nothing — a slow cooldown picks the daily commit up just as well,
-//   and every fresh page load checks it anyway via loadAll().
+// What *is* needed is the opposite — a case where focus-driven checks aren't
+// frequent enough. A route added from the settings page (the builder commits
+// routes.json) has no schedule data until the Action commits it: the first 7
+// days in ~2-3 minutes, then a days-7-89 backfill. For those minutes the
+// route is in ROUTES with an empty list and the reader is sitting there
+// watching it — not switching tabs, so nothing triggers a focus check. So
+// while that's true, tickMinute() polls as well.
 //
-//   A route that was just added. The builder (add-route.html, reached from
-//   the settings sheet) commits routes.json; the Action then commits
-//   schedule.json for the new route in two phases — the first 7 days in
-//   ~2-3 minutes, then a days-7-89 backfill. Until that first commit lands
-//   the route is in ROUTES with nothing to show, and the reader is sitting
-//   there watching an empty list. Waiting out the routine cooldown would
-//   make adding a route feel broken, so that state gets checked eagerly
-//   instead, every minute, until the data actually arrives.
-const SCHEDULE_CHECK_COOLDOWN_MS = 30 * 60 * 1000;
-// How long a route is allowed to hold the app in eager mode. The fast phase
-// normally lands in 2-3 minutes; this is generous headroom for a slow Action
-// run, and it bounds the damage when the data is never coming at all — a
-// broken Action, or a genuine station pair with no direct service, whose
-// fetch legitimately yields zero legs. Without a deadline either of those
-// would re-request 15MB every minute, forever.
+// How long a route is allowed to hold that open. The fast phase normally
+// lands in 2-3 minutes, so this is generous headroom, and it bounds the case
+// where the data is never coming at all: a broken Action, or a genuine
+// station pair with no direct service, whose fetch legitimately yields zero
+// legs and so never satisfies routeHasScheduleLegs().
 const SCHEDULE_EAGER_WINDOW_MS = 15 * 60 * 1000;
-let lastScheduleCheckAt = 0;
-// routeId -> when we first noticed it had no schedule data, so the eager
-// window is per route: one route timing out never stops a route added later
-// from getting its own fresh window.
+// routeId -> when we first noticed it had no schedule data, so the window is
+// per route: one route timing out never stops a route added later from
+// getting its own fresh window.
 const scheduleWaitStartedAt = {};
 
 function routeHasScheduleLegs(routeId) {
@@ -361,16 +354,16 @@ function routeHasScheduleLegs(routeId) {
 // **Quick (live-only) routes are excluded, and must stay excluded**: they
 // have no schedule.json entry at all, by design (see "Quick (session-only)
 // live routes" in CLAUDE.md) — they're served entirely from Darwin's live
-// board. Counting one as "awaiting schedule data" would pin the app in
-// eager mode for as long as the quick route existed, which is the exact
-// opposite of what this policy is for.
+// board, so "has no schedule legs" is their permanent, correct state, not a
+// wait. Counting one here would poll every minute for as long as the quick
+// route existed.
 function routesAwaitingSchedule() {
   const now = Date.now();
   const waiting = [];
   for (const route of ROUTES) {
     if (route.liveOnly) continue;
     if (routeHasScheduleLegs(route.id)) {
-      delete scheduleWaitStartedAt[route.id]; // arrived — release the eager window
+      delete scheduleWaitStartedAt[route.id]; // arrived — release the window
       continue;
     }
     if (scheduleWaitStartedAt[route.id] == null) scheduleWaitStartedAt[route.id] = now;
@@ -379,13 +372,10 @@ function routesAwaitingSchedule() {
   return waiting;
 }
 
-// Re-issues the schedule fetch so sw.js's compare/notify pipeline can run,
-// on the routine cooldown unless a route is waiting on data it hasn't got.
+// Only fires while a route is actually waiting — the routine case is already
+// covered by checkForDataUpdates() above.
 function checkForScheduleUpdate() {
-  const now = Date.now();
-  const eager = routesAwaitingSchedule().length > 0;
-  if (!eager && now - lastScheduleCheckAt < SCHEDULE_CHECK_COOLDOWN_MS) return;
-  lastScheduleCheckAt = now;
+  if (!routesAwaitingSchedule().length) return;
   fetch('./data/schedule.json').catch(() => {}); // response unused — sw.js compares and notifies
 }
 

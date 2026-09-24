@@ -67,10 +67,24 @@ self.addEventListener('fetch', e => {
       const networkUpdate = fetch(e.request)
         .then(response => {
           if (response.ok) {
-            if (cached && responseChanged(cached, response)) {
+            if (!cached) {
+              // Nothing stored yet — this is the copy that makes the next
+              // visit instant and offline visits work at all.
+              cache.put(e.request, response.clone());
+            } else if (responseChanged(cached, response)) {
               notifyClientsOfUpdate(e.request.url);
+              cache.put(e.request, response.clone());
             }
-            cache.put(e.request, response.clone());
+            // Otherwise: responseChanged() has just established this response
+            // is the same bytes we already hold, so re-storing it writes a
+            // 15MB Cache Storage entry to replace an identical 15MB Cache
+            // Storage entry. The network side of a revalidation is already
+            // free (GitHub Pages sends an ETag, so it's a 304 with an empty
+            // body, and inside its max-age the browser doesn't go to the
+            // network at all) — this put was the entire remaining cost of
+            // checking often, and it bought nothing. Skipping it also means
+            // the response body is never consumed, so the unchanged path
+            // does no 15MB read either.
           }
           return response;
         })

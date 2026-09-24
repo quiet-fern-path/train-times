@@ -80,3 +80,53 @@ describe('notifyClientsOfUpdate()', () => {
     }
   });
 });
+
+describe('fetch handler — an unchanged revalidation must not rewrite the cache entry', () => {
+  // data/schedule.json is ~15MB. The handler used to cache.put() on every
+  // background revalidation, including the case where responseChanged() had
+  // just established the response was byte-for-byte what was already stored
+  // — so every check cost a 15MB Cache Storage write to store what was
+  // already there. That write, not the network, was the real cost of
+  // checking often: GitHub Pages sends an ETag, so the network side of a
+  // revalidation is a 304 with an empty body (measured).
+  const URL_ = 'https://example.invalid/data/schedule.json';
+
+  function drive(ctx, cachedHeaders, networkHeaders) {
+    const { makeResponse, seedCache, dispatchFetch } = ctx.__sw;
+    seedCache(URL_, makeResponse({ headers: cachedHeaders }));
+    ctx.fetch = () => Promise.resolve(makeResponse({ headers: networkHeaders }));
+    return dispatchFetch(URL_);
+  }
+
+  test('identical etag -> no put, no notify', async () => {
+    const ctx = loadSw();
+    await drive(ctx, { etag: '"abc"' }, { etag: '"abc"' });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ctx.__sw.putCalls, [], 're-stored a cache entry that had not changed');
+    assert.deepEqual(ctx.__sw.posted, []);
+  });
+
+  test('changed etag -> still puts and still notifies', async () => {
+    const ctx = loadSw();
+    await drive(ctx, { etag: '"abc"' }, { etag: '"def"' });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ctx.__sw.putCalls, [URL_]);
+    assert.deepEqual(plain(ctx.__sw.posted), [{ type: 'content-updated', url: URL_ }]);
+  });
+
+  test('nothing cached yet -> puts, so offline still works on a first visit', async () => {
+    const ctx = loadSw();
+    ctx.fetch = () => Promise.resolve(ctx.__sw.makeResponse({ headers: { etag: '"abc"' } }));
+    await ctx.__sw.dispatchFetch(URL_);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ctx.__sw.putCalls, [URL_]);
+    assert.deepEqual(ctx.__sw.posted, [], 'a first fetch is not an "update" to tell anyone about');
+  });
+
+  test('no usable validator -> assumed changed, so a real update is never missed', async () => {
+    const ctx = loadSw();
+    await drive(ctx, {}, {});
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ctx.__sw.putCalls, [URL_]);
+  });
+});

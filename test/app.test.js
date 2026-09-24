@@ -1497,22 +1497,26 @@ describe('fetchBoards() — a round\'s boards go out together, not one after the
   });
 });
 
-describe('schedule revalidation policy — cheap files every focus, the 15MB one only when it earns it', () => {
-  // Re-requesting data/schedule.json on every tab focus is the most
-  // expensive thing this app does on a phone, and it buys nothing: the file
-  // is committed once a day. But a route added from the settings page lands
-  // in routes.json 2-3 minutes before the Action commits its schedule, and
-  // the reader is watching an empty list for that whole window — so
-  // "check it less often" must not become "check it late".
+describe('waiting on a newly added route\'s schedule', () => {
+  // The routine case needs no special handling: a schedule revalidation is a
+  // 304 with an empty body (GitHub Pages sends an ETag), inside max-age the
+  // browser doesn't go to the network at all, and sw.js no longer re-stores
+  // an unchanged response — so checkForDataUpdates() just fetches all three.
+  // What needs handling is the opposite: a route added from the settings page
+  // has no data for ~2-3 minutes while the Action runs, and the reader is
+  // watching an empty list rather than switching tabs, so no focus check
+  // fires. tickMinute() polls for exactly that window.
   function setUpPolicy(ctx, { routes, scheduleRoutes }) {
     vm.runInContext(`
       ROUTES = ${JSON.stringify(routes)};
       activeRouteId = ${JSON.stringify(routes[0].id)};
       SCHEDULE = { routes: ${JSON.stringify(scheduleRoutes)} };
+      document.getElementById('vdate').value = todayStr();
     `, ctx);
   }
   const leg = { date: '2026-09-24', uid: 'u1', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 };
   const curated = { id: 'rdg-pad', name: 'R', from: 'RDG', to: 'PAD', change: null };
+  const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
 
   // Records the fetches app.js issues, so a test can assert on which files
   // were actually asked for rather than on internal bookkeeping.
@@ -1522,44 +1526,35 @@ describe('schedule revalidation policy — cheap files every focus, the 15MB one
     return urls;
   }
 
-  test('a focus fetches routes/stations but not the schedule, once the cooldown is running', () => {
+  test('a focus checks all three files, schedule included', () => {
     const ctx = loadApp();
     setUpPolicy(ctx, { routes: [curated], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
-    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx); // as loadAll() sets it
     const urls = trackFetches(ctx);
     vm.runInContext('checkForDataUpdates();', ctx);
-    assert.deepEqual(urls, ['./routes.json', './stations.json']);
+    assert.deepEqual(urls, ['./routes.json', './stations.json', './data/schedule.json']);
   });
 
-  test('once the cooldown expires the schedule is checked again, so the daily commit still lands', () => {
-    // The other half of the policy: slower must still mean "checked", or a
-    // long-lived open tab would never pick up refresh-platforms.yml's daily
-    // commit at all.
+  test('a minute tick does NOT poll the schedule when nothing is waiting', () => {
+    // Otherwise every open tab would re-check once a minute forever, which is
+    // the cost this is all trying to avoid.
     const ctx = loadApp();
     setUpPolicy(ctx, { routes: [curated], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
-    vm.runInContext('lastScheduleCheckAt = Date.now() - SCHEDULE_CHECK_COOLDOWN_MS - 1;', ctx);
     const urls = trackFetches(ctx);
-    vm.runInContext('checkForDataUpdates();', ctx);
-    assert.ok(urls.includes('./data/schedule.json'));
-    // ...and the check re-arms the cooldown rather than firing every time.
-    urls.length = 0;
-    vm.runInContext('lastFocusCheckAt = 0; checkForDataUpdates();', ctx);
+    vm.runInContext('tickMinute();', ctx);
     assert.ok(!urls.includes('./data/schedule.json'));
   });
 
-  test('a route with no schedule data yet forces the schedule check straight past the cooldown', () => {
-    const ctx = loadApp();
+  test('a minute tick polls the schedule while a route is waiting on the Action', () => {
     // Exactly the state after the builder's routes.json commit reaches an
     // open tab: the route exists, the Action hasn't committed its data yet.
-    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
+    const ctx = loadApp();
     setUpPolicy(ctx, {
       routes: [curated, fresh],
       scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } },
     });
-    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx);
     const urls = trackFetches(ctx);
-    vm.runInContext('checkForDataUpdates();', ctx);
-    assert.ok(urls.includes('./data/schedule.json'), 'a route awaiting data must not wait out the cooldown');
+    vm.runInContext('tickMinute();', ctx);
+    assert.ok(urls.includes('./data/schedule.json'));
   });
 
   test('an empty out/ret pair counts as no data, not as data', () => {
@@ -1572,25 +1567,22 @@ describe('schedule revalidation policy — cheap files every focus, the 15MB one
   });
 
   test('a quick (live-only) route never counts as awaiting schedule data', () => {
-    // The trap this policy has to avoid: a quick route has NO schedule.json
-    // entry at all, by design — it's served entirely from Darwin's live
-    // board. Treating that as "waiting for the Action" would pin the app in
-    // eager mode, re-requesting 15MB every minute for as long as the quick
-    // route existed, which is the exact opposite of the point.
+    // The trap: a quick route has NO schedule.json entry at all, by design —
+    // it's served entirely from Darwin's live board, so "no schedule legs" is
+    // its permanent, correct state rather than a wait. Counting it would make
+    // every minute tick re-check the schedule for as long as it existed.
     const ctx = loadApp();
     const quick = { id: 'q-rdg-bri', name: 'Q', from: 'RDG', to: 'BRI', change: null, liveOnly: true };
     setUpPolicy(ctx, { routes: [curated, quick], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
     assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), []);
 
-    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx);
     const urls = trackFetches(ctx);
-    vm.runInContext('checkForDataUpdates();', ctx);
-    assert.ok(!urls.includes('./data/schedule.json'), 'a quick route pinned the app in eager mode');
+    vm.runInContext('tickMinute();', ctx);
+    assert.ok(!urls.includes('./data/schedule.json'), 'a quick route pinned the app into polling');
   });
 
-  test('the eager window is bounded, so data that never arrives stops costing 15MB a minute', () => {
+  test('the window is bounded, so data that never arrives stops being polled for', () => {
     const ctx = loadApp();
-    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
     setUpPolicy(ctx, { routes: [fresh], scheduleRoutes: {} });
     assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
     // Backdate the wait past the window — an Action that failed, or a station
@@ -1599,19 +1591,17 @@ describe('schedule revalidation policy — cheap files every focus, the 15MB one
     assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), []);
   });
 
-  test('the eager window is per route, so a timed-out one does not starve a route added later', () => {
+  test('the window is per route, so a timed-out one does not starve a route added later', () => {
     const ctx = loadApp();
     const stuck = { id: 'rdg-stuck', name: 'S', from: 'RDG', to: 'STK', change: null };
-    const fresh = { id: 'rdg-new', name: 'N', from: 'RDG', to: 'NEW', change: null };
     setUpPolicy(ctx, { routes: [stuck], scheduleRoutes: {} });
     vm.runInContext('routesAwaitingSchedule(); scheduleWaitStartedAt["rdg-stuck"] -= SCHEDULE_EAGER_WINDOW_MS + 1;', ctx);
     vm.runInContext(`ROUTES = ${JSON.stringify([stuck, fresh])};`, ctx);
     assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
   });
 
-  test('data arriving releases the eager window rather than leaving it latched', () => {
+  test('data arriving releases the window rather than leaving it latched', () => {
     const ctx = loadApp();
-    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
     setUpPolicy(ctx, { routes: [fresh], scheduleRoutes: {} });
     assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
     vm.runInContext(`SCHEDULE = { routes: { 'rdg-new': { out: ${JSON.stringify([leg])}, ret: [] } } };`, ctx);
