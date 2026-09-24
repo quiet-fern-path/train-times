@@ -1385,7 +1385,12 @@ describe('a superseded live round must not report over the round that replaced i
   // finishing after the view had moved on both reported its own (irrelevant)
   // outcome over the current one and unlocked a duplicate round.
   test('a slow round finishing after a route switch leaves the newer round\'s status alone', async () => {
-    const ctx = loadApp();
+    // Clock pinned to 09:00 BST, before both fixture legs depart. The status
+    // this asserts on ("matched no trains") is only reachable while
+    // hasUpcomingLegs() is true — after the last departure, zero matches is
+    // the correct answer and the dot legitimately goes green. Left on the
+    // real clock this passed in the morning and failed in the afternoon.
+    const ctx = loadApp({ now: ukEpoch(2026, 8, 19, 9, 0, true) });
     const routes = [
       { id: 'slow', name: 'Slow', from: 'RDG', to: 'PAD', change: null },
       { id: 'fast', name: 'Fast', from: 'KGX', to: 'CBG', change: null },
@@ -1489,5 +1494,128 @@ describe('fetchBoards() — a round\'s boards go out together, not one after the
     vm.runInContext('localStorage.setItem("darwinApiKey", "test-key");', ctx);
     await ctx.fetchBoards([['RDG', 'TWY', 'to'], ['TWY', 'HOH', 'to'], ['HOH', 'TWY', 'to'], ['TWY', 'RDG', 'to']]);
     assert.equal(maxInFlight, 4);
+  });
+});
+
+describe('schedule revalidation policy — cheap files every focus, the 15MB one only when it earns it', () => {
+  // Re-requesting data/schedule.json on every tab focus is the most
+  // expensive thing this app does on a phone, and it buys nothing: the file
+  // is committed once a day. But a route added from the settings page lands
+  // in routes.json 2-3 minutes before the Action commits its schedule, and
+  // the reader is watching an empty list for that whole window — so
+  // "check it less often" must not become "check it late".
+  function setUpPolicy(ctx, { routes, scheduleRoutes }) {
+    vm.runInContext(`
+      ROUTES = ${JSON.stringify(routes)};
+      activeRouteId = ${JSON.stringify(routes[0].id)};
+      SCHEDULE = { routes: ${JSON.stringify(scheduleRoutes)} };
+    `, ctx);
+  }
+  const leg = { date: '2026-09-24', uid: 'u1', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 };
+  const curated = { id: 'rdg-pad', name: 'R', from: 'RDG', to: 'PAD', change: null };
+
+  // Records the fetches app.js issues, so a test can assert on which files
+  // were actually asked for rather than on internal bookkeeping.
+  function trackFetches(ctx) {
+    const urls = [];
+    ctx.fetch = (url) => { urls.push(String(url)); return Promise.reject(new Error('unused')); };
+    return urls;
+  }
+
+  test('a focus fetches routes/stations but not the schedule, once the cooldown is running', () => {
+    const ctx = loadApp();
+    setUpPolicy(ctx, { routes: [curated], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
+    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx); // as loadAll() sets it
+    const urls = trackFetches(ctx);
+    vm.runInContext('checkForDataUpdates();', ctx);
+    assert.deepEqual(urls, ['./routes.json', './stations.json']);
+  });
+
+  test('once the cooldown expires the schedule is checked again, so the daily commit still lands', () => {
+    // The other half of the policy: slower must still mean "checked", or a
+    // long-lived open tab would never pick up refresh-platforms.yml's daily
+    // commit at all.
+    const ctx = loadApp();
+    setUpPolicy(ctx, { routes: [curated], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
+    vm.runInContext('lastScheduleCheckAt = Date.now() - SCHEDULE_CHECK_COOLDOWN_MS - 1;', ctx);
+    const urls = trackFetches(ctx);
+    vm.runInContext('checkForDataUpdates();', ctx);
+    assert.ok(urls.includes('./data/schedule.json'));
+    // ...and the check re-arms the cooldown rather than firing every time.
+    urls.length = 0;
+    vm.runInContext('lastFocusCheckAt = 0; checkForDataUpdates();', ctx);
+    assert.ok(!urls.includes('./data/schedule.json'));
+  });
+
+  test('a route with no schedule data yet forces the schedule check straight past the cooldown', () => {
+    const ctx = loadApp();
+    // Exactly the state after the builder's routes.json commit reaches an
+    // open tab: the route exists, the Action hasn't committed its data yet.
+    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
+    setUpPolicy(ctx, {
+      routes: [curated, fresh],
+      scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } },
+    });
+    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx);
+    const urls = trackFetches(ctx);
+    vm.runInContext('checkForDataUpdates();', ctx);
+    assert.ok(urls.includes('./data/schedule.json'), 'a route awaiting data must not wait out the cooldown');
+  });
+
+  test('an empty out/ret pair counts as no data, not as data', () => {
+    const ctx = loadApp();
+    // The two-phase Action writes the route key before the legs land, so
+    // "the key exists" is not the same question as "there is anything to show".
+    setUpPolicy(ctx, { routes: [curated], scheduleRoutes: { 'rdg-pad': { out: [], ret: [] } } });
+    assert.equal(vm.runInContext('routeHasScheduleLegs("rdg-pad")', ctx), false);
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-pad']);
+  });
+
+  test('a quick (live-only) route never counts as awaiting schedule data', () => {
+    // The trap this policy has to avoid: a quick route has NO schedule.json
+    // entry at all, by design — it's served entirely from Darwin's live
+    // board. Treating that as "waiting for the Action" would pin the app in
+    // eager mode, re-requesting 15MB every minute for as long as the quick
+    // route existed, which is the exact opposite of the point.
+    const ctx = loadApp();
+    const quick = { id: 'q-rdg-bri', name: 'Q', from: 'RDG', to: 'BRI', change: null, liveOnly: true };
+    setUpPolicy(ctx, { routes: [curated, quick], scheduleRoutes: { 'rdg-pad': { out: [leg], ret: [] } } });
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), []);
+
+    vm.runInContext('lastScheduleCheckAt = Date.now();', ctx);
+    const urls = trackFetches(ctx);
+    vm.runInContext('checkForDataUpdates();', ctx);
+    assert.ok(!urls.includes('./data/schedule.json'), 'a quick route pinned the app in eager mode');
+  });
+
+  test('the eager window is bounded, so data that never arrives stops costing 15MB a minute', () => {
+    const ctx = loadApp();
+    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
+    setUpPolicy(ctx, { routes: [fresh], scheduleRoutes: {} });
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
+    // Backdate the wait past the window — an Action that failed, or a station
+    // pair with no direct service, whose fetch legitimately yields zero legs.
+    vm.runInContext('scheduleWaitStartedAt["rdg-new"] -= SCHEDULE_EAGER_WINDOW_MS + 1;', ctx);
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), []);
+  });
+
+  test('the eager window is per route, so a timed-out one does not starve a route added later', () => {
+    const ctx = loadApp();
+    const stuck = { id: 'rdg-stuck', name: 'S', from: 'RDG', to: 'STK', change: null };
+    const fresh = { id: 'rdg-new', name: 'N', from: 'RDG', to: 'NEW', change: null };
+    setUpPolicy(ctx, { routes: [stuck], scheduleRoutes: {} });
+    vm.runInContext('routesAwaitingSchedule(); scheduleWaitStartedAt["rdg-stuck"] -= SCHEDULE_EAGER_WINDOW_MS + 1;', ctx);
+    vm.runInContext(`ROUTES = ${JSON.stringify([stuck, fresh])};`, ctx);
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
+  });
+
+  test('data arriving releases the eager window rather than leaving it latched', () => {
+    const ctx = loadApp();
+    const fresh = { id: 'rdg-new', name: 'New', from: 'RDG', to: 'NEW', change: null };
+    setUpPolicy(ctx, { routes: [fresh], scheduleRoutes: {} });
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), ['rdg-new']);
+    vm.runInContext(`SCHEDULE = { routes: { 'rdg-new': { out: ${JSON.stringify([leg])}, ret: [] } } };`, ctx);
+    assert.deepEqual(plain(vm.runInContext('routesAwaitingSchedule()', ctx)), []);
+    assert.equal(vm.runInContext('scheduleWaitStartedAt["rdg-new"]', ctx), undefined);
   });
 });

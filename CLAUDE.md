@@ -805,9 +805,61 @@ throws away the whole live overlay:
    green-but-stale window.
 
 Note what makes this fire in normal use rather than rarely:
-`checkForDataUpdates()` re-issues all three data fetches on every tab focus,
-and `refresh-platforms.yml` commits a new `schedule.json` daily — so the first
-focus after each daily commit takes exactly this path.
+`refresh-platforms.yml` commits a new `schedule.json` daily, and a tab focus
+can re-check it (see the revalidation policy below) — so the first focus
+after each daily commit takes exactly this path.
+
+## Schedule revalidation policy — the cheap files often, the 15MB one rarely
+
+`checkForDataUpdates()` used to re-issue **all three** data fetches on every
+tab focus (20s debounce). `data/schedule.json` is ~15MB and growing, so that
+was the most expensive thing the app did on a phone, and it bought nothing:
+the file is committed roughly once a day. But it can't simply be slowed down,
+because one case genuinely needs it immediately — see below. So the three
+files are now split:
+
+- **`routes.json` / `stations.json`** — a few KB, and they're what actually
+  detects a route being added or removed. Still fetched on **every** focus,
+  unchanged.
+- **`data/schedule.json`** — `checkForScheduleUpdate()`, on a
+  `SCHEDULE_CHECK_COOLDOWN_MS` (30 min) cooldown, seeded from `loadAll()` so
+  the first focus after a load doesn't immediately re-request the largest
+  file in the app. A fresh page load checks it anyway, and 30 min is far
+  inside the daily commit cadence.
+
+**The case that must not be slowed down**: a route added from the settings
+page (the builder commits `routes.json`) has no schedule data until the
+Action's two-phase fetch commits it — the first 7 days in ~2-3 minutes, then
+a days-7-89 backfill. Until then the route is in `ROUTES` with an empty list
+and the reader is watching it. So `routesAwaitingSchedule()` puts the app in
+**eager mode** — a schedule check every minute via `tickMinute()`, plus one
+immediately when the `routes.json` swap itself lands — until the data
+arrives. `routeHasScheduleLegs()` deliberately tests for *legs*, not for the
+route key: the two-phase Action writes the key before there's anything in it.
+
+Two bounds keep eager mode from becoming the problem it was meant to fix:
+
+- **Quick (live-only) routes are excluded, and must stay excluded.** A quick
+  route has **no `schedule.json` entry at all**, by design (see "Quick
+  (session-only) live routes" below) — it's served entirely from Darwin's
+  live board. Counting one as "awaiting schedule data" would pin the app in
+  eager mode, re-requesting 15MB every minute, for as long as the quick route
+  existed — the exact opposite of the point. This is the single easiest way
+  to break this policy; there's a regression test named for it.
+- **`SCHEDULE_EAGER_WINDOW_MS` (15 min), tracked per route** in
+  `scheduleWaitStartedAt`. The fast phase normally lands in 2-3 minutes, so
+  this is generous headroom — but it also bounds the damage when the data is
+  never coming: a broken Action, or a genuine station pair with no direct
+  service, whose fetch legitimately yields **zero legs** and so never
+  satisfies `routeHasScheduleLegs()`. Without the deadline either case would
+  re-request 15MB every minute forever. Per-route (not one global timer) so a
+  route that has timed out never starves a route added afterwards of its own
+  window.
+
+The days-7-89 backfill is deliberately *not* chased eagerly — the fast phase
+already satisfies `routeHasScheduleLegs()`, which releases eager mode. The
+backfill arrives on the routine cooldown or the next page load, which is fine:
+it only affects days a week or more out.
 
 ## Known limitations, not bugs
 
