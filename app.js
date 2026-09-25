@@ -310,7 +310,11 @@ function checkForDataUpdates() {
   });
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') { checkForDataUpdates(); requestAutoDir(); }
+  if (document.visibilityState === 'visible') {
+    checkForDataUpdates();
+    autoDirPaused = false; // coming back is a new "where am I now?" — see requestAutoDir
+    requestAutoDir({ fresh: true });
+  }
 });
 window.addEventListener('focus', checkForDataUpdates);
 
@@ -444,9 +448,13 @@ function restoreState() {
 // Picks whichever end of the active route the visitor is nearer and shows
 // the direction leaving it. Never blocks a render: the page draws with the
 // last-used direction first and only switches once a fix arrives. Coarse
-// accuracy and a generous maximumAge mean the browser can usually answer
-// from a cached fix, with no GPS spin-up and no network — so a flaky or
-// absent connection just means "no switch", never a slower load.
+// accuracy means no GPS spin-up, and a flaky or absent connection just
+// means "no switch", never a slower load. Returning to the tab demands a
+// brand-new fix (maximumAge 0): the whole point is noticing you've moved,
+// and any cached fix predates the move. Load and route switch accept one
+// up to a minute old, which can't be from before a journey.
+// Tapping a tab pauses switching (the visitor's choice wins) only until they
+// next come back to the tab, which re-checks from scratch.
 // Coordinates are inlined (not fetched) for the same reason. A route whose
 // ends aren't listed here (e.g. a quick route) keeps the last-used direction.
 const STATION_COORDS = {
@@ -457,7 +465,8 @@ const STATION_COORDS = {
   MAN: [53.4774, -2.2309], MLW: [51.5706, -0.7662], HXX: [51.4713, -0.4539],
   HAY: [51.5031, -0.4205],
 };
-let autoDir = false;
+let autoDir = false;       // opened with #dir=auto
+let autoDirPaused = false; // a tab was tapped since the visitor last came back
 // Squared equirectangular distance — only ever compared, and accurate far
 // beyond what a coarse fix needs at UK scale.
 function approxDist2([lat1, lon1], [lat2, lon2]) {
@@ -472,13 +481,13 @@ function dirForLocation(route, lat, lon) {
   if (!a || !b || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
   return approxDist2([lat, lon], a) <= approxDist2([lat, lon], b) ? 'out' : 'ret';
 }
-function requestAutoDir() {
-  if (!autoDir || !('geolocation' in navigator)) return;
+function requestAutoDir({ fresh = false } = {}) {
+  if (!autoDir || autoDirPaused || !('geolocation' in navigator)) return;
   navigator.geolocation.getCurrentPosition(pos => {
-    if (!autoDir) return; // the visitor tapped a tab while we waited — theirs wins
+    if (autoDirPaused) return; // the visitor tapped a tab while we waited — theirs wins
     const dir = dirForLocation(currentRoute(), pos.coords.latitude, pos.coords.longitude);
     if (dir && dir !== activeDir) selectDir(dir);
-  }, () => {}, { enableHighAccuracy: false, maximumAge: 10 * 60 * 1000, timeout: 15000 });
+  }, () => {}, { enableHighAccuracy: false, maximumAge: fresh ? 0 : 60 * 1000, timeout: 15000 });
 }
 
 function applyActiveDirUI() {
@@ -1794,7 +1803,7 @@ function selectDir(dir) {
 }
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
-    autoDir = false; // a manual choice ends location-driven switching
+    autoDirPaused = true; // a manual choice wins until the visitor next returns to the tab
     selectDir(btn.dataset.dir);
   });
 });

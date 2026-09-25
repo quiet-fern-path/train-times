@@ -310,11 +310,13 @@ these legs in on screen right now".
 Opt-in via the link hash (`#route=rdg-pad&dir=auto`). The page renders with
 the last-used direction **first**, then `requestAutoDir()` asks
 `navigator.geolocation` for a coarse fix (`enableHighAccuracy: false`,
-`maximumAge` 10 min) and, via `dirForLocation()`, switches to the direction
+`maximumAge` 60s) and, via `dirForLocation()`, switches to the direction
 leaving whichever end of the route is nearer. It re-checks on route switch
-and when the tab becomes visible again. Tapping a tab ends it for the
-session (`autoDir = false`); the hash keeps `dir=auto` until then so a
-reload stays location-driven.
+and every time the tab becomes visible again — that one with `maximumAge: 0`,
+because the typical return is after a journey and any cached fix predates
+it (confirmed in Chromium: a 60s `maximumAge` hands back the old fix). Tapping a tab pauses switching (`autoDirPaused`) only until
+the visitor next returns to the tab; the hash keeps `dir=auto` throughout
+so a reload stays location-driven.
 
 Two rules keep this from costing load time or offline robustness — don't
 break either:
