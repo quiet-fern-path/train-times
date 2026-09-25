@@ -310,7 +310,7 @@ function checkForDataUpdates() {
   });
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') checkForDataUpdates();
+  if (document.visibilityState === 'visible') { checkForDataUpdates(); requestAutoDir(); }
 });
 window.addEventListener('focus', checkForDataUpdates);
 
@@ -405,7 +405,7 @@ function readURLState() {
 function writeURLState(state) {
   const params = new URLSearchParams();
   params.set('route', state.route);
-  params.set('dir', state.dir);
+  params.set('dir', autoDir ? 'auto' : state.dir); // keep "auto" so a reload/bookmark stays location-driven
   params.set('date', state.date);
   const hash = '#' + params.toString();
   if (location.hash !== hash) history.replaceState(null, '', hash);
@@ -430,9 +430,57 @@ function restoreState() {
   const dateStr = url.date; // hash-only, no localStorage fallback — see persistState
   if (routeId && ROUTES.some(r => r.id === routeId)) activeRouteId = routeId;
   if (dir === 'out' || dir === 'ret') activeDir = dir;
+  // dir=auto: render with the last-used direction straight away (never wait
+  // on a location fix), then let requestAutoDir() flip it if needed.
+  if (url.dir === 'auto') {
+    autoDir = true;
+    const last = localStorage.getItem('lastDir');
+    if (last === 'out' || last === 'ret') activeDir = last;
+  }
   if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) inp.value = dateStr;
   persistState(); // normalize the hash to reflect what we actually settled on
 }
+// ── Direction from approximate location (opt-in via #dir=auto) ──────
+// Picks whichever end of the active route the visitor is nearer and shows
+// the direction leaving it. Never blocks a render: the page draws with the
+// last-used direction first and only switches once a fix arrives. Coarse
+// accuracy and a generous maximumAge mean the browser can usually answer
+// from a cached fix, with no GPS spin-up and no network — so a flaky or
+// absent connection just means "no switch", never a slower load.
+// Coordinates are inlined (not fetched) for the same reason. A route whose
+// ends aren't listed here (e.g. a quick route) keeps the last-used direction.
+const STATION_COORDS = {
+  RDG: [51.4588, -0.9718], PAD: [51.5160, -0.1770], OXF: [51.7535, -1.2700],
+  MAI: [51.5187, -0.7227], TWY: [51.4755, -0.8633], HOT: [51.5343, -0.9003],
+  KGX: [51.5308, -0.1238], CBG: [52.1945, 0.1375], TWI: [51.4500, -0.3301],
+  TED: [51.4244, -0.3327], COO: [51.5606, -0.7224], NMC: [53.3651, -2.0055],
+  MAN: [53.4774, -2.2309], MLW: [51.5706, -0.7662], HXX: [51.4713, -0.4539],
+  HAY: [51.5031, -0.4205],
+};
+let autoDir = false;
+// Squared equirectangular distance — only ever compared, and accurate far
+// beyond what a coarse fix needs at UK scale.
+function approxDist2([lat1, lon1], [lat2, lon2]) {
+  const x = (lon2 - lon1) * Math.cos((lat1 + lat2) * Math.PI / 360);
+  const y = lat2 - lat1;
+  return x * x + y * y;
+}
+// 'out' if nearer route.from, 'ret' if nearer route.to, null if unknown.
+function dirForLocation(route, lat, lon) {
+  const a = route && STATION_COORDS[route.from];
+  const b = route && STATION_COORDS[route.to];
+  if (!a || !b || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return approxDist2([lat, lon], a) <= approxDist2([lat, lon], b) ? 'out' : 'ret';
+}
+function requestAutoDir() {
+  if (!autoDir || !('geolocation' in navigator)) return;
+  navigator.geolocation.getCurrentPosition(pos => {
+    if (!autoDir) return; // the visitor tapped a tab while we waited — theirs wins
+    const dir = dirForLocation(currentRoute(), pos.coords.latitude, pos.coords.longitude);
+    if (dir && dir !== activeDir) selectDir(dir);
+  }, () => {}, { enableHighAccuracy: false, maximumAge: 10 * 60 * 1000, timeout: 15000 });
+}
+
 function applyActiveDirUI() {
   document.querySelectorAll('.tab').forEach(b => {
     const active = b.dataset.dir === activeDir;
@@ -519,6 +567,7 @@ function renderRoutePicker() {
       persistState();
       render();
       scrollToNextIfToday();
+      requestAutoDir();
     });
   });
   el.querySelectorAll('.chip-remove').forEach(btn => {
@@ -1731,21 +1780,22 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────
+function selectDir(dir) {
+  activeDir = dir;
+  applyActiveDirUI();
+  persistState();
+  renderDirection(activeDir); // refreshes the slower-train count text for this direction
+  const dateStr = document.getElementById('vdate').value || todayStr();
+  if (dateStr === todayStr()) {
+    scrollToNext(document.getElementById('panel-' + activeDir));
+    const nc = document.getElementById('panel-' + activeDir).querySelector('.train-card.is-next');
+    if (nc) maybeStartSecTimer(parseInt(nc.dataset.depm)); else clearSecTimer();
+  }
+}
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
-    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active'); btn.setAttribute('aria-selected', 'true');
-    activeDir = btn.dataset.dir;
-    document.getElementById('panel-' + activeDir).classList.add('active');
-    persistState();
-    renderDirection(activeDir); // refreshes the slower-train count text for this direction
-    const dateStr = document.getElementById('vdate').value || todayStr();
-    if (dateStr === todayStr()) {
-      scrollToNext(document.getElementById('panel-' + activeDir));
-      const nc = document.getElementById('panel-' + activeDir).querySelector('.train-card.is-next');
-      if (nc) maybeStartSecTimer(parseInt(nc.dataset.depm)); else clearSecTimer();
-    }
+    autoDir = false; // a manual choice ends location-driven switching
+    selectDir(btn.dataset.dir);
   });
 });
 
@@ -2027,6 +2077,7 @@ window.addEventListener('online', () => refreshLiveOverlay());
   } else {
     scrollToNextIfToday();
   }
+  requestAutoDir();
   window.addEventListener('scroll', () => {
     clearTimeout(scrollSaveTimer);
     scrollSaveTimer = setTimeout(() => sessionStorage.setItem('scrollY', String(window.scrollY)), 200);

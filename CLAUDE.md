@@ -305,6 +305,27 @@ only (see its own comment) — it answers "is this leg beaten on the
 timetable", a different question from "what order does live running put
 these legs in on screen right now".
 
+## `#dir=auto` — direction from approximate location
+
+Opt-in via the link hash (`#route=rdg-pad&dir=auto`). The page renders with
+the last-used direction **first**, then `requestAutoDir()` asks
+`navigator.geolocation` for a coarse fix (`enableHighAccuracy: false`,
+`maximumAge` 10 min) and, via `dirForLocation()`, switches to the direction
+leaving whichever end of the route is nearer. It re-checks on route switch
+and when the tab becomes visible again. Tapping a tab ends it for the
+session (`autoDir = false`); the hash keeps `dir=auto` until then so a
+reload stays location-driven.
+
+Two rules keep this from costing load time or offline robustness — don't
+break either:
+
+- **Never await the fix before rendering.** A flaky or absent connection
+  (or a denied permission) must mean "no switch", not "slower page".
+- **Coordinates are inlined in `STATION_COORDS`, not fetched.** Add an
+  entry whenever you add a station to `stations.json` (a test enforces
+  this). A route with an unlisted end — e.g. any quick route — simply
+  keeps the last-used direction. No position is ever stored.
+
 ## Route types: direct vs connection
 
 `routes.json`'s `change` field (null vs a CRS code) determines which code

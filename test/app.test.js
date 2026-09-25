@@ -1609,3 +1609,33 @@ describe('waiting on a newly added route\'s schedule', () => {
     assert.equal(vm.runInContext('scheduleWaitStartedAt["rdg-new"]', ctx), undefined);
   });
 });
+
+describe('dirForLocation — #dir=auto picks the direction leaving the nearer end', () => {
+  const ctx = loadApp();
+  const rdgPad = { from: 'RDG', to: 'PAD' };
+
+  test('in Reading town centre → out (Reading → Paddington)', () => {
+    assert.equal(ctx.dirForLocation(rdgPad, 51.455, -0.970), 'out');
+  });
+  test('in central London → ret (Paddington → Reading)', () => {
+    assert.equal(ctx.dirForLocation(rdgPad, 51.507, -0.128), 'ret');
+  });
+  test('Twyford (just east of Reading) is still nearer Reading', () => {
+    assert.equal(ctx.dirForLocation(rdgPad, 51.4755, -0.8633), 'out');
+  });
+  test('Southall (west London) is nearer Paddington', () => {
+    assert.equal(ctx.dirForLocation(rdgPad, 51.506, -0.378), 'ret');
+  });
+  test('a station without coordinates gives no opinion, so the last-used direction stands', () => {
+    assert.equal(ctx.dirForLocation({ from: 'RDG', to: 'BRI' }, 51.455, -0.970), null);
+  });
+  test('a missing fix gives no opinion', () => {
+    assert.equal(ctx.dirForLocation(rdgPad, NaN, NaN), null);
+    assert.equal(ctx.dirForLocation(null, 51.455, -0.970), null);
+  });
+  test('every station in stations.json has coordinates', () => {
+    const stations = require('../stations.json');
+    const coords = require('node:vm').runInContext('STATION_COORDS', ctx);
+    assert.deepEqual(Object.keys(stations).filter((c) => !coords[c]), []);
+  });
+});
