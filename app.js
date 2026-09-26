@@ -657,9 +657,15 @@ function directCard(leg, route, dir, isToday, curM, faster) {
       </div>
     </div>
     ${delayTag ? `<div class="change-row">${delayTag}</div>` : ''}
+    ${reasonHtml(leg)}
     ${slowerHtml}
     ${rttLink}
   </div>`;
+}
+
+// Darwin's stated cause, under the Cancelled/late tag it explains.
+function reasonHtml(leg) {
+  return leg._disruptReason ? `<div class="reason">${escapeHtml(leg._disruptReason)}</div>` : '';
 }
 
 function connectionCard(leg, route, dir, isToday, curM, faster) {
@@ -721,6 +727,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
     </div>
     <div class="change-row">Change at ${changeName}: arr ${changeArrText} &middot; dep ${changeDepText} &middot; ${leg.changeMins} min</div>
     ${cancelledTag}
+    ${reasonHtml(leg)}
     ${tightWarning}
     ${slowerHtml}
     ${link1} ${link2}
@@ -858,6 +865,7 @@ function renderDirection(dir) {
     const board = LIVE_ONLY_BOARDS[route.id] || {};
     const legs = (board[dir] || []).slice().sort(byArrival);
     renderLegList(listEl, legs, dir, true, nowM(), directCard, liveOnlyEmptyHtml());
+    renderDisruption(dir, true);
     return;
   }
 
@@ -877,6 +885,7 @@ function renderDirection(dir) {
   const emptyHtml = `<div class="no-svc"><strong>No service data</strong>No trains found for ${dayLabel}. If this looks wrong, the weekly schedule refresh may not have run yet, or this date is beyond the current lookahead window.</div>`;
 
   renderLegList(listEl, legs, dir, isToday, curM, isConnection ? connectionCard : directCard, emptyHtml);
+  renderDisruption(dir, isToday);
 }
 
 function render() {
@@ -1226,6 +1235,116 @@ function findCallingPoint(svc, crs) {
   return null;
 }
 
+// ── Disruption notices ──────────────────────────────────────────────
+// Every GetDepBoardWithDetails response carries the station's National Rail
+// (NRCC) notices in `nrccMessages` — engineering works, line closures,
+// "disruption between X and Y". They ride along on the boards each round
+// already fetches, so this costs no extra call. They're station-wide, not
+// per-destination (filterCrs only narrows trainServices), so they're keyed
+// by CRS and shared across routes and directions.
+//
+// Each message is XHTML, usually ending in an <a> to National Rail's travel
+// news. Rendered as plain text (tags stripped, then re-escaped), never as
+// HTML: this is third-party markup going into innerHTML. The one link kept is
+// the first nationalrail.co.uk href, re-emitted by us.
+//
+// A board that failed this round leaves its station's last-known notices in
+// place — the same no-wipe-on-failure rule as the leg overlays, so a dropped
+// signal never makes a disruption warning disappear.
+const STATION_MESSAGES = {}; // crs -> { msgs: [{text, url}], at }
+
+function decodeEntities(s) {
+  return s
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// The REST JSON wraps each message as {Value: "..."}; accept a bare string
+// and a lower-case `value` too, since the exact casing hasn't been checked
+// against a live disrupted board.
+function parseNrccMessages(board) {
+  const raw = (board && board.nrccMessages) || [];
+  const out = [];
+  for (const m of Array.isArray(raw) ? raw : [raw]) {
+    const html = typeof m === 'string' ? m : (m && (m.Value || m.value || m.xhtmlMessage)) || '';
+    if (!html) continue;
+    const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)].map(x => decodeEntities(x[1]));
+    const url = hrefs.find(h => /^https:\/\/(www\.)?nationalrail\.co\.uk\//i.test(h)) || null;
+    const text = decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+    if (text && !out.some(o => o.text === text)) out.push({ text, url });
+  }
+  return out;
+}
+
+function recordStationMessages(crs, board) {
+  if (!crs || !board) return;
+  STATION_MESSAGES[crs] = { msgs: parseNrccMessages(board), at: Date.now() };
+}
+
+// The stations whose notices matter to someone travelling in `dir`: where
+// they board, plus the change station on a connection. The destination is
+// deliberately left out — its board isn't fetched (every board is an
+// origin's), and a problem on the line to it shows up in the origin's
+// notices anyway.
+function disruptionStations(route, dir) {
+  const origin = dir === 'out' ? route.from : route.to;
+  return route.change ? [origin, route.change] : [origin];
+}
+
+// [{crs, msgs}] for stations with current notices. Older than the live cache
+// window counts as gone: a notice can be withdrawn, and nothing past an hour
+// old should be shown as current.
+function disruptionFor(route, dir) {
+  const groups = [];
+  for (const crs of disruptionStations(route, dir)) {
+    const e = STATION_MESSAGES[crs];
+    if (!e || !e.msgs.length) continue;
+    const age = Date.now() - e.at;
+    if (!(age >= 0) || age > LIVE_CACHE_MAX_AGE_MS) continue;
+    groups.push({ crs, msgs: e.msgs });
+  }
+  return groups;
+}
+
+function disruptionHtml(groups) {
+  if (!groups.length) return '';
+  const body = groups.map(g => {
+    const name = escapeHtml(STATIONS[g.crs] || g.crs);
+    return g.msgs.map(m => `<p><strong>${name}:</strong> ${escapeHtml(m.text)}${m.url ? ` <a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">More&nbsp;info&nbsp;&rarr;</a>` : ''}</p>`).join('');
+  }).join('');
+  return `<div class="disruption" role="alert"><div class="disruption-title">&#9888; Disruption notice</div>${body}</div>`;
+}
+
+// Fills a direction's banner and flags its tab, so a notice on the other
+// direction isn't missed. Only for today's live view — notices describe now,
+// not a date being browsed ahead.
+function renderDisruption(dir, show) {
+  const route = currentRoute();
+  const groups = show && route ? disruptionFor(route, dir) : [];
+  const el = document.getElementById('disrupt-' + dir);
+  if (el) el.innerHTML = disruptionHtml(groups);
+  const tab = document.getElementById('tab-' + dir);
+  if (tab) tab.classList.toggle('has-disruption', groups.length > 0);
+}
+
+// Darwin's own reason for a cancellation or delay ("This train has been
+// cancelled because of a fault on this train"). A plain string in the REST
+// schema; tolerate an object wrapper as with nrccMessages. Delay reasons only
+// count when the service is actually late — Darwin can leave one on a train
+// that has since recovered.
+function serviceReason(svc, cancelled, delayed) {
+  const pick = r => typeof r === 'string' ? r : (r && (r.Value || r.value)) || '';
+  const r = cancelled ? pick(svc.cancelReason) : delayed ? pick(svc.delayReason) : '';
+  return r ? decodeEntities(r.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim() || null : null;
+}
+
 // Build leg-shaped objects directly from a live departure board's own
 // trainServices — used for quick (session-only) routes, which have no
 // schedule.json entry to overlay live data onto. Unlike applyDirectOverlay
@@ -1274,6 +1393,7 @@ function synthesizeLiveLegs(board, destCrs) {
       _delayMins: delayMins,
       _liveDepM: depM + delayMins,
       _liveArr: liveArr,
+      _disruptReason: serviceReason(svc, isCancelled, delayMins > 0),
     });
   }
   return legs;
@@ -1295,8 +1415,8 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM', '_liveArr'];
-const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM', '_liveArr', '_disruptReason'];
+const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -1334,7 +1454,7 @@ function saveLiveCache(route, dateStr) {
   if (route.liveOnly) {
     const board = LIVE_ONLY_BOARDS[route.id];
     if (!board) return;
-    const payload = { date: dateStr, savedAt: Date.now(), out: board.out, ret: board.ret };
+    const payload = { date: dateStr, savedAt: Date.now(), out: board.out, ret: board.ret, messages: routeMessages(route) };
     try {
       sessionStorage.setItem(liveCacheKey(route.id), JSON.stringify(payload));
     } catch (e) {
@@ -1350,6 +1470,7 @@ function saveLiveCache(route, dateStr) {
     savedAt: Date.now(),
     out: snapshotLegs(data.out || [], isConnection),
     ret: snapshotLegs(data.ret || [], isConnection),
+    messages: routeMessages(route),
   };
   try {
     localStorage.setItem(liveCacheKey(route.id), JSON.stringify(payload));
@@ -1358,6 +1479,24 @@ function saveLiveCache(route, dateStr) {
     // just won't survive a reload this time, nothing to surface to the user.
   }
 }
+// Disruption notices for this route's stations, saved alongside its live
+// legs so a reload with no signal still shows the warning. Each keeps its own
+// fetch time, and a restore never overwrites a fresher in-memory copy (another
+// route sharing the station may have fetched it since).
+function routeMessages(route) {
+  const out = {};
+  for (const crs of [route.from, route.to, route.change]) {
+    if (crs && STATION_MESSAGES[crs]) out[crs] = STATION_MESSAGES[crs];
+  }
+  return out;
+}
+function restoreRouteMessages(saved) {
+  for (const [crs, e] of Object.entries(saved || {})) {
+    if (!e || !Array.isArray(e.msgs) || typeof e.at !== 'number') continue;
+    if (!STATION_MESSAGES[crs] || STATION_MESSAGES[crs].at < e.at) STATION_MESSAGES[crs] = e;
+  }
+}
+
 function restoreLiveCacheForRoute(route) {
   let raw;
   try { raw = liveCacheStorage(route).getItem(liveCacheKey(route.id)); } catch (e) { return; }
@@ -1366,6 +1505,7 @@ function restoreLiveCacheForRoute(route) {
   try { cached = JSON.parse(raw); } catch (e) { return; }
   const age = Date.now() - (cached.savedAt || 0);
   if (!(age >= 0) || age > LIVE_CACHE_MAX_AGE_MS || cached.date !== todayStr()) return;
+  restoreRouteMessages(cached.messages);
 
   if (route.liveOnly) {
     LIVE_ONLY_BOARDS[route.id] = { out: cached.out || [], ret: cached.ret || [] };
@@ -1609,6 +1749,8 @@ async function overlayLiveOnlyRoute(route) {
     [route.from, route.to, 'to'],
     [route.to, route.from, 'to'],
   ]);
+  recordStationMessages(route.from, outBoard);
+  recordStationMessages(route.to, retBoard);
   const merged = mergeLiveOnlyBoard(LIVE_ONLY_BOARDS[route.id], outBoard, retBoard, route);
   LIVE_ONLY_BOARDS[route.id] = merged;
   // A quick route's legs *are* the board, so "matched" is just how many legs
@@ -1623,6 +1765,8 @@ async function overlayDirectLive(route, dateStr) {
     [route.from, route.to, 'to'],
     [route.to, route.from, 'to'],
   ]);
+  recordStationMessages(route.from, outBoard);
+  recordStationMessages(route.to, retBoard);
   const matched = applyDirectOverlay(data.out, dateStr, outBoard, route.to)
     + applyDirectOverlay(data.ret, dateStr, retBoard, route.from);
   return boardOutcome([outBoard, retBoard], matched);
@@ -1651,6 +1795,7 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
       leg._delayMins = 0;
     }
     leg._liveDepM = leg.depM + leg._delayMins;
+    leg._disruptReason = serviceReason(svc, leg._cancelled, leg._delayMins > 0);
 
     // Live arrival estimate at the destination, read straight off this same
     // service's subsequentCallingPoints — the board was already fetched
@@ -1660,7 +1805,10 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
     // points don't carry one).
     const destPoint = findCallingPoint(svc, destCrs);
     if (destPoint) {
-      if (destPoint.isCancelled) leg._cancelled = true;
+      if (destPoint.isCancelled) {
+        leg._cancelled = true;
+        leg._disruptReason = serviceReason(svc, true, false);
+      }
       if (destPoint.et && /^\d{2}:\d{2}$/.test(destPoint.et)) {
         leg._liveArr = destPoint.et;
       } else if (destPoint.et === 'On time') {
@@ -1680,6 +1828,10 @@ async function overlayConnectionLive(route, dateStr) {
     [route.to, route.change, 'to'],
     [route.change, route.from, 'to'],
   ]);
+  recordStationMessages(route.from, outA);
+  recordStationMessages(route.to, retA);
+  // Two change-station boards, one per direction; either carries its notices.
+  recordStationMessages(route.change, outB || retB);
   const matched = applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to)
     + applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
   return boardOutcome([outA, outB, retA, retB], matched);
@@ -1703,11 +1855,13 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     let liveDep2M = null;
     let liveArr1M = null; // real live arrival estimate at the change station, when boardA's match carries it
     let legMatched = false;
+    let svc1 = null, svc2 = null;
 
     if (boardA) {
       const s1 = matchByTime(boardA, leg.dep, leg.toc1, changeCrs, leg.changeArrM);
       if (s1) {
         legMatched = true;
+        svc1 = s1;
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
         const platform1State = derivePlatformState(s1.platform, leg.platform1, s1.platformIsHidden);
@@ -1744,6 +1898,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
       const s2 = matchByTime(boardB, leg.changeDep, leg.toc2, destCrs, leg.arrM);
       if (s2) {
         legMatched = true;
+        svc2 = s2;
         leg2Cancelled = s2.isCancelled || s2.etd === 'Cancelled' || false;
         leg._platform2 = s2.platform || leg.platform2;
         const platform2State = derivePlatformState(s2.platform, leg.platform2, s2.platformIsHidden);
@@ -1773,6 +1928,15 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     leg._cancelled = leg1Cancelled || leg2Cancelled;
     leg._cancelledLeg = leg1Cancelled ? 1 : (leg2Cancelled ? 2 : 0);
     leg._liveDepM = leg.depM + liveDelay1;
+    // The reason that explains what the card shows: the cancelled sub-leg's,
+    // else leg-1's delay. Left as it was when neither service matched, like
+    // every other field here.
+    if (svc1 || svc2) {
+      leg._disruptReason = (leg1Cancelled && svc1 && serviceReason(svc1, true, false))
+        || (leg2Cancelled && svc2 && serviceReason(svc2, true, false))
+        || (svc1 && serviceReason(svc1, false, liveDelay1 > 0))
+        || null;
+    }
     // Prefer the change-station calling point's real live arrival estimate;
     // only fall back to projecting leg-1's origin delay forward (a
     // reasonable approximation — delay typically carries through to the

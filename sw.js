@@ -1,6 +1,6 @@
 // Bump this string whenever the app shell itself changes shape
 // (not needed for routine data refreshes — those are handled below).
-const CACHE = 'timetables-v9';
+const CACHE = 'timetables-v10';
 
 self.addEventListener('install', () => self.skipWaiting());
 

@@ -1639,3 +1639,117 @@ describe('dirForLocation — #dir=auto picks the direction leaving the nearer en
     assert.deepEqual(Object.keys(stations).filter((c) => !coords[c]), []);
   });
 });
+
+describe('disruption notices — Darwin nrccMessages and service reasons', () => {
+  const route = { id: 'r', name: 'R', from: 'RDG', to: 'PAD', change: null };
+
+  test('parseNrccMessages strips markup, keeps a National Rail link, drops duplicates', () => {
+    const ctx = loadApp();
+    const msgs = plain(ctx.parseNrccMessages({ nrccMessages: [
+      { Value: 'Disruption between Reading &amp; Slough. <a href="https://www.nationalrail.co.uk/service-disruptions/x/">Latest</a>' },
+      { Value: 'Disruption between Reading &amp; Slough. <a href="https://www.nationalrail.co.uk/service-disruptions/x/">Latest</a>' },
+      '<p>Lifts out of order</p>',
+    ] }));
+    assert.deepEqual(msgs, [
+      { text: 'Disruption between Reading & Slough. Latest', url: 'https://www.nationalrail.co.uk/service-disruptions/x/' },
+      { text: 'Lifts out of order', url: null },
+    ]);
+  });
+
+  test('a link to anywhere but nationalrail.co.uk is not kept', () => {
+    const ctx = loadApp();
+    const [m] = plain(ctx.parseNrccMessages({ nrccMessages: [{ Value: 'x <a href="javascript:alert(1)">y</a>' }] }));
+    assert.equal(m.url, null);
+  });
+
+  test('notice text is escaped, never rendered as HTML', () => {
+    const ctx = loadApp();
+    const html = ctx.disruptionHtml([{ crs: 'RDG', msgs: [{ text: '<img src=x onerror=alert(1)>', url: null }] }]);
+    assert.doesNotMatch(html, /<img/);
+    assert.match(html, /&lt;img/);
+  });
+
+  test('a failed board keeps the station\'s last-known notices', () => {
+    const ctx = loadApp();
+    ctx.recordStationMessages('RDG', { nrccMessages: [{ Value: 'Line closed' }] });
+    ctx.recordStationMessages('RDG', null);
+    assert.equal(plain(ctx.disruptionFor(route, 'out'))[0].msgs[0].text, 'Line closed');
+  });
+
+  test('a board with no notices clears them, and each direction reads its own origin', () => {
+    const ctx = loadApp();
+    ctx.recordStationMessages('RDG', { nrccMessages: [{ Value: 'Line closed' }] });
+    assert.equal(ctx.disruptionFor(route, 'ret').length, 0, 'PAD has no notices');
+    ctx.recordStationMessages('RDG', { trainServices: [] });
+    assert.equal(ctx.disruptionFor(route, 'out').length, 0);
+  });
+
+  test('a connection route also shows the change station\'s notices', () => {
+    const ctx = loadApp();
+    const conn = { id: 'c', from: 'RDG', to: 'HOT', change: 'TWY' };
+    ctx.recordStationMessages('TWY', { nrccMessages: [{ Value: 'Branch closed' }] });
+    assert.deepEqual(plain(ctx.disruptionFor(conn, 'out')).map(g => g.crs), ['TWY']);
+    assert.deepEqual(plain(ctx.disruptionFor(conn, 'ret')).map(g => g.crs), ['TWY']);
+  });
+
+  test('a live round puts the notice in the banner and flags the tab', async () => {
+    const ctx = loadApp({ now: ukEpoch(2026, 8, 19, 9, 0, true) });
+    const today = vm.runInContext('todayStr()', ctx);
+    setUpLiveRound(ctx, { routes: [route], activeId: 'r', schedule: { routes: {
+      r: { out: [{ date: today, uid: 'u1', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 }], ret: [] },
+    } } });
+    ctx.fetch = (url) => {
+      const board = /GetDepBoardWithDetails\/RDG/.test(url)
+        ? Object.assign(depBoard({ std: '10:13', etd: '10:25', platform: '4', destCrs: 'PAD', destSt: '10:40', destEt: '10:52' }),
+          { nrccMessages: [{ Value: 'Disruption between Reading and London Paddington' }] })
+        : { trainServices: [] };
+      return Promise.resolve({ ok: true, status: 200, json: async () => board });
+    };
+    await vm.runInContext('refreshLiveOverlay()', ctx);
+    assert.match(ctx.__elements.get('disrupt-out').innerHTML, /Disruption between Reading and London Paddington/);
+    assert.equal(ctx.__elements.get('disrupt-ret').innerHTML, '');
+    assert.ok(ctx.__elements.get('tab-out').classList.contains('has-disruption'));
+    assert.ok(!ctx.__elements.get('tab-ret').classList.contains('has-disruption'));
+  });
+
+  test('notices survive a reload through the live cache', async () => {
+    const ctx = loadApp();
+    const today = vm.runInContext('todayStr()', ctx);
+    ctx.localStorage.setItem('liveCache:r', JSON.stringify({
+      date: today, savedAt: Date.now(), out: {}, ret: {},
+      messages: { PAD: { msgs: [{ text: 'Engineering works', url: null }], at: Date.now() } },
+    }));
+    setUpLiveRound(ctx, { routes: [route], activeId: 'r', schedule: { routes: { r: { out: [], ret: [] } } } });
+    ctx.restoreLiveCacheForRoute(route);
+    assert.equal(plain(ctx.disruptionFor(route, 'ret'))[0].msgs[0].text, 'Engineering works');
+  });
+
+  test('a cancelled direct leg carries Darwin\'s cancel reason onto its card', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', uid: 'u', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 };
+    const board = { trainServices: [{ std: '10:13', etd: 'Cancelled', operatorCode: 'GW',
+      cancelReason: 'This train has been cancelled because of a fault on this train' }] };
+    ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+    assert.equal(leg._disruptReason, 'This train has been cancelled because of a fault on this train');
+    const html = ctx.directCard(leg, route, 'out', true, 600, null);
+    assert.match(html, /class="reason">This train has been cancelled/);
+  });
+
+  test('a delay reason on a train that is running on time is not shown', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', uid: 'u', toc: 'GW', dep: '10:13', depM: 613, arr: '10:40', arrM: 640 };
+    const board = { trainServices: [{ std: '10:13', etd: 'On time', operatorCode: 'GW', delayReason: 'Earlier signal fault' }] };
+    ctx.applyDirectOverlay([leg], '2026-07-02', board, 'PAD');
+    assert.equal(leg._disruptReason, null);
+  });
+
+  test('a connection leg shows the cancelled sub-leg\'s reason', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '10:00', depM: 600, toc1: 'GW', changeArr: '10:08', changeArrM: 608,
+      changeDep: '10:12', changeMins: 4, toc2: 'GW', arr: '10:30', arrM: 630 };
+    const boardA = { trainServices: [{ std: '10:00', etd: 'On time', operatorCode: 'GW' }] };
+    const boardB = { trainServices: [{ std: '10:12', etd: 'Cancelled', operatorCode: 'GW', cancelReason: 'Staff shortage' }] };
+    ctx.applyConnectionOverlay([leg], '2026-07-02', boardA, boardB, 'TWY', 'HOT');
+    assert.equal(leg._disruptReason, 'Staff shortage');
+  });
+});

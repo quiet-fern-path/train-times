@@ -30,7 +30,7 @@ different auth models, and different failure-degradation requirements.
 |---|---|
 | `index.html` | App shell. Also contains the inline bootstrap-cache script (see below). |
 | `styles.css` | All styling. Single file, no preprocessor. |
-| `app.js` | All client logic: rendering, overtaking, live overlay, settings, quick (session-only) live routes (see below). |
+| `app.js` | All client logic: rendering, overtaking, live overlay, disruption notices, settings, quick (session-only) live routes (see below). |
 | `add-route.html` / `add-route.js` | In-app route builder / manager (see "In-app route builder" below). Standalone page linked from the settings sheet; commits `routes.json`/`stations.json`/`parked-routes.json` via the GitHub API with the user's own token. |
 | `sw.js` | Service worker — stale-while-revalidate caching. |
 | `routes.json` | Route config: `{id, name, from, to, change, minConnectionMins}`. Edit this to add/change routes — no other code changes needed for a direct route. |
@@ -465,8 +465,17 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-There is currently nothing outstanding in this category — see below for items
-that were checked, including two that turned out to be wrong.
+
+- **Darwin REST shape of `nrccMessages`, `cancelReason` and `delayReason`**
+  (see "Disruption notices" below). Written from the LDBWS schema, not a
+  live disrupted board: `nrccMessages` as an array of `{Value: "<xhtml>"}`,
+  the two reasons as plain strings. `parseNrccMessages()`/`serviceReason()`
+  also accept a bare string, lower-case `value` and (for messages)
+  `xhtmlMessage`, so a casing slip degrades to "no banner", never an error.
+  Check a real payload next time a key is shared in-session.
+
+See below for items that were checked, including two that turned out to be
+wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
@@ -748,6 +757,37 @@ subscription, unverified on this key) and it returns no
 `matchByTime`'s arrival tie-break all depend on — so it isn't a drop-in, and
 it would cost a second call per board to keep those. Worth revisiting only if
 the ladder's floor stops being enough.
+
+## Disruption notices
+
+Two kinds, both read off boards each round already fetches — no extra call:
+
+- **Station notices** (`nrccMessages` on every `GetDepBoardWithDetails`
+  response): engineering works, closures, "disruption between X and Y".
+  Station-wide, not per-destination — `filterCrs` only narrows
+  `trainServices` — so `recordStationMessages()` keys them by CRS in
+  `STATION_MESSAGES`, shared across routes and directions. Each direction
+  shows its origin's notices, plus the change station's on a connection
+  (`disruptionStations()`), in a banner above the list (`#disrupt-out`/
+  `#disrupt-ret`); the tab gets a ⚠ (`.has-disruption`) so a notice on the
+  other direction isn't missed. Today only — they describe now.
+- **Service reasons** (`cancelReason`, `delayReason`): `leg._disruptReason`,
+  shown under the Cancelled/late tag. A delay reason only counts while the
+  train is actually late; on a connection, the cancelled sub-leg's reason
+  wins.
+
+Rules that matter:
+
+- **Rendered as text, never HTML.** Messages are third-party XHTML going into
+  `innerHTML`; tags are stripped, entities decoded, then re-escaped. The only
+  link kept is the first `https://…nationalrail.co.uk/` href. Don't render the
+  raw XHTML "to keep the links".
+- **A failed board keeps the station's last notices** — same no-wipe rule as
+  the leg overlays. A *successful* board with no `nrccMessages` clears them:
+  that is Darwin saying the notice was withdrawn.
+- **Notices older than `LIVE_CACHE_MAX_AGE_MS` (1 h) aren't shown**, and they
+  ride in the live cache (`messages` in `saveLiveCache()`'s payload) so a
+  reload with no signal still shows the warning.
 
 ## "Live" in the status bar means live data reached a card
 

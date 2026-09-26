@@ -61,6 +61,13 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 /* LIST */
 .panel{display:none}.panel.active{display:block}
 .train-list{padding:10px 10px 40px;display:flex;flex-direction:column;gap:5px;max-width:860px;margin:0 auto}
+.disruption{max-width:840px;margin:10px auto 0;padding:9px 12px;background:#fffbeb;border:1px solid #fcd34d;border-left:4px solid #d97706;border-radius:var(--radius);font-size:.78rem;line-height:1.4;color:#78350f}
+#disrupt-out:not(:empty),#disrupt-ret:not(:empty){padding:0 10px}
+.disruption-title{font-weight:700;font-size:.8rem;margin-bottom:3px;color:#92400e}
+.disruption p{margin-top:4px;overflow-wrap:anywhere}
+.disruption a{color:#92400e;font-weight:600}
+.tab.has-disruption::after{content:' \26A0';color:#fbbf24}
+.reason{margin-top:5px;font-size:.7rem;color:#991b1b;line-height:1.35}
 .now-line{display:flex;align-items:center;gap:10px;font-size:.72rem;font-weight:700;color:var(--red);text-transform:uppercase;letter-spacing:.07em;padding:2px 0}
 .now-line::before,.now-line::after{content:'';flex:1;height:1.5px;background:var(--red);opacity:.3}
 
