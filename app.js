@@ -621,6 +621,8 @@ function directCard(leg, route, dir, isToday, curM, faster) {
   // spell it out here the same way connectionCard does.
   const delayTag = isCancelled
     ? `<span class="delay-tag">Cancelled</span>`
+    : leg._delayUnknown
+      ? `<span class="delay-tag">Delayed</span>`
     : leg._delayMins > 0
       ? `<span class="delay-tag">${leg._delayMins} min late</span>`
       : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
@@ -1262,6 +1264,12 @@ function decodeEntities(s) {
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
 }
+// Block-level breaks become a space; inline tags (the <a> most notices end
+// in) vanish outright, or "…the <a>website</a>." reads "website ." on screen.
+function stripTags(html) {
+  return decodeEntities(html.replace(/<(br|p|\/p|div|\/div)\b[^>]*>/gi, ' ').replace(/<[^>]*>/g, ''))
+    .replace(/\s+/g, ' ').trim();
+}
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -1277,7 +1285,7 @@ function parseNrccMessages(board) {
     if (!html) continue;
     const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)].map(x => decodeEntities(x[1]));
     const url = hrefs.find(h => /^https:\/\/(www\.)?nationalrail\.co\.uk\//i.test(h)) || null;
-    const text = decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+    const text = stripTags(html);
     if (text && !out.some(o => o.text === text)) out.push({ text, url });
   }
   return out;
@@ -1316,7 +1324,9 @@ function disruptionFor(route, dir) {
 function disruptionHtml(groups) {
   if (!groups.length) return '';
   const body = groups.map(g => {
-    const name = escapeHtml(STATIONS[g.crs] || g.crs);
+    // A quick route's stations usually aren't in STATIONS; use the national
+    // list if the quick-route sheet has already loaded it this session.
+    const name = escapeHtml(STATIONS[g.crs] || (QUICK_STATIONS && QUICK_STATIONS[g.crs]) || g.crs);
     return g.msgs.map(m => `<p><strong>${name}:</strong> ${escapeHtml(m.text)}${m.url ? ` <a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">More&nbsp;info&nbsp;&rarr;</a>` : ''}</p>`).join('');
   }).join('');
   return `<div class="disruption" role="alert"><div class="disruption-title">&#9888; Disruption notice</div>${body}</div>`;
@@ -1342,7 +1352,7 @@ function renderDisruption(dir, show) {
 function serviceReason(svc, cancelled, delayed) {
   const pick = r => typeof r === 'string' ? r : (r && (r.Value || r.value)) || '';
   const r = cancelled ? pick(svc.cancelReason) : delayed ? pick(svc.delayReason) : '';
-  return r ? decodeEntities(r.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim() || null : null;
+  return r ? stripTags(r) || null : null;
 }
 
 // Build leg-shaped objects directly from a live departure board's own
@@ -1393,7 +1403,8 @@ function synthesizeLiveLegs(board, destCrs) {
       _delayMins: delayMins,
       _liveDepM: depM + delayMins,
       _liveArr: liveArr,
-      _disruptReason: serviceReason(svc, isCancelled, delayMins > 0),
+      _delayUnknown: !isCancelled && svc.etd === 'Delayed',
+      _disruptReason: serviceReason(svc, isCancelled, delayMins > 0 || svc.etd === 'Delayed'),
     });
   }
   return legs;
@@ -1415,7 +1426,7 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_liveDepM', '_liveArr', '_disruptReason'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_delayUnknown', '_liveDepM', '_liveArr', '_disruptReason'];
 const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
@@ -1795,7 +1806,11 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
       leg._delayMins = 0;
     }
     leg._liveDepM = leg.depM + leg._delayMins;
-    leg._disruptReason = serviceReason(svc, leg._cancelled, leg._delayMins > 0);
+    // "Delayed" is Darwin's etd for a train it knows is late but can't yet
+    // estimate — confirmed live (PAD 16:48 GWR, 2026-09-26). _delayMins is 0
+    // then, so without this flag the card said "On time".
+    leg._delayUnknown = !leg._cancelled && svc.etd === 'Delayed';
+    leg._disruptReason = serviceReason(svc, leg._cancelled, leg._delayMins > 0 || leg._delayUnknown);
 
     // Live arrival estimate at the destination, read straight off this same
     // service's subsequentCallingPoints — the board was already fetched
@@ -1872,6 +1887,9 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
           leg._liveDep = s1.etd;
           liveDelay1 = Math.max(0, liveMinute(s1.etd) - leg.depM);
         } else {
+          // "Delayed" (late, no estimate yet) shows as the word itself;
+          // anything else resets a late time left over from an earlier round.
+          leg._liveDep = s1.etd === 'Delayed' ? 'Delayed' : leg.dep;
           liveDelay1 = 0;
         }
         // Real live arrival estimate at the change station, read straight off
@@ -1910,6 +1928,8 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
           liveDep2M = liveMinute(s2.etd);
         } else if (s2.etd === 'On time') {
           leg._liveChangeDep = leg.changeDep;
+        } else if (s2.etd === 'Delayed') {
+          leg._liveChangeDep = 'Delayed';
         }
         // Live arrival estimate at the final destination, read straight off
         // this same service's subsequentCallingPoints — same technique as
@@ -1934,7 +1954,8 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     if (svc1 || svc2) {
       leg._disruptReason = (leg1Cancelled && svc1 && serviceReason(svc1, true, false))
         || (leg2Cancelled && svc2 && serviceReason(svc2, true, false))
-        || (svc1 && serviceReason(svc1, false, liveDelay1 > 0))
+        || (svc1 && serviceReason(svc1, false, liveDelay1 > 0 || svc1.etd === 'Delayed'))
+        || (svc2 && serviceReason(svc2, false, svc2.etd === 'Delayed' || (liveDep2M != null && liveDep2M > leg.changeArrM + leg.changeMins)))
         || null;
     }
     // Prefer the change-station calling point's real live arrival estimate;

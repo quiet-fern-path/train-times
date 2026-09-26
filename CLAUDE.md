@@ -465,20 +465,24 @@ reintroduce a `!isConnection` gate around it.
 
 The sandbox used to build this can't reach `rtt.io` or `raildata.org.uk`,
 so the following are from docs and inference, not tested against live responses.
-
-- **Darwin REST shape of `nrccMessages`, `cancelReason` and `delayReason`**
-  (see "Disruption notices" below). Written from the LDBWS schema, not a
-  live disrupted board: `nrccMessages` as an array of `{Value: "<xhtml>"}`,
-  the two reasons as plain strings. `parseNrccMessages()`/`serviceReason()`
-  also accept a bare string, lower-case `value` and (for messages)
-  `xhtmlMessage`, so a casing slip degrades to "no banner", never an error.
-  Check a real payload next time a key is shared in-session.
-
-See below for items that were checked, including two that turned out to be
-wrong.
+There is currently nothing outstanding in this category — see below for items
+that were checked, including two that turned out to be wrong.
 
 The following were originally unverified assumptions and have since been
 confirmed against the live API:
+
+- **Darwin REST shape of `nrccMessages`, `cancelReason`, `delayReason`** —
+  confirmed live on 2026-09-26 across 12 stations: `nrccMessages` is an
+  array of `{Value: "<xhtml>"}`, present only when a station has notices
+  (absent at PAD/RDG that day, present at CLJ/VIC/LDS/MAN/BHM); both reasons
+  are plain strings. Notices end in an inline `<a>` to
+  `nationalrail.co.uk/service-disruptions/…`.
+- **`etd: "Delayed"` is real** — late, no estimate yet. Seen live on the
+  PAD 16:48 GWR (an `rdg-pad` Return leg), with `et: "Delayed"` on every
+  calling point too. `_delayMins` is 0 then, so `directCard()` used to show
+  a green **"On time"** badge on it — same trap as the cancelled case above.
+  `leg._delayUnknown` now drives a "Delayed" tag, checked before the
+  minutes/on-time branches. Don't drop it.
 
 - **`GetArrBoardWithDetails` at the change station doesn't work — HTTP 500**
   every time it was tried live (`GET .../GetArrBoardWithDetails/TWY?filterCrs=RDG&filterType=from`),

@@ -1753,3 +1753,52 @@ describe('disruption notices — Darwin nrccMessages and service reasons', () =>
     assert.equal(leg._disruptReason, 'Staff shortage');
   });
 });
+
+describe('etd "Delayed" — late with no estimate yet (seen live at PAD, 2026-09-26)', () => {
+  const route = { id: 'r', name: 'R', from: 'RDG', to: 'PAD', change: null };
+  const board = { trainServices: [{ std: '16:48', etd: 'Delayed', operatorCode: 'GW', platform: '8',
+    delayReason: 'This service has been delayed by a fault on this train' }] };
+
+  test('a direct card says Delayed, never On time, and gives the reason', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', uid: 'u', toc: 'GW', dep: '16:48', depM: 1008, arr: '17:11', arrM: 1031 };
+    ctx.applyDirectOverlay([leg], '2026-07-02', board, 'RDG');
+    const html = ctx.directCard(leg, route, 'ret', true, 1000, null);
+    assert.doesNotMatch(html, /On time/);
+    assert.match(html, /delay-tag">Delayed</);
+    assert.match(html, /delayed by a fault on this train/);
+  });
+
+  test('a quick-route leg is flagged the same way', () => {
+    const ctx = loadApp();
+    const b = { trainServices: [{ ...board.trainServices[0],
+      subsequentCallingPoints: [{ callingPoint: [{ crs: 'RDG', st: '17:11', et: 'Delayed' }] }] }] };
+    const [leg] = ctx.synthesizeLiveLegs(b, 'RDG');
+    assert.equal(leg._delayUnknown, true);
+    assert.match(leg._disruptReason, /fault on this train/);
+  });
+
+  test('a connection leg-1 shows Delayed rather than a stale late time', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '10:00', depM: 600, toc1: 'GW', changeArr: '10:08', changeArrM: 608,
+      changeDep: '10:12', changeMins: 4, toc2: 'GW', arr: '10:30', arrM: 630, _liveDep: '10:05' };
+    ctx.applyConnectionOverlay([leg], '2026-07-02',
+      { trainServices: [{ std: '10:00', etd: 'Delayed', operatorCode: 'GW', delayReason: 'Congestion' }] }, null, 'TWY', 'HOT');
+    assert.equal(leg._liveDep, 'Delayed');
+    assert.equal(leg._disruptReason, 'Congestion');
+  });
+
+  test('a connection leg-1 back on time drops the late time from an earlier round', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '10:00', depM: 600, toc1: 'GW', changeArrM: 608, changeMins: 4, _liveDep: '10:05' };
+    ctx.applyConnectionOverlay([leg], '2026-07-02', { trainServices: [{ std: '10:00', etd: 'On time', operatorCode: 'GW' }] }, null, 'TWY', 'HOT');
+    assert.equal(leg._liveDep, '10:00');
+  });
+});
+
+test('parseNrccMessages handles a real notice (Leeds board, 2026-09-26)', () => {
+  const ctx = loadApp();
+  const [m] = plain(ctx.parseNrccMessages({ nrccMessages: [{ Value: 'Trains between Shipley and Skipton may be cancelled or delayed by up to 30 minutes. More details can be found in the Disruptions area of the <a href="https://www.nationalrail.co.uk/service-disruptions/skipton-20260926/">National Rail website.</a>' }] }));
+  assert.equal(m.text, 'Trains between Shipley and Skipton may be cancelled or delayed by up to 30 minutes. More details can be found in the Disruptions area of the National Rail website.');
+  assert.equal(m.url, 'https://www.nationalrail.co.uk/service-disruptions/skipton-20260926/');
+});
