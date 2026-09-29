@@ -656,6 +656,22 @@ most important thing this app can tell someone, and the unfiltered path picks
 it up. Treat that as a reason to prefer client-side narrowing, not drift to
 be corrected.
 
+**The "no usable call at the destination" guess was wrong, and it shipped as
+a real bug.** Confirmed live on 2026-09-29: the 07:42 Bristol→Paddington was
+cancelled *at Reading* (`etd: "Cancelled"`, `isCancelled: true`) but still
+ran to Paddington (PAD calling point `et: "08:25"`, not cancelled). It was on
+the unfiltered RDG board and **missing** from `RDG?filterCrs=PAD`, while the
+08:42, cancelled throughout, was on both. So the app showed the 07:42 as a
+normal train with a planned platform. The filter's rule is still unknown; the
+fix doesn't depend on it. `addFilterDropped()` tops up every successful
+*server-filtered* rung with one unfiltered board (narrowed client-side,
+deduplicated by `serviceID`), adding only what the filter dropped. It tries
+only the unfiltered rungs *below* the winning one, so a board already clamped
+by the ceiling doesn't re-spend a call at a size known to 500, and it's best
+effort — a failed top-up returns the filtered board unchanged. Steady state
+is two calls per board per minute. Don't remove it to save a call: the
+unfiltered board is the only request that sees these cancellations.
+
 Two rules keep the mixed ladder honest:
 
 - **An empty *server-filtered* board is accepted as definitive** — Darwin

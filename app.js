@@ -1031,8 +1031,9 @@ function apiKey() { return localStorage.getItem('darwinApiKey') || ''; }
 // `etd: "Cancelled"` and every calling point cancelled (stable over three
 // runs; partially-cancelled services survive the filter, so the rule looks
 // like "no usable call left at the destination" — mechanism inferred, not
-// documented). A wholly cancelled train is the single most important thing
-// this app can tell someone, so picking it up is a straight gain, not drift.
+// documented, and since shown wrong: see addFilterDropped()). A cancelled
+// train is the single most important thing this app can tell someone, so
+// picking it up is a straight gain, not drift.
 //
 // Which kind wins depends on how much of the station's traffic goes your way
 // — measured yields: PAD→RDG 36%, KGX→CBG 35%, RDG→PAD 29%, PAD→MAI 16%,
@@ -1105,7 +1106,7 @@ async function fetchBoard(crs, filterCrs, filterType) {
         // empty result is a definitive answer ("nothing more today"), not a
         // reason to keep spending calls.
         boardRowsHint[hintKey] = { idx, at: Date.now() };
-        return board;
+        return filterCrs ? addFilterDropped(board, crs, filterCrs, filterType, key, idx + 1) : board;
       }
       const narrowed = filterBoardTo(board, filterCrs);
       if ((narrowed.trainServices || []).length) {
@@ -1134,6 +1135,35 @@ async function fetchBoard(crs, filterCrs, filterType) {
   // back up to a full-size request once the station quietens down.
   boardRowsHint[hintKey] = { idx: BOARD_LADDER.length - 1, at: Date.now() };
   return emptyFallback;
+}
+
+// Darwin's server-side filter drops some cancelled services outright, and
+// not only wholly cancelled ones. Confirmed live on 2026-09-29: the 07:42
+// Bristol→Paddington, cancelled *at Reading* (`etd: "Cancelled"`,
+// `isCancelled: true`) but still running to Paddington (PAD calling point
+// `et: "08:25"`, not cancelled), was on the unfiltered RDG board and missing
+// from `RDG?filterCrs=PAD` — while the 08:42, cancelled throughout, was on
+// both. So the app showed the 07:42 as a normal train. A cancellation is the
+// most important thing this app can show, so a server-filtered board is
+// topped up from an unfiltered one (the cheap, bounded request), narrowed
+// client-side, adding only services the filtered board lacks. Best effort:
+// if the top-up fails, the filtered board is returned as it was. It only
+// tries unfiltered rungs below the one that won, so a board already clamped
+// by the ceiling doesn't re-spend a call on a size known to 500.
+async function addFilterDropped(board, crs, filterCrs, filterType, key, fromIdx) {
+  const have = new Set((board.trainServices || []).map((s) => s.serviceID).filter(Boolean));
+  for (const rung of BOARD_LADDER.slice(fromIdx)) {
+    if (rung.serverFilter) continue;
+    const { board: extra, retryable } = await fetchBoardOnce(crs, null, filterType, rung.rows, key);
+    if (extra) {
+      const missing = (filterBoardTo(extra, filterCrs).trainServices || [])
+        .filter((s) => s.serviceID && !have.has(s.serviceID));
+      if (!missing.length) return board;
+      return Object.assign({}, board, { trainServices: (board.trainServices || []).concat(missing) });
+    }
+    if (!retryable) break;
+  }
+  return board;
 }
 
 function fetchBoardUrl(crs, filterCrs, filterType, numRows) {

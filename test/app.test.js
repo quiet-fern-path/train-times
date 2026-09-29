@@ -1082,15 +1082,16 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
     assert.notEqual(board, null, 'a smaller board should have been fetched');
     assert.equal(board.numRows, 8);
-    // filtered 20 fails, unfiltered 25 fails, filtered 8 fits
-    assert.deepEqual(calls, [20, -25, 8]);
+    // filtered 20 fails, unfiltered 25 fails, filtered 8 fits, then the
+    // unfiltered top-up tries only the size below 25 (see addFilterDropped)
+    assert.deepEqual(calls, [20, -25, 8, -12]);
   });
 
-  test('a board that fits first time makes exactly one call', async () => {
+  test('a board that fits first time makes one call, plus one unfiltered top-up', async () => {
     const ctx = loadApp();
     const calls = stubDarwin(ctx, { maxRows: 100 });
     await ctx.fetchBoard('RDG', 'PAD', 'to');
-    assert.deepEqual(calls, [20]);
+    assert.deepEqual(calls, [20, -25]);
   });
 
   test('the working rung is remembered, so the next poll does not replay the ladder', async () => {
@@ -1099,7 +1100,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     await ctx.fetchBoard('PAD', 'RDG', 'to');
     calls.length = 0;
     await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.deepEqual(calls, [8], 'should start straight at the rung that worked');
+    assert.deepEqual(calls, [8, -12], 'should start straight at the rung that worked');
   });
 
   test('the remembered rung is per board, not global', async () => {
@@ -1119,7 +1120,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     await ctx.fetchBoard('PAD', 'RDG', 'to');
     calls.length = 0;
     await ctx.fetchBoard('RDG', 'PAD', 'to');
-    assert.deepEqual(calls, [['RDG', 20]], 'a different board starts from a full-size request');
+    assert.deepEqual(calls, [['RDG', 20], ['RDG', 25]], 'a different board starts from a full-size request');
   });
 
   test('a 4xx is not retried smaller — shrinking a request we got wrong just burns rate limit', async () => {
@@ -1163,7 +1164,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     assert.equal(await ctx.fetchBoard('PAD', 'RDG', 'to'), null);
     const calls = stubDarwin(ctx, { maxRows: 100 });
     await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.deepEqual(calls, [20]);
+    assert.deepEqual(calls, [20, -25]);
   });
 
   test('no API key means no request at all', async () => {
@@ -1185,7 +1186,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: [svcToRdg('19:00')] }) });
     };
     await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.deepEqual(urls.map((u) => /filterCrs=RDG/.test(u)), [true, false, true]);
+    assert.deepEqual(urls.map((u) => /filterCrs=RDG/.test(u)), [true, false, true, false]);
     urls.forEach((u) => assert.match(u, /GetDepBoardWithDetails\/PAD/));
     urls.filter((u) => /filterCrs/.test(u)).forEach((u) => assert.match(u, /filterType=to/));
   });
@@ -1230,7 +1231,7 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: filtered ? [svcToRdg('20:30')] : [elsewhere] }) });
     };
     const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
-    assert.deepEqual(calls, [20, -25, 8]);
+    assert.deepEqual(calls, [20, -25, 8, -12]);
     assert.deepEqual(board.trainServices.map((s) => s.std), ['20:30']);
   });
 
@@ -1242,7 +1243,64 @@ describe('fetchBoard() — steps down to a smaller board when Darwin 500s on a b
     const calls = stubDarwin(ctx, { maxRows: 100, services: [] });
     const board = await ctx.fetchBoard('PAD', 'RDG', 'to');
     assert.deepEqual(board.trainServices, []);
-    assert.deepEqual(calls, [20]);
+    assert.deepEqual(calls, [20, -25]);
+  });
+
+  // Confirmed live 2026-09-29: the 07:42 RDG->PAD, cancelled at Reading but
+  // still running to Paddington, was on the unfiltered RDG board and missing
+  // from RDG?filterCrs=PAD, so the app showed it as a normal train.
+  describe('a server-filtered board is topped up with services the filter dropped', () => {
+    const svc = (id, std, etd, pad = { st: '08:09', et: 'On time' }) => ({
+      serviceID: id, std, etd, isCancelled: etd === 'Cancelled',
+      subsequentCallingPoints: [{ callingPoint: [Object.assign({ crs: 'PAD' }, pad)] }],
+    });
+    const elsewhere = { serviceID: 'x', std: '07:38', etd: 'On time', subsequentCallingPoints: [{ callingPoint: [{ crs: 'BSK', st: '07:50' }] }] };
+
+    function stub(ctx, { filtered, unfiltered, unfilteredStatus = 200 }) {
+      ctx.localStorage.setItem('darwinApiKey', 'test-key');
+      ctx.fetch = (url) => {
+        const isFiltered = !!new ctx.URL(url).searchParams.get('filterCrs');
+        if (!isFiltered && unfilteredStatus !== 200) {
+          return Promise.resolve({ ok: false, status: unfilteredStatus, statusText: '', text: () => Promise.resolve('') });
+        }
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ trainServices: isFiltered ? filtered : unfiltered }) });
+      };
+    }
+
+    test('a cancelled service missing from the filtered board is added', async () => {
+      const ctx = loadApp();
+      const a = svc('a', '07:35', 'On time');
+      const dropped = svc('b', '07:42', 'Cancelled', { st: '08:09', et: '08:25' });
+      stub(ctx, { filtered: [a], unfiltered: [a, elsewhere, dropped] });
+      const board = await ctx.fetchBoard('RDG', 'PAD', 'to');
+      assert.deepEqual(board.trainServices.map((s) => `${s.std} ${s.etd}`), ['07:35 On time', '07:42 Cancelled']);
+    });
+
+    test('services already on the filtered board are not duplicated', async () => {
+      const ctx = loadApp();
+      const a = svc('a', '07:35', 'On time');
+      stub(ctx, { filtered: [a], unfiltered: [a, elsewhere] });
+      const board = await ctx.fetchBoard('RDG', 'PAD', 'to');
+      assert.deepEqual(board.trainServices.map((s) => s.serviceID), ['a']);
+    });
+
+    test('a failed top-up leaves the filtered board as it was', async () => {
+      const ctx = loadApp();
+      const a = svc('a', '07:35', 'On time');
+      stub(ctx, { filtered: [a], unfiltered: [], unfilteredStatus: 500 });
+      const board = await ctx.fetchBoard('RDG', 'PAD', 'to');
+      assert.deepEqual(board.trainServices.map((s) => s.serviceID), ['a']);
+    });
+
+    test('the added service reaches the leg as Cancelled', async () => {
+      const ctx = loadApp();
+      const dropped = svc('b', '07:42', 'Cancelled', { st: '08:09', et: '08:25' });
+      stub(ctx, { filtered: [], unfiltered: [dropped] });
+      const board = await ctx.fetchBoard('RDG', 'PAD', 'to');
+      const legs = [{ date: '2026-09-29', dep: '07:42', depM: 462, arr: '08:09', arrM: 489, toc: 'GW' }];
+      ctx.applyDirectOverlay(legs, '2026-09-29', board, 'PAD');
+      assert.equal(legs[0]._cancelled, true);
+    });
   });
 });
 
