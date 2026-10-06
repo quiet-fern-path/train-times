@@ -788,9 +788,13 @@ Two kinds, both read off boards each round already fetches — no extra call:
   `trainServices` — so `recordStationMessages()` keys them by CRS in
   `STATION_MESSAGES`, shared across routes and directions. Each direction
   shows its origin's notices, plus the change station's on a connection
-  (`disruptionStations()`), in a banner above the list (`#disrupt-out`/
-  `#disrupt-ret`); the tab gets a ⚠ (`.has-disruption`) so a notice on the
-  other direction isn't missed. Today only — they describe now.
+  (`disruptionStations()`), in a banner `renderLegList()` places just above
+  the Now divider; the tab gets a ⚠ (`.has-disruption`) so a notice on the
+  other direction isn't missed. Today only — they describe now. The banner
+  used to sit above the whole list, and `scrollToNextIfToday()`'s jump past
+  departed trains hid it on every load — a real complaint: the details were
+  only found by scrolling to the top. `scrollToNext()` now lands on the
+  banner when there is one. Don't move it back above the list.
 - **Service reasons** (`cancelReason`, `delayReason`): `leg._disruptReason`,
   shown under the Cancelled/late tag. A delay reason only counts while the
   train is actually late; on a connection, the cancelled sub-leg's reason

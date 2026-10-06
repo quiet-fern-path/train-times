@@ -756,8 +756,13 @@ function noMoreTrainsLabel(hm, route) {
 // _cancelled/_next-compatible fields (which both synthesizeLiveLegs and
 // schedule.json legs do).
 function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml) {
+  // Disruption notices sit beside the Now divider, not above the whole list:
+  // scrollToNextIfToday() jumps past departed trains, so a banner at the top
+  // was scrolled out of view on every load and only found by scrolling back.
+  const route = currentRoute();
+  const notice = isToday && route ? disruptionHtml(disruptionFor(route, dir)) : '';
   if (!legs.length) {
-    listEl.innerHTML = emptyHtml;
+    listEl.innerHTML = notice + emptyHtml;
     return;
   }
 
@@ -814,7 +819,6 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
       slowerCount > 0 ? `· ${slowerCount} slower train${slowerCount === 1 ? '' : 's'} dimmed` : '';
   }
 
-  const route = currentRoute();
   const parts = [];
   const card = leg => cardBuilder(leg, route, dir, isToday, curM, fasterMap.get(leg));
   if (isToday) {
@@ -826,6 +830,7 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
     const past = visible.filter(l => effDepM(l) < curM);
     const future = visible.filter(l => effDepM(l) >= curM);
     past.forEach(leg => parts.push(card(leg)));
+    if (notice) parts.push(notice);
     const hm = londonHm();
     parts.push(future.length ? `<div class="now-line">Now ${hm}</div>` : `<div class="now-line">${noMoreTrainsLabel(hm, route)}</div>`);
     future.forEach(leg => parts.push(card(leg)));
@@ -968,7 +973,9 @@ function tickMinute() {
 }
 
 function scrollToNext(panelEl) {
-  const target = panelEl.querySelector('.is-next') || panelEl.querySelector('.now-line');
+  // A disruption notice sits just above the Now divider; land on it so it's
+  // read before the next train, rather than left just off the top.
+  const target = panelEl.querySelector('.disruption') || panelEl.querySelector('.is-next') || panelEl.querySelector('.now-line');
   if (!target) return;
   setTimeout(() => {
     const hh = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--header-h')) || 128;
@@ -1362,14 +1369,12 @@ function disruptionHtml(groups) {
   return `<div class="disruption" role="alert"><div class="disruption-title">&#9888; Disruption notice</div>${body}</div>`;
 }
 
-// Fills a direction's banner and flags its tab, so a notice on the other
-// direction isn't missed. Only for today's live view — notices describe now,
-// not a date being browsed ahead.
+// Flags a direction's tab, so a notice on the other direction isn't missed.
+// The notice itself is drawn by renderLegList(), beside the Now divider. Only
+// for today's live view — notices describe now, not a date being browsed ahead.
 function renderDisruption(dir, show) {
   const route = currentRoute();
   const groups = show && route ? disruptionFor(route, dir) : [];
-  const el = document.getElementById('disrupt-' + dir);
-  if (el) el.innerHTML = disruptionHtml(groups);
   const tab = document.getElementById('tab-' + dir);
   if (tab) tab.classList.toggle('has-disruption', groups.length > 0);
 }

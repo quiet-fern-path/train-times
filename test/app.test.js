@@ -1764,10 +1764,28 @@ describe('disruption notices — Darwin nrccMessages and service reasons', () =>
       return Promise.resolve({ ok: true, status: 200, json: async () => board });
     };
     await vm.runInContext('refreshLiveOverlay()', ctx);
-    assert.match(ctx.__elements.get('disrupt-out').innerHTML, /Disruption between Reading and London Paddington/);
-    assert.equal(ctx.__elements.get('disrupt-ret').innerHTML, '');
+    assert.match(ctx.__elements.get('list-out').innerHTML, /Disruption between Reading and London Paddington/);
+    assert.doesNotMatch(ctx.__elements.get('list-ret').innerHTML, /class="disruption"/);
     assert.ok(ctx.__elements.get('tab-out').classList.contains('has-disruption'));
     assert.ok(!ctx.__elements.get('tab-ret').classList.contains('has-disruption'));
+  });
+
+  test('the notice sits just above the Now divider, where the page scrolls to', () => {
+    const ctx = loadApp();
+    const today = vm.runInContext('todayStr()', ctx);
+    const curM = vm.runInContext('nowM()', ctx);
+    setUpLiveRound(ctx, { routes: [route], activeId: 'r', schedule: { routes: {
+      r: { out: [
+        { date: today, uid: 'past', dep: '-', depM: curM - 30, arr: '-', arrM: curM - 5 },
+        { date: today, uid: 'next', dep: '-', depM: curM + 30, arr: '-', arrM: curM + 55 },
+      ], ret: [] },
+    } } });
+    ctx.recordStationMessages('RDG', { nrccMessages: [{ Value: 'Line closed' }] });
+    vm.runInContext("renderDirection('out')", ctx);
+    const html = ctx.__elements.get('list-out').innerHTML;
+    const notice = html.indexOf('class="disruption"');
+    assert.ok(notice > html.indexOf('train-card'), 'below departed trains');
+    assert.ok(notice < html.indexOf('now-line'), 'above the Now divider');
   });
 
   test('notices survive a reload through the live cache', async () => {
