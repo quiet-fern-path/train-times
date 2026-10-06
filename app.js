@@ -575,6 +575,7 @@ function renderRoutePicker() {
       activeRouteId = btn.dataset.route;
       persistState();
       render();
+      revealActiveChip();
       scrollToNextIfToday();
       requestAutoDir();
     });
@@ -584,9 +585,42 @@ function renderRoutePicker() {
   });
 }
 
+// The active chip is the on-screen title (no separate title row), so the name
+// only goes to the tab title. #route-title stays for the load-failure message.
 function updateRouteTitle() {
   const r = currentRoute();
-  document.getElementById('route-title').textContent = r ? r.name : '';
+  document.getElementById('route-title').textContent = '';
+  document.title = r ? `${r.name} · Train Times` : 'Train Times';
+}
+
+// Brings the active chip into view in the sideways-scrolling route row — on
+// load or after a hash change it can otherwise be off to the right, and the
+// row is the only place the route's name is shown.
+function revealActiveChip() {
+  const scroller = document.getElementById('route-scroller');
+  const chip = scroller && scroller.querySelector('.route-chip.active');
+  if (!chip || !scroller.clientWidth) return;
+  const left = chip.offsetLeft - scroller.offsetLeft;
+  const right = left + chip.offsetWidth;
+  if (left < scroller.scrollLeft || right > scroller.scrollLeft + scroller.clientWidth - 18) {
+    scroller.scrollLeft = Math.max(0, left - 8);
+  }
+}
+
+// "Today", "Tomorrow", "Yesterday" or "Thu 8 Oct" for the compact date pill.
+function dateLabel(dateStr) {
+  const today = todayStr();
+  if (dateStr === today) return 'Today';
+  if (dateStr === addDays(today, 1)) return 'Tomorrow';
+  if (dateStr === addDays(today, -1)) return 'Yesterday';
+  return new Date(dateStr + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+}
+function updateDateLabel() {
+  const dateStr = document.getElementById('vdate').value || todayStr();
+  const label = document.getElementById('date-label');
+  if (label) label.textContent = dateLabel(dateStr);
+  const pill = label && label.parentElement;
+  if (pill && pill.classList) pill.classList.toggle('not-today', dateStr !== todayStr());
 }
 
 // ── Card builders ───────────────────────────────────────────────────
@@ -760,9 +794,11 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
   // scrollToNextIfToday() jumps past departed trains, so a banner at the top
   // was scrolled out of view on every load and only found by scrolling back.
   const route = currentRoute();
-  const notice = isToday && route ? disruptionHtml(disruptionFor(route, dir)) : '';
+  const notice = isToday && route ? disruptionHtml(disruptionFor(route, dir), dir) : '';
   if (!legs.length) {
     listEl.innerHTML = notice + emptyHtml;
+    // Otherwise the previous route's count lingers in the status bar.
+    if (dir === activeDir) document.getElementById('slower-count').textContent = '';
     return;
   }
 
@@ -816,7 +852,7 @@ function renderLegList(listEl, legs, dir, isToday, curM, cardBuilder, emptyHtml)
 
   if (dir === activeDir) {
     document.getElementById('slower-count').textContent =
-      slowerCount > 0 ? `· ${slowerCount} slower train${slowerCount === 1 ? '' : 's'} dimmed` : '';
+      slowerCount > 0 ? `${slowerCount} slower dimmed` : '';
   }
 
   const parts = [];
@@ -914,6 +950,7 @@ function render() {
   if (dateNav) dateNav.style.display = isLiveOnly ? 'none' : 'flex';
   renderRoutePicker();
   updateRouteTitle();
+  updateDateLabel();
   renderDirection('out');
   renderDirection('ret');
   // schedule.json's generation time is meaningless for a quick route (it has
@@ -926,8 +963,11 @@ function scheduleAgeLabel() {
   if (!SCHEDULE.generated_at) return '';
   const gen = new Date(SCHEDULE.generated_at);
   const days = Math.floor((Date.now() - gen.getTime()) / 86400000);
-  if (SCHEDULE.is_seed_placeholder) return ' · seed data, run the Action for real schedules';
-  return ` · schedule updated ${days === 0 ? 'today' : days + 'd ago'}`;
+  if (SCHEDULE.is_seed_placeholder) return 'seed data';
+  // refresh-platforms.yml rewrites the file daily, so a fresh schedule is the
+  // normal case and not worth status-bar room. Only flag one that's stopped
+  // updating.
+  return days >= 2 ? `schedule ${days}d old` : '';
 }
 
 // ── NOW button & live tick ──────────────────────────────────────────
@@ -978,9 +1018,10 @@ function scrollToNext(panelEl) {
   const target = panelEl.querySelector('.disruption') || panelEl.querySelector('.is-next') || panelEl.querySelector('.now-line');
   if (!target) return;
   setTimeout(() => {
-    const hh = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--header-h')) || 128;
-    const th = document.querySelector('.tab-bar').offsetHeight || 48;
-    const y = target.getBoundingClientRect().top + window.scrollY - hh - th - 12;
+    // Everything sticky (routes, tabs, date, status) lives in the header now,
+    // so its height is the whole offset.
+    const hh = hdr.offsetHeight || 140;
+    const y = target.getBoundingClientRect().top + window.scrollY - hh - 8;
     window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
   }, 150);
 }
@@ -1358,15 +1399,24 @@ function disruptionFor(route, dir) {
   return groups;
 }
 
-function disruptionHtml(groups) {
+// Collapsed by default to a heading plus the first notice clamped to two
+// lines (see .disruption in styles.css), so three notices take the same room
+// as one. The heading toggles it; the choice is kept per direction in
+// DISRUPTION_OPEN, since every minute's re-render rebuilds the banner.
+const DISRUPTION_OPEN = { out: false, ret: false };
+function disruptionHtml(groups, dir) {
   if (!groups.length) return '';
+  const open = !!(dir && DISRUPTION_OPEN[dir]);
+  const count = groups.reduce((n, g) => n + g.msgs.length, 0);
   const body = groups.map(g => {
     // A quick route's stations usually aren't in STATIONS; use the national
     // list if the quick-route sheet has already loaded it this session.
     const name = escapeHtml(STATIONS[g.crs] || (QUICK_STATIONS && QUICK_STATIONS[g.crs]) || g.crs);
-    return g.msgs.map(m => `<p><strong>${name}:</strong> ${escapeHtml(m.text)}${m.url ? ` <a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">More&nbsp;info&nbsp;&rarr;</a>` : ''}</p>`).join('');
+    return g.msgs.map(m => `<p><strong>${name}:</strong> ${escapeHtml(m.text)}${m.url ? ` <a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">Details&nbsp;&rarr;</a>` : ''}</p>`).join('');
   }).join('');
-  return `<div class="disruption" role="alert"><div class="disruption-title">&#9888; Disruption notice</div>${body}</div>`;
+  const title = count > 1 ? `${count} disruption notices` : 'Disruption notice';
+  const more = open ? 'Less &#9652;' : (count > 1 ? `+${count - 1} more &#9662;` : 'More &#9662;');
+  return `<div class="disruption${open ? ' open' : ''}" role="alert"><button class="disruption-head" data-disrupt-dir="${dir || ''}" aria-expanded="${open}">&#9888; ${title}<span class="disruption-more">${more}</span></button>${body}</div>`;
 }
 
 // Flags a direction's tab, so a notice on the other direction isn't missed.
@@ -1572,7 +1622,7 @@ function restoreLiveCacheForRoute(route) {
 function staleLiveLabel(routeId) {
   const at = lastLiveSuccessAt[routeId];
   const age = at != null ? formatAge(Date.now() - at) : '';
-  return `Showing last known live data (offline${age ? ', ' + age : ''})`;
+  return `Offline · last live data${age ? ' ' + age : ''}`;
 }
 
 // Drives both the detailed status-bar dot/label and the quiet header strip
@@ -1583,6 +1633,7 @@ function setLiveStatus(state, text) {
   const label = document.getElementById('live-label');
   dot.className = 'live-dot' + (state !== 'off' ? ' ' + state : '');
   label.textContent = text;
+  label.title = text; // the one-line bar may truncate it
   hdr.classList.remove('live-on', 'live-stale', 'live-error');
   if (state !== 'off') hdr.classList.add('live-' + state);
   // No key saved: the whole status bar doubles as a shortcut to Settings
@@ -1652,13 +1703,13 @@ async function refreshLiveOverlay() {
     // routes), so it needs a distinct message rather than "scheduled times
     // only", which would wrongly imply it has scheduled times to fall back to.
     setLiveStatus('off', route.liveOnly
-      ? 'This route needs your Darwin key to show anything — tap ⚙'
-      : 'Scheduled times only — tap ⚙ for live platforms & delays');
+      ? 'Needs a Darwin key — tap here'
+      : 'Scheduled times · tap for live data');
     return;
   }
 
   if (!route.liveOnly && dateStr !== todayStr()) {
-    setLiveStatus('off', 'Scheduled times (live only available for today)');
+    setLiveStatus('off', 'Scheduled times · live is today only');
     return;
   }
 
@@ -1707,19 +1758,19 @@ async function refreshLiveOverlay() {
     // Distinct from a generic/transient failure: Darwin rejected the key
     // itself, so retrying on its own won't help — the visitor needs to fix
     // the key in Settings.
-    setLiveStatus('error', 'Invalid API key — check Settings ⚙');
+    setLiveStatus('error', 'Invalid API key — tap ⚙');
   } else if (gotSomething) {
     // Some boards landed and some didn't. The trains the working board(s)
     // covered really are live; the rest are sitting on scheduled times. Say
     // so rather than showing green — a whole direction can be dead in this
     // state (see fetchBoard's size-ceiling note), and green claiming
     // otherwise is exactly the failure that made this unreportable.
-    setLiveStatus('stale', 'Live data incomplete — some trains not updating (tap ⚠)');
+    setLiveStatus('stale', 'Live data incomplete — tap ⚠');
   } else if (outcome.boardsOk > 0 && hasUpcomingLegs(route, dateStr)) {
     // Every board came back, none of them matched a train that hasn't left
     // yet. Not a network problem — a matching one (see matchByTime), and
     // still not something to paint green.
-    setLiveStatus('stale', 'Live data fetched but matched no trains (tap ⚠)');
+    setLiveStatus('stale', 'Live data matched no trains — tap ⚠');
   } else if (outcome.boardsOk > 0) {
     // Boards fine, nothing left to overlay today — the normal state after
     // the last train, not a fault.
@@ -1729,7 +1780,7 @@ async function refreshLiveOverlay() {
   } else {
     // A quick route has no scheduled-time fallback to mention — unlike a
     // curated route, there was never anything else to show.
-    setLiveStatus('error', route.liveOnly ? 'No live data yet — check your connection' : 'Scheduled times (live update failed)');
+    setLiveStatus('error', route.liveOnly ? 'No live data yet — check your connection' : 'Live update failed · scheduled times');
   }
 
   // Built whenever anything went wrong, not only on total failure — a
@@ -2209,6 +2260,17 @@ document.getElementById('btn-settings').addEventListener('click', openSettings);
 // the small gear icon.
 document.getElementById('status-bar').addEventListener('click', () => {
   if (!apiKey()) openSettings();
+  else if (lastLiveErrorReport) openErrorReport();
+});
+// Disruption banner heading: expand/collapse. Delegated, because the banner
+// is rebuilt by every render.
+['out', 'ret'].forEach(dir => {
+  document.getElementById('list-' + dir).addEventListener('click', e => {
+    const head = e.target && e.target.closest && e.target.closest('.disruption-head');
+    if (!head) return;
+    DISRUPTION_OPEN[dir] = !DISRUPTION_OPEN[dir];
+    renderDirection(dir);
+  });
 });
 document.getElementById('btn-settings-close').addEventListener('click', () => {
   document.getElementById('settings-overlay').classList.remove('open');
@@ -2222,9 +2284,13 @@ document.getElementById('btn-settings-save').addEventListener('click', () => {
 });
 
 // ── Live data error panel ────────────────────────────────────────────
-document.getElementById('btn-live-error').addEventListener('click', () => {
+function openErrorReport() {
   document.getElementById('error-details-text').value = lastLiveErrorReport || '(no details captured)';
   document.getElementById('error-overlay').classList.add('open');
+}
+document.getElementById('btn-live-error').addEventListener('click', (e) => {
+  if (e && e.stopPropagation) e.stopPropagation(); // it sits inside the status bar
+  openErrorReport();
 });
 document.getElementById('btn-error-close').addEventListener('click', () => {
   document.getElementById('error-overlay').classList.remove('open');
@@ -2253,6 +2319,10 @@ function onDateNavChange() {
   scrollToNextIfToday();
 }
 inp.addEventListener('change', onDateNavChange);
+// The input is laid invisibly over the date pill, so a tap already lands on
+// it; showPicker() makes desktop Chromium open the calendar too, where a
+// click on the field's text would otherwise only focus it.
+inp.addEventListener('click', () => { try { if (inp.showPicker) inp.showPicker(); } catch (e) { /* already open, or unsupported */ } });
 document.getElementById('btn-prev-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), -1); onDateNavChange(); });
 document.getElementById('btn-next-day').addEventListener('click', () => { inp.value = addDays(inp.value || todayStr(), 1); onDateNavChange(); });
 // "Now" always means now, regardless of which date is currently being
@@ -2294,6 +2364,7 @@ window.addEventListener('online', () => refreshLiveOverlay());
   new ResizeObserver(setHH).observe(hdr);
   setHH();
   render();
+  revealActiveChip();
   scheduleNextMinute();
 
   // A saved scroll position means this is a reload of the same tab/session —

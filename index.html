@@ -12,32 +12,34 @@
 
 <header class="site-header" id="hdr">
   <div class="hrow">
-    <div class="route-title" id="route-title">Loading…</div>
-    <button id="btn-live-error" class="icon-btn live-error-btn" title="Live data error — tap for details" style="display:none">&#9888;</button>
-    <button id="chip-add-quick" class="icon-btn" title="Add a quick live route — this session only, no commit">+</button>
-    <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
+    <div class="route-scroller" id="route-scroller">
+      <div class="route-picker" id="route-picker"></div>
+      <button id="chip-add-quick" class="route-chip route-chip-add" title="Add a quick live route — this session only, no commit">+</button>
+    </div>
     <button id="btn-now" class="icon-btn btn-now" title="Jump to current time">Now</button>
+    <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
   </div>
-  <div class="route-picker" id="route-picker"></div>
-  <div class="date-nav" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-    <button class="icon-btn" id="btn-prev-day">&#8592;</button>
-    <input type="date" id="vdate" style="font-size:16px;padding:4px 8px;border:1px solid rgba(255,255,255,.18);border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-family:inherit;color-scheme:dark;flex:1;min-width:0">
-    <button class="icon-btn" id="btn-next-day">&#8594;</button>
+  <div class="route-title" id="route-title"></div>
+  <div class="nav-row">
+    <div class="tab-bar" role="tablist">
+      <button class="tab active" role="tab" aria-selected="true" id="tab-out" data-dir="out">Outward</button>
+      <button class="tab" role="tab" aria-selected="false" id="tab-ret" data-dir="ret">Return</button>
+    </div>
+    <div class="date-nav">
+      <button class="date-step" id="btn-prev-day" title="Previous day">&#8249;</button>
+      <label class="date-pill"><span id="date-label">Today</span><input type="date" id="vdate" aria-label="Date"></label>
+      <button class="date-step" id="btn-next-day" title="Next day">&#8250;</button>
+    </div>
   </div>
-</header>
-
-<div class="tab-bar" role="tablist">
-  <button class="tab active" role="tab" aria-selected="true" id="tab-out" data-dir="out">Outward</button>
-  <button class="tab" role="tab" aria-selected="false" id="tab-ret" data-dir="ret">Return</button>
-</div>
-
-<main>
   <div class="status-bar" id="status-bar">
     <span class="live-dot" id="live-dot"></span>
     <span id="live-label">Scheduled times</span>
-    <span id="slower-count"></span>
-    <span id="schedule-age"></span>
+    <span class="status-meta"><span id="slower-count"></span><span id="schedule-age"></span></span>
+    <button id="btn-live-error" class="live-error-btn" title="Live data error — tap for details" style="display:none">&#9888;</button>
   </div>
+</header>
+
+<main>
   <div class="panel active" id="panel-out"><div class="train-list" id="list-out"></div></div>
   <div class="panel" id="panel-ret"><div class="train-list" id="list-ret"></div></div>
 </main>

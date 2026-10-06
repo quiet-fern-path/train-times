@@ -1788,6 +1788,27 @@ describe('disruption notices — Darwin nrccMessages and service reasons', () =>
     assert.ok(notice < html.indexOf('now-line'), 'above the Now divider');
   });
 
+  test('the banner collapses to one heading however many notices there are', () => {
+    const ctx = loadApp();
+    const groups = [{ crs: 'RDG', msgs: [{ text: 'One', url: null }, { text: 'Two', url: null }, { text: 'Three', url: null }] }];
+    const closed = ctx.disruptionHtml(groups, 'out');
+    assert.match(closed, /3 disruption notices/);
+    assert.match(closed, /\+2 more/);
+    assert.doesNotMatch(closed, /class="disruption open"/);
+    ctx.__elements.get('list-out')._trigger('click', { target: { closest: () => ({}) } });
+    assert.match(ctx.disruptionHtml(groups, 'out'), /class="disruption open"/);
+    assert.doesNotMatch(ctx.disruptionHtml(groups, 'ret'), /class="disruption open"/, 'each direction keeps its own state');
+  });
+
+  test('dateLabel names nearby days and abbreviates the rest', () => {
+    const ctx = loadApp();
+    const today = vm.runInContext('todayStr()', ctx);
+    assert.equal(ctx.dateLabel(today), 'Today');
+    assert.equal(ctx.dateLabel(ctx.addDays(today, 1)), 'Tomorrow');
+    assert.equal(ctx.dateLabel(ctx.addDays(today, -1)), 'Yesterday');
+    assert.match(ctx.dateLabel(ctx.addDays(today, 3)), /^[A-Z][a-z]{2},? \d{1,2} [A-Z][a-z]{2}$/);
+  });
+
   test('notices survive a reload through the live cache', async () => {
     const ctx = loadApp();
     const today = vm.runInContext('todayStr()', ctx);

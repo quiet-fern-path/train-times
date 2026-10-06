@@ -305,6 +305,28 @@ only (see its own comment) — it answers "is this leg beaten on the
 timetable", a different question from "what order does live running put
 these legs in on screen right now".
 
+## Compact sticky header
+
+Everything that stays on screen lives inside one sticky `#hdr`, in three
+rows: route chips (the active chip *is* the title — no separate title row)
+with Now and ⚙; Outward/Return tabs sharing a row with the date; and a
+one-line status bar. `scrollToNext()` offsets by `hdr.offsetHeight` alone —
+the old sum of separate header/tab heights left out the status bar and hid
+whatever it scrolled to. Rules that keep it short:
+
+- **The status bar never wraps.** `#live-label` truncates with an ellipsis
+  (full text in its `title`), so keep status strings short. The schedule age
+  only shows once it's 2+ days old: `refresh-platforms.yml` rewrites the file
+  daily, so "updated today" was noise.
+- **The date is a pill ("Today", "Thu 8 Oct") with the native
+  `<input type="date">` laid invisibly over it**, plus `showPicker()` on
+  click for desktop Chromium. It's still the real native control underneath
+  (no custom picker), but it's the kind of change that needs a real-device
+  check on Firefox for Android.
+- **`revealActiveChip()`** scrolls the chip row to the active route on load
+  and route switch, since the row is the only place its name appears.
+  `#route-title` stays only to show the load-failure message.
+
 ## `#dir=auto` — direction from approximate location
 
 Opt-in via the link hash (`#route=rdg-pad&dir=auto`). The page renders with
@@ -794,7 +816,11 @@ Two kinds, both read off boards each round already fetches — no extra call:
   used to sit above the whole list, and `scrollToNextIfToday()`'s jump past
   departed trains hid it on every load — a real complaint: the details were
   only found by scrolling to the top. `scrollToNext()` now lands on the
-  banner when there is one. Don't move it back above the list.
+  banner when there is one. Don't move it back above the list. It renders
+  **collapsed** (heading + first notice clamped to two lines, "+N more"),
+  so three notices cost the same room as one; tapping the heading expands
+  it, remembered per direction in `DISRUPTION_OPEN` because every minute's
+  re-render rebuilds the banner.
 - **Service reasons** (`cancelReason`, `delayReason`): `leg._disruptReason`,
   shown under the Cancelled/late tag. A delay reason only counts while the
   train is actually late; on a connection, the cancelled sub-leg's reason
