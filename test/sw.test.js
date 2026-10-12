@@ -130,3 +130,28 @@ describe('fetch handler — an unchanged revalidation must not rewrite the cache
     assert.deepEqual(ctx.__sw.putCalls, [URL_]);
   });
 });
+
+describe('fetch handler — data files bypass the browser HTTP cache when revalidating', () => {
+  // GitHub Pages sends max-age=600, so a plain background fetch kept getting
+  // the browser's own 10-minute-old copy back: a route added from the
+  // builder didn't reach the picker for up to 10 minutes.
+  async function initFor(url) {
+    const ctx = loadSw();
+    const inits = [];
+    ctx.fetch = (req, init) => { inits.push(init); return Promise.resolve(ctx.__sw.makeResponse({ headers: { etag: '"a"' } })); };
+    await ctx.__sw.dispatchFetch(url);
+    assert.equal(inits.length, 1);
+    return inits[0];
+  }
+
+  for (const file of ['routes.json', 'stations.json', 'data/schedule.json']) {
+    test(`${file} revalidates with the server`, async () => {
+      assert.equal((await initFor(`https://example.invalid/train-times/${file}`))?.cache, 'no-cache');
+    });
+  }
+
+  test('app-shell files keep the default HTTP caching', async () => {
+    assert.equal(await initFor('https://example.invalid/train-times/app.js'), undefined);
+    assert.equal(await initFor('https://example.invalid/train-times/stations_all.json'), undefined);
+  });
+});

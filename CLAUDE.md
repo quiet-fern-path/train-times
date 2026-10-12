@@ -944,13 +944,22 @@ there.** Against the real deployment:
 | `GET` with `If-None-Match` | **304, 0 bytes** |
 | unconditional `GET` | 200, **15,255,091 bytes** |
 
-GitHub Pages sends `etag`, `last-modified` and `cache-control: max-age=600`.
-So inside ten minutes the browser answers from its own HTTP cache without
-touching the network at all, and after that a revalidation is a 304 with an
-empty body. **The server already states its own freshness policy, and
-honouring it beats guessing a number in this file** — a hand-rolled cooldown
-could only add staleness on top (30 minutes of it; "once overnight" would be
-worse still, and would also miss a manual `workflow_dispatch` entirely).
+GitHub Pages sends `etag`, `last-modified` and `cache-control: max-age=600`,
+so a revalidation is a 304 with an empty body. A hand-rolled cooldown could
+only add staleness (30 minutes of it; "once overnight" would be worse still,
+and would also miss a manual `workflow_dispatch` entirely).
+
+**`sw.js` revalidates the three data files with `cache: 'no-cache'`
+(`isDataFile()`), deliberately ignoring that `max-age=600`.** Honouring it
+shipped as a real bug: the background fetch went through the browser's HTTP
+cache, so for up to 10 minutes after the last network fetch every check got
+the old copy back and saw no change. A route added from the builder took up
+to 10 minutes to reach the picker, then up to 10 more for its schedule. With
+`no-cache` every check is a conditional request (304, empty body, when
+nothing changed), so it costs almost nothing. GitHub's CDN can still hold an
+old copy for up to its own 10 minutes; nothing client-side can bypass that
+short of a cache-busting query string, which this file rules out above.
+App-shell files keep default caching: they change only with a `CACHE` bump.
 
 **The real cost was never the network — it was in `sw.js`.** The fetch
 handler used to `cache.put()` on *every* background revalidation, including

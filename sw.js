@@ -1,6 +1,6 @@
 // Bump this string whenever the app shell itself changes shape
 // (not needed for routine data refreshes — those are handled below).
-const CACHE = 'timetables-v14';
+const CACHE = 'timetables-v15';
 
 self.addEventListener('install', () => self.skipWaiting());
 
@@ -38,6 +38,19 @@ function notifyClientsOfUpdate(url) {
   });
 }
 
+// The data files app.js hot-reloads (its DATA_RELOAD_HANDLERS). Their
+// background refresh asks the server every time (cache: 'no-cache') rather
+// than trusting the browser's HTTP cache: GitHub Pages sends max-age=600, so
+// a plain fetch kept returning the copy from up to 10 minutes earlier, and a
+// route added from the builder took that long to reach the picker (then as
+// long again for its schedule). With an ETag the check is a conditional
+// request — a 304 with an empty body when nothing changed — so it stays
+// almost free. App-shell files keep the default: they only change with a
+// CACHE bump, which a navigation picks up anyway.
+function isDataFile(url) {
+  return /\/(routes|stations)\.json$|\/data\/schedule\.json$/.test(new URL(url).pathname);
+}
+
 // Stale-while-revalidate: if a cached copy exists, return it INSTANTLY —
 // no network round trip on the critical path at all. A background fetch
 // still runs to refresh the cache, but the page never waits on it.
@@ -64,7 +77,7 @@ self.addEventListener('fetch', e => {
     caches.open(CACHE).then(async cache => {
       const cached = await cache.match(e.request);
 
-      const networkUpdate = fetch(e.request)
+      const networkUpdate = (isDataFile(e.request.url) ? fetch(e.request, { cache: 'no-cache' }) : fetch(e.request))
         .then(response => {
           if (response.ok) {
             if (!cached) {
