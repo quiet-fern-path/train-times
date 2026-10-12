@@ -37,6 +37,7 @@ different auth models, and different failure-degradation requirements.
 | `parked-routes.json` | Routes removed via the builder, kept with full config for one-click re-add. Ships as `[]`. Not read by the main app. |
 | `stations.json` | CRS code → display name for the configured routes. Add an entry whenever you add a station to `routes.json`. |
 | `stations_all.json` | Full national CRS → name map (~2,600). Powers station autocomplete for both the builder (`add-route.html`) and the main app's quick-route sheet; loaded lazily by each, kept out of the main app's precache. |
+| `stations_coords.json` | National CRS → `[lat, lon]` for `#dir=auto` (see that section). Generated from an ODbL dataset; attribution is in the settings sheet. |
 | `data/schedule.json` | Generated output. Don't hand-edit — it's overwritten by the Action every run. Ships with an empty-arrays placeholder (`is_seed_placeholder: true`) until the Action runs for real. |
 | `scripts/fetch_schedule.py` | Runs in both Actions below. Queries RTT, writes `data/schedule.json`. |
 | `.github/workflows/update-schedule.yml` | Full fetch: weekly cron (Mondays 04:00 UTC) + manual trigger. |
@@ -345,10 +346,17 @@ break either:
 
 - **Never await the fix before rendering.** A flaky or absent connection
   (or a denied permission) must mean "no switch", not "slower page".
-- **Coordinates are inlined in `STATION_COORDS`, not fetched.** Add an
-  entry whenever you add a station to `stations.json` (a test enforces
-  this). A route with an unlisted end — e.g. any quick route — simply
-  keeps the last-used direction. No position is ever stored.
+- **Coordinates come from `stations_coords.json`, never awaited before
+  rendering.** It's a national CRS → `[lat, lon]` map (~60KB), loaded
+  alongside the data files; only the geolocation callback waits for it, and
+  if it fails the route keeps the last-used direction. It replaced a
+  hand-kept `STATION_COORDS` list in `app.js`, which every station added
+  from the builder missed (Basingstoke shipped without one and turned CI
+  red). National coverage means builder routes and quick routes need no
+  per-station step. Source: `davwheat/uk-railway-stations`'s
+  `stations.json` (from Trainline EU's dataset), filtered to
+  `stations_all.json`'s codes and rounded to 4dp. It's **ODbL**: keep the
+  attribution in the settings sheet. No position is ever stored.
 
 ## Route types: direct vs connection
 
