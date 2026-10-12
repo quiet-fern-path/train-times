@@ -1686,6 +1686,7 @@ describe('waiting on a newly added route\'s schedule', () => {
 
 describe('dirForLocation — #dir=auto picks the direction leaving the nearer end', () => {
   const ctx = loadApp();
+  vm.runInContext(`STATION_COORDS = ${JSON.stringify(require('../stations_coords.json'))};`, ctx);
   const rdgPad = { from: 'RDG', to: 'PAD' };
 
   test('in Reading town centre → out (Reading → Paddington)', () => {
@@ -1701,7 +1702,7 @@ describe('dirForLocation — #dir=auto picks the direction leaving the nearer en
     assert.equal(ctx.dirForLocation(rdgPad, 51.506, -0.378), 'ret');
   });
   test('a station without coordinates gives no opinion, so the last-used direction stands', () => {
-    assert.equal(ctx.dirForLocation({ from: 'RDG', to: 'BRI' }, 51.455, -0.970), null);
+    assert.equal(ctx.dirForLocation({ from: 'RDG', to: 'ZZZ' }, 51.455, -0.970), null);
   });
   test('a missing fix gives no opinion', () => {
     assert.equal(ctx.dirForLocation(rdgPad, NaN, NaN), null);
@@ -1709,8 +1710,19 @@ describe('dirForLocation — #dir=auto picks the direction leaving the nearer en
   });
   test('every station in stations.json has coordinates', () => {
     const stations = require('../stations.json');
-    const coords = require('node:vm').runInContext('STATION_COORDS', ctx);
+    const coords = require('../stations_coords.json');
     assert.deepEqual(Object.keys(stations).filter((c) => !coords[c]), []);
+  });
+  // The point of a national file: a station added from the builder, or a
+  // quick route's ends, need no per-station step to work with #dir=auto.
+  test('nearly every national station has coordinates', () => {
+    const all = require('../stations_all.json');
+    const coords = require('../stations_coords.json');
+    const missing = Object.keys(all).filter((c) => !coords[c]);
+    assert.ok(missing.length <= 5, `missing: ${missing.join(', ')}`);
+    for (const [lat, lon] of Object.values(coords)) {
+      assert.ok(lat > 49 && lat < 61 && lon > -9 && lon < 2, `${lat},${lon} is not in Great Britain`);
+    }
   });
 });
 

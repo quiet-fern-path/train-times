@@ -207,6 +207,7 @@ function mergeUserRoutes(baseRoutes) {
 }
 
 async function loadAll() {
+  loadStationCoords(); // not awaited — see STATION_COORDS
   let routes;
   [routes, STATIONS, SCHEDULE] = await Promise.all([
     loadJSON('./routes.json'),
@@ -455,16 +456,20 @@ function restoreState() {
 // up to a minute old, which can't be from before a journey.
 // Tapping a tab pauses switching (the visitor's choice wins) only until they
 // next come back to the tab, which re-checks from scratch.
-// Coordinates are inlined (not fetched) for the same reason. A route whose
-// ends aren't listed here (e.g. a quick route) keeps the last-used direction.
-const STATION_COORDS = {
-  RDG: [51.4588, -0.9718], PAD: [51.5160, -0.1770], OXF: [51.7535, -1.2700],
-  MAI: [51.5187, -0.7227], TWY: [51.4755, -0.8633], HOT: [51.5343, -0.9003],
-  KGX: [51.5308, -0.1238], CBG: [52.1945, 0.1375], TWI: [51.4500, -0.3301],
-  TED: [51.4244, -0.3327], COO: [51.5606, -0.7224], NMC: [53.3651, -2.0055],
-  MAN: [53.4774, -2.2309], MLW: [51.5706, -0.7662], HXX: [51.4713, -0.4539],
-  HAY: [51.5031, -0.4205], BSK: [51.2684, -1.0872],
-};
+// Coordinates come from stations_coords.json, a national CRS → [lat, lon]
+// map, so any station works with no per-route step (it used to be a
+// hand-kept list here, which every station added from the builder silently
+// missed). It loads alongside the data files but is never awaited before
+// rendering: a fix only waits for it, and if it never arrives the route
+// just keeps the last-used direction. Source and licence: see CLAUDE.md.
+let STATION_COORDS = {};
+let stationCoordsReady = Promise.resolve();
+function loadStationCoords() {
+  stationCoordsReady = loadJSON('./stations_coords.json')
+    .then(c => { STATION_COORDS = c || {}; })
+    .catch(() => {});
+  return stationCoordsReady;
+}
 let autoDir = false;       // opened with #dir=auto
 let autoDirPaused = false; // a tab was tapped since the visitor last came back
 // Squared equirectangular distance — only ever compared, and accurate far
@@ -483,7 +488,8 @@ function dirForLocation(route, lat, lon) {
 }
 function requestAutoDir({ fresh = false } = {}) {
   if (!autoDir || autoDirPaused || !('geolocation' in navigator)) return;
-  navigator.geolocation.getCurrentPosition(pos => {
+  navigator.geolocation.getCurrentPosition(async pos => {
+    await stationCoordsReady;
     if (autoDirPaused) return; // the visitor tapped a tab while we waited — theirs wins
     const dir = dirForLocation(currentRoute(), pos.coords.latitude, pos.coords.longitude);
     if (dir && dir !== activeDir) selectDir(dir);

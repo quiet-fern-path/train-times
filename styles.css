@@ -144,6 +144,8 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .settings-sheet label{display:block;font-size:.82rem;font-weight:600;margin-top:14px}
 .settings-sheet input{width:100%;padding:10px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-top:4px}
 .settings-sheet p{font-size:.78rem;color:var(--muted);margin-top:6px;line-height:1.4}
+.settings-sheet .attribution{font-size:.68rem;margin-top:12px}
+.settings-sheet .attribution a{color:inherit}
 .settings-sheet .row{display:flex;gap:8px;margin-top:16px}
 .settings-sheet button{flex:1;padding:11px;font-size:.9rem;font-weight:600;border:none;border-radius:8px;font-family:inherit}
 .btn-save{background:var(--navy);color:#fff}

@@ -51,6 +51,7 @@
     <label for="api-key-input">Consumer key (x-apikey)</label>
     <input id="api-key-input" type="text" autocomplete="off" autocapitalize="off" placeholder="Paste your key here">
     <p>Get a free key at <strong>raildata.org.uk</strong> — register, subscribe to the "Live Departure Board" product, then copy the consumer key from its Specification tab. Stored only on this device.</p>
+    <p class="attribution">Station locations: <a href="https://github.com/davwheat/uk-railway-stations">uk-railway-stations</a> (David Wheatley), from <a href="https://github.com/trainline-eu/stations">Trainline EU</a> and their sources, under the <a href="https://opendatacommons.org/licenses/odbl/1-0/">ODbL</a>.</p>
     <p style="margin-top:16px"><a href="./add-route.html" style="color:#2563eb;text-decoration:none;font-weight:600">Add or manage routes ›</a></p>
     <div class="row">
       <button class="btn-close" id="btn-settings-close">Close</button>
@@ -107,7 +108,7 @@ if ('serviceWorker' in navigator) {
       const cache = await caches.open(key);
       // Bootstrap-cache this page plus the static data files, in case the
       // very first navigation raced ahead of the service worker activating.
-      const urls = [location.pathname, './styles.css', './app.js', './favicon.svg', './routes.json', './stations.json', './data/schedule.json', './add-route.html', './add-route.js'];
+      const urls = [location.pathname, './styles.css', './app.js', './favicon.svg', './routes.json', './stations.json', './stations_coords.json', './data/schedule.json', './add-route.html', './add-route.js'];
       for (const url of urls) {
         if (await cache.match(url)) continue;
         try {
