@@ -86,6 +86,14 @@ calendar date of the 03:00 start. `depM`/`arrM` for 00:00–02:59 are stored
 as 1440+ (01:30 → 1530), so chronological sort order within a day is correct
 without any special-casing in the render loop.
 
+**RTT caps a query at 23h59m of real time** (HTTP 400 "maximum query
+duration is 23h59m", confirmed live). On the night the clocks go back,
+03:00–02:59 is 24h59m, so that whole day was rejected for every route
+(2026-10-24 shipped missing). `day_windows()` splits only that day into
+03:00–01:59 and 02:00–02:59, one extra call per station a year. It relies
+on RTT reading an ambiguous end such as `01:59` as the later (GMT) hour,
+also confirmed live. The spring night is 22h59m and needs nothing.
+
 **In `app.js` `todayStr()`**: before 03:00, returns yesterday's date, so the
 client filters the correct schedule day. Changing this to a plain `new Date()`
 would cause the date picker and NOW-line to break in the early hours.

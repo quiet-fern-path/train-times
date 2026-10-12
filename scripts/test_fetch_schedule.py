@@ -84,6 +84,30 @@ class TestTimeHelpers(unittest.TestCase):
             ("2026-07-02T03:00:00", "2026-07-03T02:59:00"),
         )
 
+    def test_day_windows_is_one_query_on_a_normal_day(self):
+        self.assertEqual(fs.day_windows(date(2026, 7, 2)),
+                         [("2026-07-02T03:00:00", "2026-07-03T02:59:00")])
+
+    def test_day_windows_is_one_query_when_the_clocks_go_forward(self):
+        # 03:00 to 02:59 is only 22h59m of real time that night.
+        self.assertEqual(fs.day_windows(date(2026, 3, 28)),
+                         [("2026-03-28T03:00:00", "2026-03-29T02:59:00")])
+
+    def test_day_windows_splits_when_the_clocks_go_back(self):
+        # 24h59m of real time: RTT rejects anything over 23h59m (HTTP 400),
+        # which lost 2026-10-24 for every route.
+        self.assertEqual(fs.day_windows(date(2026, 10, 24)), [
+            ("2026-10-24T03:00:00", "2026-10-25T01:59:00"),
+            ("2026-10-25T02:00:00", "2026-10-25T02:59:00"),
+        ])
+
+    def test_fetch_station_day_combines_split_windows(self):
+        fs._station_day_cache.clear()
+        with patch.object(fs, "api_get", return_value=[]) as mock_get:
+            fs.fetch_station_day("RDG", date(2026, 10, 24))
+        self.assertEqual([c.args[0]["timeTo"] for c in mock_get.call_args_list],
+                         ["2026-10-25T01:59:00", "2026-10-25T02:59:00"])
+
     def test_parse_dt_strips_timezone_treats_as_local(self):
         self.assertEqual(fs.parse_dt("2026-07-02T07:54:00+01:00"), datetime(2026, 7, 2, 7, 54, 0))
         self.assertEqual(fs.parse_dt("2026-07-02T07:54:00Z"), datetime(2026, 7, 2, 7, 54, 0))

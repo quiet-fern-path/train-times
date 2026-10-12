@@ -42,6 +42,7 @@ import json
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -130,6 +131,36 @@ def day_window(tday):
         f"{tday.isoformat()}T{DAY_START_HOUR:02d}:00:00",
         f"{next_cal.isoformat()}T{DAY_START_HOUR - 1:02d}:59:00",  # 02:59:00
     )
+
+
+UK = ZoneInfo("Europe/London")
+# RTT rejects any query spanning more than this much real (elapsed) time:
+# HTTP 400 "maximum query duration is 23h59m" (confirmed live).
+MAX_QUERY = timedelta(hours=23, minutes=59)
+
+
+def day_windows(tday):
+    """day_window() split into queries RTT will accept. Normally that's the
+    one window. On the night the clocks go back, 03:00 to 02:59 is 24h59m of
+    real time, which RTT rejected with HTTP 400, losing that whole day for
+    every route (shipped: 2026-10-24 was missing from every route). Then the
+    day becomes two windows: 03:00 to 01:59 GMT (exactly 23h59m, covering
+    both 01:00 hours), and 02:00 to 02:59. Only that one day a year costs a
+    second call per station.
+
+    Relies on RTT reading an ambiguous end time such as "01:59" that night
+    as the later (GMT) one: confirmed live, as an end of 01:00 or 01:30 from
+    a 02:00 BST start was rejected as over 23h59m."""
+    time_from, time_to = day_window(tday)
+    start = datetime.fromisoformat(time_from).replace(tzinfo=UK)
+    end = datetime.fromisoformat(time_to).replace(tzinfo=UK)
+    if end.astimezone(timezone.utc) - start.astimezone(timezone.utc) <= MAX_QUERY:
+        return [(time_from, time_to)]
+    split = (start.astimezone(timezone.utc) + MAX_QUERY).astimezone(UK).replace(tzinfo=None)
+    return [
+        (time_from, split.isoformat(timespec="seconds")),
+        ((split + timedelta(minutes=1)).isoformat(timespec="seconds"), time_to),
+    ]
 
 
 # ── API layer ─────────────────────────────────────────────────────────────────
@@ -337,8 +368,9 @@ def fetch_station_day(station, tday):
     if key in _station_day_cache:
         return _station_day_cache[key]
 
-    time_from, time_to = day_window(tday)
-    svcs = api_get({"code": station, "timeFrom": time_from, "timeTo": time_to})
+    svcs = []
+    for time_from, time_to in day_windows(tday):
+        svcs += api_get({"code": station, "timeFrom": time_from, "timeTo": time_to})
 
     deps, arrs = {}, {}
     for svc in svcs:
