@@ -49,6 +49,7 @@ import requests
 LOOKAHEAD_DAYS = 90
 BASE_URL = "https://data.rtt.io"
 DAY_START_HOUR = 3   # timetable day begins at 03:00
+MAX_NUDGED_LEG_MINS = 12 * 60  # see _resolve_arrival()
 
 # Fixed request delay. Confirmed live against the API: entitlements carry
 # limits of 30/minute, 750/hour, 9000/day, 30000/week (X-RateLimit-Limit-*
@@ -428,8 +429,16 @@ def _resolve_arrival(dep, arr_candidates):
         # crossing when the departure itself is in the legitimate 00:00-02:59
         # range (depM already has dt_to_m's 1440+ offset applied); otherwise
         # this candidate isn't this journey's arrival — skip it.
+        #
+        # Even from a 00:00-02:59 departure, the nudge must give a plausible
+        # journey. A train heading the other way can have called at the
+        # destination late the previous evening: dep Reading 00:07 westbound
+        # to Oxford, after passing Maidenhead westbound at 23:37. Nudged, that
+        # became a ~23h30m Reading->Maidenhead "leg", and ~400 such legs
+        # shipped across four routes. A real crossing (02:24 -> 03:11) is
+        # minutes long, so cap the nudged journey at MAX_NUDGED_LEG_MINS.
         if arr_m < dep["depM"]:
-            if dep["depM"] >= 1440:
+            if dep["depM"] >= 1440 and arr_m + 1440 - dep["depM"] <= MAX_NUDGED_LEG_MINS:
                 arr_m += 1440
             else:
                 continue

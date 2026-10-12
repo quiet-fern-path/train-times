@@ -498,6 +498,15 @@ reintroduce a `!isConnection` gate around it.
   by picking, per departure, the earliest candidate arrival that actually
   follows it — don't collapse `fetch_station_day`'s index back to
   last-write-wins single dicts.
+- **`_resolve_arrival()`'s day-boundary nudge is capped at
+  `MAX_NUDGED_LEG_MINS` (12h).** An arrival before a 00:00–02:59 departure
+  used to be nudged to the next day unconditionally. But a train heading
+  the other way can have called at the destination the previous evening
+  (Reading 00:07 westbound to Oxford, having passed Maidenhead westbound at
+  23:37), which made a ~23h30m "leg". About 400 shipped across four routes,
+  and connection routes inherited them as leg-2s. A real crossing
+  (02:24 → 03:11) is minutes long. Checked live: the cap removed only those
+  wrong-way legs. Don't drop it.
 
 ## Unverified assumptions — check these against real data, don't assume
 
@@ -1084,6 +1093,17 @@ days a week or more out.
   below) upgrades most of *today's* legs from `forecast` to real `planned`
   each morning, but every other day in the lookahead still only has the
   `forecast` guess until its own day arrives.
+
+- **Clock-change nights get a few night trains slightly wrong.** RTT returns
+  plain local times with no offset, and `depM`/`arrM` are wall-clock
+  minutes. So a journey that crosses the change shows an hour too long in
+  spring and an hour too short in autumn, which can mis-dim it as
+  overtaken. In autumn a crossing that appears to arrive before it departs
+  is dropped by the nudge cap above. And during autumn's repeated 01:00
+  hour, `nowM()` can't tell which 01:xx a train meant. This only affects
+  trains between about 00:00 and 03:00 on two nights a year; fixing it
+  properly needs offsets RTT doesn't give. The fetch itself is handled:
+  see `day_windows()`.
 
 ## Daily platform-only refresh (`refresh-platforms.yml`)
 

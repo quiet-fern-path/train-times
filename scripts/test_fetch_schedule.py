@@ -239,6 +239,18 @@ class TestResolveArrival(unittest.TestCase):
         self.assertEqual(arr["arr"], "08:05")
         self.assertEqual(arr_m, 485)
 
+    def test_day_boundary_crossing_is_still_nudged(self):
+        dep = {"depM": 1464}  # 02:24
+        arr_m, _ = fs._resolve_arrival(dep, [{"arr": "03:11", "arrM": 191}])
+        self.assertEqual(arr_m, 1631)
+
+    def test_previous_evening_call_is_not_a_next_day_arrival(self):
+        # Real data: W34932 departs Reading 00:07 westbound for Oxford, having
+        # passed Maidenhead westbound at 23:37. Nudging that arrival made a
+        # ~23h30m Reading->Maidenhead leg; ~400 of these shipped.
+        dep = {"depM": 1447}  # 00:07
+        self.assertIsNone(fs._resolve_arrival(dep, [{"arr": "23:37", "arrM": 1417}]))
+
     def test_picks_earliest_valid_candidate_when_several_follow(self):
         dep = {"depM": 400}
         candidates = [{"arr": "08:00", "arrM": 480}, {"arr": "07:10", "arrM": 430}]
