@@ -753,14 +753,30 @@ describe('renderLegList() — "Now" divider and "next" selection stay correct on
 });
 
 describe('legCacheKey() — direct vs connection legs keyed differently for the live cache', () => {
-  test('a direct leg is keyed by its uid', () => {
+  test('a direct leg is keyed by its date and uid', () => {
     const ctx = loadApp();
-    assert.equal(ctx.legCacheKey({ uid: 'A1' }, false), 'A1');
+    assert.equal(ctx.legCacheKey({ date: '2026-10-12', uid: 'A1' }, false), '2026-10-12|A1');
   });
 
-  test('a connection leg is keyed by both uids combined (no single uid identifies it)', () => {
+  test('a connection leg is keyed by its date and both uids combined (no single uid identifies it)', () => {
     const ctx = loadApp();
-    assert.equal(ctx.legCacheKey({ uid1: 'A1', uid2: 'B1' }, true), 'A1|B1');
+    assert.equal(ctx.legCacheKey({ date: '2026-10-12', uid1: 'A1', uid2: 'B1' }, true), '2026-10-12|A1|B1');
+  });
+
+  // Regression: an RTT uid recurs on every day its timetable runs, so a
+  // uid-only key restored today's live state onto tomorrow's same-uid legs —
+  // seen as delays and platform changes on the "Tomorrow" view.
+  test('restoring the cache only touches the day it was saved for', () => {
+    const ctx = loadApp();
+    const leg = (date) => ({ date, uid: 'G1', dep: '21:04', depM: 1264, platform: '10' });
+    const today = leg('2026-10-12');
+    today._liveDepM = 1266; today._delayMins = 2; today._platform = '10A'; today._platformChanged = true;
+    const snap = ctx.snapshotLegs([today], false);
+    const fresh = [leg('2026-10-12'), leg('2026-10-13')];
+    ctx.restoreLegs(fresh, false, snap);
+    assert.equal(fresh[0]._delayMins, 2);
+    assert.equal(fresh[1]._delayMins, undefined);
+    assert.equal(fresh[1]._platformChanged, undefined);
   });
 });
 
@@ -1504,7 +1520,7 @@ describe('applyDataUpdate() — an in-place schedule swap must not strand the li
     // A previous round's live state, saved exactly as saveLiveCache() would.
     ctx.localStorage.setItem('liveCache:r', JSON.stringify({
       date: today, savedAt: Date.now(),
-      out: { u1: { _liveChecked: true, _delayMins: 12, _liveDep: '10:25', _liveDepM: 625 } },
+      out: { [`${today}|u1`]: { _liveChecked: true, _delayMins: 12, _liveDep: '10:25', _liveDepM: 625 } },
       ret: {},
     }));
     ctx.fetch = () => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(schedule)) });

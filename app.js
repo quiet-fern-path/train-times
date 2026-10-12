@@ -1516,8 +1516,14 @@ const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liv
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
-// regenerated weekly.
-function legCacheKey(leg, isConnection) { return isConnection ? `${leg.uid1}|${leg.uid2}` : leg.uid; }
+// regenerated weekly. The date is part of the key because an RTT uid is the
+// schedule's identity, not one day's train: the same uid recurs on every day
+// that timetable runs. Keyed by uid alone, a reload painted today's live
+// delays and platforms onto tomorrow's same-uid trains (a real bug).
+function legCacheKey(leg, isConnection) {
+  const id = isConnection ? `${leg.uid1}|${leg.uid2}` : leg.uid;
+  return id ? `${leg.date}|${id}` : id;
+}
 
 function snapshotLegs(legs, isConnection) {
   const fields = isConnection ? CONNECTION_LIVE_FIELDS : DIRECT_LIVE_FIELDS;
