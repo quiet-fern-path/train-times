@@ -463,7 +463,7 @@ const STATION_COORDS = {
   KGX: [51.5308, -0.1238], CBG: [52.1945, 0.1375], TWI: [51.4500, -0.3301],
   TED: [51.4244, -0.3327], COO: [51.5606, -0.7224], NMC: [53.3651, -2.0055],
   MAN: [53.4774, -2.2309], MLW: [51.5706, -0.7662], HXX: [51.4713, -0.4539],
-  HAY: [51.5031, -0.4205],
+  HAY: [51.5031, -0.4205], BSK: [51.2684, -1.0872],
 };
 let autoDir = false;       // opened with #dir=auto
 let autoDirPaused = false; // a tab was tapped since the visitor last came back
