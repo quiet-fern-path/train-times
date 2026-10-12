@@ -58,4 +58,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add data/schedule.json
           git diff --cached --quiet || git commit -m "Refresh today's platforms ($(date -u +%F))"
+          git pull --rebase
           git push

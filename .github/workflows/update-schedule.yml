@@ -58,10 +58,14 @@ jobs:
 
           # Commit data/schedule.json (only if it actually changed) and push.
           # schedule.json is NOT in this workflow's push-trigger paths, so
-          # these commits never re-trigger the workflow.
+          # these commits never re-trigger the workflow. Rebase first: a run
+          # takes minutes, and any push to main meanwhile (e.g. a code
+          # change) would otherwise reject this one and lose the fetch.
+          # Nothing else writes schedule.json while this runs (the
+          # concurrency group), so the rebase can't conflict on it.
           commit_push() {
             git add data/schedule.json
-            git diff --cached --quiet || { git commit -m "$1" && git push; }
+            git diff --cached --quiet || { git commit -m "$1" && git pull --rebase && git push; }
           }
 
           if [ "$EVENT_NAME" = "push" ]; then
