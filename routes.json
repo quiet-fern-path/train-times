@@ -7,21 +7,6 @@
     "change": null
   },
   {
-    "id": "rdg-hxx",
-    "name": "Reading ↔ Heathrow Terminals 2 & 3 Rail",
-    "from": "RDG",
-    "to": "HXX",
-    "change": "HAY",
-    "minConnectionMins": 2
-  },
-  {
-    "id": "rdg-bsk",
-    "name": "Reading ↔ Basingstoke",
-    "from": "RDG",
-    "to": "BSK",
-    "change": null
-  },
-  {
     "id": "rdg-oxf",
     "name": "Reading ↔ Oxford",
     "from": "RDG",

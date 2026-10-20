@@ -29,5 +29,13 @@
     "from": "KGX",
     "to": "CBG",
     "change": null
+  },
+  {
+    "id": "rdg-hxx",
+    "name": "Reading ↔ Heathrow Terminals 2 & 3 Rail",
+    "from": "RDG",
+    "to": "HXX",
+    "change": "HAY",
+    "minConnectionMins": 2
   }
 ]
