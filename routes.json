@@ -19,5 +19,12 @@
     "from": "RDG",
     "to": "MAI",
     "change": null
+  },
+  {
+    "id": "rdg-wat",
+    "name": "Reading ↔ London Waterloo",
+    "from": "RDG",
+    "to": "WAT",
+    "change": null
   }
 ]
