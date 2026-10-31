@@ -21,6 +21,13 @@
     "change": null
   },
   {
+    "id": "rdg-tap",
+    "name": "Reading ↔ Taplow",
+    "from": "RDG",
+    "to": "TAP",
+    "change": null
+  },
+  {
     "id": "rdg-wat",
     "name": "Reading ↔ London Waterloo",
     "from": "RDG",
