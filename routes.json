@@ -14,6 +14,13 @@
     "change": null
   },
   {
+    "id": "kgx-cbg",
+    "name": "Kings Cross ↔ Cambridge",
+    "from": "KGX",
+    "to": "CBG",
+    "change": null
+  },
+  {
     "id": "rdg-mai",
     "name": "Reading ↔ Maidenhead",
     "from": "RDG",

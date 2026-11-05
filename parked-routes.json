@@ -24,13 +24,6 @@
     "minConnectionMins": 1
   },
   {
-    "id": "kgx-cbg",
-    "name": "Kings Cross ↔ Cambridge",
-    "from": "KGX",
-    "to": "CBG",
-    "change": null
-  },
-  {
     "id": "rdg-hxx",
     "name": "Reading ↔ Heathrow Terminals 2 & 3 Rail",
     "from": "RDG",
