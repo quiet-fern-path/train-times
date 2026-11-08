@@ -726,9 +726,18 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
   const cls = ['train-card', isPast ? 'is-past' : '', isNext ? 'is-next' : '', isNext && minsAway < 5 ? 'is-soon' : '', isCancelled ? 'is-cancelled' : '',
     isSlower ? 'is-slower' : ''].filter(Boolean).join(' ');
 
+  // Cancelled first, then the leg-1 departure's delay — same order as
+  // directCard, so a cancelled or "Delayed" train never gets "On time".
+  const liveDelay = leg._liveDepM != null ? leg._liveDepM - leg.depM : 0;
   const cancelledTag = isCancelled
     ? `<div class="change-row"><span class="delay-tag">${leg._cancelledLeg === 2 ? toName + ' leg' : fromName + ' leg'} cancelled</span></div>`
-    : '';
+    : leg._liveDep === 'Delayed'
+      ? `<div class="change-row"><span class="delay-tag">Delayed</span></div>`
+    : liveDelay > 0
+      ? `<div class="change-row"><span class="delay-tag">${liveDelay} min late</span></div>`
+    : leg._liveChecked
+      ? `<div class="change-row"><span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span></div>`
+      : '';
 
   const slowerHtml = isSlower
     ? `<div class="change-row"><span class="sh-icon">&#10142;</span>Faster: <strong>${faster.dep}</strong> &rarr; <strong>${faster.arr || '?'}</strong> (${durFmt(faster.arrM != null ? faster.arrM - faster.depM : null)})</div>`
@@ -737,9 +746,19 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
   const link1 = leg.uid1 ? `<a class="rtt-link" href="https://www.realtimetrains.co.uk/service/gb-nr:${leg.uid1}/${leg.serviceDate1 || leg.date}/detailed" target="_blank" rel="noopener">Leg 1 on RTT &rarr;</a>` : '';
   const link2 = leg.uid2 ? `<a class="rtt-link" href="https://www.realtimetrains.co.uk/service/gb-nr:${leg.uid2}/${leg.serviceDate2 || leg.date}/detailed" target="_blank" rel="noopener">Leg 2 on RTT &rarr;</a>` : '';
 
-  const tightWarning = leg._liveChangeMins != null && leg._liveChangeMins < (route.minConnectionMins || 5)
-    ? `<div class="change-row"><span class="delay-tag">Tight connection: ${leg._liveChangeMins} min</span></div>`
+  // The original pairing always stays on the card (it may still work if the
+  // reader runs, or leg-1 makes time back); an at-risk connection adds the
+  // backup leg-2 beneath it rather than replacing it, so the card's times and
+  // its place in the list don't jump about. See updateConnectionRisk().
+  const gap = leg._liveChangeMins;
+  const tightWarning = leg._connAtRisk && leg._cancelledLeg !== 2 && gap != null
+    ? `<div class="change-row"><span class="delay-tag">${gap < 0 ? `Connection likely missed (${-gap} min short)` : `Tight connection: ${gap} min`}</span></div>`
     : '';
+  const backup = leg._backup;
+  const backupHtml = !leg._connAtRisk || backup === undefined ? ''
+    : backup
+      ? `<div class="change-row">${leg._cancelledLeg === 2 ? 'Instead' : 'If missed'}: ${escapeHtml(backup.dep)} from ${changeName}${backup.platform ? ` (Plat ${escapeHtml(backup.platform)})` : ''} &rarr; arr <strong>${escapeHtml(backup.arr)}</strong></div>`
+      : `<div class="change-row">No later train to ${toName} on the live board yet</div>`;
 
   // Live arrival time at the change station comes from leg-1's own
   // subsequentCallingPoints entry for it (see applyConnectionOverlay) — no
@@ -771,6 +790,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
     ${cancelledTag}
     ${reasonHtml(leg)}
     ${tightWarning}
+    ${backupHtml}
     ${slowerHtml}
     ${link1} ${link2}
   </div>`;
@@ -1517,8 +1537,8 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_delayMins', '_delayUnknown', '_liveDepM', '_liveArr', '_disruptReason'];
-const CONNECTION_LIVE_FIELDS = ['_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform2', '_platform2Confirmed', '_platform2Changed', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_platformHidden', '_delayMins', '_delayUnknown', '_liveDepM', '_liveArr', '_disruptReason'];
+const CONNECTION_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_connAtRisk', '_backup', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform1Hidden', '_platform2', '_platform2Confirmed', '_platform2Changed', '_platform2Hidden', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -1945,15 +1965,65 @@ async function overlayConnectionLive(route, dateStr) {
   recordStationMessages(route.to, retA);
   // Two change-station boards, one per direction; either carries its notices.
   recordStationMessages(route.change, outB || retB);
-  const matched = applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to)
-    + applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from);
+  const minConn = route.minConnectionMins || 5;
+  const matched = applyConnectionOverlay(data.out, dateStr, outA, outB, route.change, route.to, minConn)
+    + applyConnectionOverlay(data.ret, dateStr, retA, retB, route.change, route.from, minConn);
   return boardOutcome([outA, outB, retA, retB], matched);
+}
+
+// A connection is "at risk" once leg-1's live arrival leaves less than the
+// route's minimum connection time before leg-2 goes, or leg-2 is cancelled.
+// The card keeps the original pairing (it may still work if the reader runs
+// or leg-1 makes time back) and adds the backup below it. Hysteresis: the
+// flag only clears once the gap is CONNECTION_HYSTERESIS_MINS above the
+// minimum, so a Darwin estimate wobbling a minute either side of it doesn't
+// make the warning and backup flicker on every poll.
+const CONNECTION_HYSTERESIS_MINS = 2;
+function updateConnectionRisk(leg, leg1Cancelled, leg2Cancelled, estimatedArr, boardB, svc2, destCrs, minConnMins) {
+  const gap = leg._liveChangeMins;
+  const clearAt = leg._connAtRisk ? minConnMins + CONNECTION_HYSTERESIS_MINS : minConnMins;
+  // A cancelled leg-1 never reaches the change station, so no backup helps.
+  const atRisk = !leg1Cancelled && (leg2Cancelled || (gap != null && gap < clearAt));
+  leg._connAtRisk = atRisk;
+  if (!atRisk) { delete leg._backup; return; }
+  // A failed change-station board keeps the last backup, like every other
+  // live field. undefined = never searched; null = searched, nothing found.
+  if (boardB && estimatedArr != null) {
+    leg._backup = findBackupLeg2(boardB, estimatedArr + minConnMins, svc2, leg.changeDep, destCrs);
+  }
+}
+
+// The leg-2 to fall back on: of the services on the change station's board
+// that leave at least the minimum connection time after leg-1's live
+// arrival and still call at the destination, the one arriving first (a later
+// fast train can beat an earlier stopper). Skips the original leg-2, anything
+// cancelled, and "Delayed" services, whose departure time is unknown.
+function findBackupLeg2(board, earliestDepM, original, originalStd, destCrs) {
+  const hm = /^\d{2}:\d{2}$/;
+  let best = null, bestArrM = Infinity, bestDepM = Infinity;
+  for (const s of (board && board.trainServices) || []) {
+    if (original ? s === original : s.std === originalStd) continue;
+    if (!hm.test(s.std) || s.isCancelled || s.etd === 'Cancelled' || s.etd === 'Delayed') continue;
+    const dep = hm.test(s.etd) ? s.etd : s.std;
+    const depM = liveMinute(dep);
+    if (depM < earliestDepM) continue;
+    const cp = findCallingPoint(s, destCrs);
+    if (!cp || cp.isCancelled || cp.et === 'Cancelled') continue;
+    const arr = hm.test(cp.et) ? cp.et : cp.st;
+    if (!arr || !hm.test(arr)) continue;
+    const arrM = liveMinute(arr);
+    if (arrM < bestArrM || (arrM === bestArrM && depM < bestDepM)) {
+      best = { dep, arr, platform: s.platform || null };
+      bestArrM = arrM; bestDepM = depM;
+    }
+  }
+  return best;
 }
 
 // Returns the number of legs that received live data for at least one of
 // their two sub-legs this round (a leg whose leg-1 matched but whose leg-2
 // didn't is still a leg showing live data, so it counts once).
-function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCrs) {
+function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCrs, minConnMins = 5) {
   if (!boardA && !boardB) return 0; // both fetches failed — leave legs' existing live state untouched
   let matched = 0;
   for (const leg of legs) {
@@ -1975,6 +2045,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
       if (s1) {
         legMatched = true;
         svc1 = s1;
+        leg._liveChecked = true;
         leg1Cancelled = s1.isCancelled || s1.etd === 'Cancelled' || false;
         leg._platform1 = s1.platform || leg.platform1;
         const platform1State = derivePlatformState(s1.platform, leg.platform1, s1.platformIsHidden);
@@ -2061,11 +2132,13 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
     // reasonable approximation — delay typically carries through to the
     // next stop) when that calling point wasn't found (e.g. boardA's fetch
     // failed, or didn't match this leg at all).
+    let estimatedArr = null;
     if (leg.changeArrM != null) {
-      const estimatedArr = liveArr1M != null ? liveArr1M : leg.changeArrM + liveDelay1;
+      estimatedArr = liveArr1M != null ? liveArr1M : leg.changeArrM + liveDelay1;
       const dep2M = liveDep2M != null ? liveDep2M : leg.changeArrM + leg.changeMins;
       leg._liveChangeMins = dep2M - estimatedArr;
     }
+    if (legMatched) updateConnectionRisk(leg, leg1Cancelled, leg2Cancelled, estimatedArr, boardB, svc2, destCrs, minConnMins);
     if (legMatched) matched++;
   }
   return matched;

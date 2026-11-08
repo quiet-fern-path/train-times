@@ -1927,3 +1927,163 @@ test('parseNrccMessages handles a real notice (Leeds board, 2026-09-26)', () => 
   assert.equal(m.text, 'Trains between Shipley and Skipton may be cancelled or delayed by up to 30 minutes. More details can be found in the Disruptions area of the National Rail website.');
   assert.equal(m.url, 'https://www.nationalrail.co.uk/service-disruptions/skipton-20260926/');
 });
+
+describe('at-risk connections — original kept, backup leg-2 added, with hysteresis', () => {
+  // leg-1 10:00 → change 10:08, leg-2 10:12 → dest 10:30. Minimum connection 2.
+  const route = { id: 'c', name: 'C', from: 'RDG', to: 'HXX', change: 'HAY', minConnectionMins: 2 };
+  function leg() {
+    return { date: '2026-07-02', dep: '10:00', depM: 600, toc1: 'GW', changeArr: '10:08', changeArrM: 608,
+      changeDep: '10:12', changeMins: 4, toc2: 'XR', arr: '10:30', arrM: 630 };
+  }
+  // leg-1 running with the given estimate at the change station.
+  const boardA = et => ({ trainServices: [{ std: '10:00', etd: 'On time', operatorCode: 'GW',
+    subsequentCallingPoints: [{ callingPoint: [{ crs: 'HAY', st: '10:08', et }] }] }] });
+  const svc = (std, arr, extra = {}) => ({ std, etd: 'On time', operatorCode: 'XR', platform: '4',
+    subsequentCallingPoints: [{ callingPoint: [{ crs: 'HXX', st: arr, et: 'On time' }] }], ...extra });
+  const boardB = { trainServices: [svc('10:12', '10:30'), svc('10:27', '10:45'), svc('10:31', '10:41')] };
+  const apply = (ctx, l, et, b = boardB) => ctx.applyConnectionOverlay([l], '2026-07-02', boardA(et), b, 'HAY', 'HXX', 2);
+
+  test('a comfortable connection is not at risk and has no backup', () => {
+    const ctx = loadApp();
+    const l = leg();
+    apply(ctx, l, 'On time');
+    assert.equal(l._connAtRisk, false);
+    assert.equal(l._backup, undefined);
+  });
+
+  test('below the minimum: at risk, original arrival kept, earliest-arriving backup chosen', () => {
+    const ctx = loadApp();
+    const l = leg();
+    apply(ctx, l, '10:11'); // 1 min to make the 10:12
+    assert.equal(l._connAtRisk, true);
+    assert.equal(l._liveArr, '10:30'); // the original still drives the card and its sort position
+    // The 10:31 arrives at 10:41, before the 10:27's 10:45.
+    assert.deepEqual(plain(l._backup), { dep: '10:31', arr: '10:41', platform: '4' });
+    const html = ctx.connectionCard(l, route, 'out', true, 590, null);
+    assert.match(html, /Tight connection: 1 min/);
+    assert.match(html, /If missed: 10:31 from HAY \(Plat 4\) &rarr; arr <strong>10:41/);
+    assert.match(html, /10:30/);
+  });
+
+  test('a negative gap says the connection is likely missed', () => {
+    const ctx = loadApp();
+    const l = leg();
+    apply(ctx, l, '10:15');
+    const html = ctx.connectionCard(l, route, 'out', true, 590, null);
+    assert.match(html, /Connection likely missed \(3 min short\)/);
+  });
+
+  test('hysteresis: the flag holds just above the minimum and clears only with margin', () => {
+    const ctx = loadApp();
+    const l = leg();
+    apply(ctx, l, '10:11'); // gap 1 → at risk
+    apply(ctx, l, '10:10'); // gap 2 = minimum → still at risk (would not have tripped from cold)
+    assert.equal(l._connAtRisk, true);
+    assert.ok(l._backup);
+    apply(ctx, l, '10:09'); // gap 3 → still inside the 2 min margin
+    assert.equal(l._connAtRisk, true);
+    apply(ctx, l, '10:08'); // gap 4 = minimum + margin → clears
+    assert.equal(l._connAtRisk, false);
+    assert.equal(l._backup, undefined);
+
+    const cold = leg();
+    apply(ctx, cold, '10:10'); // gap 2 from cold → not at risk
+    assert.equal(cold._connAtRisk, false);
+  });
+
+  test('a cancelled leg-2 offers the backup as "Instead"', () => {
+    const ctx = loadApp();
+    const l = leg();
+    const b = { trainServices: [svc('10:12', '10:30', { etd: 'Cancelled' }), svc('10:27', '10:45')] };
+    apply(ctx, l, 'On time', b);
+    assert.equal(l._cancelledLeg, 2);
+    const html = ctx.connectionCard(l, route, 'out', true, 590, null);
+    assert.match(html, /Instead: 10:27/);
+    assert.doesNotMatch(html, /Tight connection/);
+  });
+
+  test('a cancelled leg-1 gets no backup — the change station is never reached', () => {
+    const ctx = loadApp();
+    const l = leg();
+    ctx.applyConnectionOverlay([l], '2026-07-02', { trainServices: [{ std: '10:00', etd: 'Cancelled', operatorCode: 'GW' }] },
+      boardB, 'HAY', 'HXX', 2);
+    assert.equal(l._connAtRisk, false);
+  });
+
+  test('backup skips cancelled, "Delayed", too-early and destination-cancelled services', () => {
+    const ctx = loadApp();
+    const b = { trainServices: [
+      svc('10:12', '10:30'),
+      svc('10:13', '10:29'), // exactly 2 min after the 10:11 arrival: makeable
+      svc('10:14', '10:28', { etd: 'Cancelled' }),
+      svc('10:15', '10:27', { etd: 'Delayed' }),
+      { ...svc('10:16', '10:26'), subsequentCallingPoints: [{ callingPoint: [{ crs: 'HXX', st: '10:26', isCancelled: true }] }] },
+    ] };
+    const l = leg();
+    apply(ctx, l, '10:11', b);
+    assert.equal(l._backup.dep, '10:13');
+    const early = leg();
+    apply(ctx, early, '10:12', b); // 10:13 now under the 2 min minimum
+    assert.equal(early._backup, null);
+    assert.match(ctx.connectionCard(early, route, 'out', true, 590, null), /No later train to HXX on the live board yet/);
+  });
+
+  test('a failed change-station board keeps the last backup', () => {
+    const ctx = loadApp();
+    const l = leg();
+    apply(ctx, l, '10:11');
+    apply(ctx, l, '10:11', null);
+    assert.equal(l._backup.dep, '10:31');
+  });
+
+  test('risk state and backup survive the live cache', () => {
+    const ctx = loadApp();
+    const l = Object.assign(leg(), { uid1: 'a', uid2: 'b' });
+    apply(ctx, l, '10:11');
+    const fresh = Object.assign(leg(), { uid1: 'a', uid2: 'b' });
+    ctx.restoreLegs([fresh], true, plain(ctx.snapshotLegs([l], true)));
+    assert.equal(fresh._connAtRisk, true);
+    assert.equal(fresh._backup.dep, '10:31');
+  });
+});
+
+describe('connection card delay badge (leg-1 departure)', () => {
+  const route = { id: 'c', name: 'C', from: 'RDG', to: 'HXX', change: 'HAY', minConnectionMins: 2 };
+  const leg = () => ({ date: '2026-07-02', dep: '10:00', depM: 600, toc1: 'GW', changeArr: '10:08', changeArrM: 608,
+    changeDep: '10:20', changeMins: 12, arr: '10:40', arrM: 640 });
+  const run = etd => {
+    const ctx = loadApp();
+    const l = leg();
+    ctx.applyConnectionOverlay([l], '2026-07-02', { trainServices: [{ std: '10:00', etd, operatorCode: 'GW' }] }, null, 'HAY', 'HXX', 2);
+    return ctx.connectionCard(l, route, 'out', true, 590, null);
+  };
+  test('late', () => assert.match(run('10:04'), /delay-tag">4 min late</));
+  test('on time', () => assert.match(run('On time'), />On time</));
+  test('Delayed, never On time', () => {
+    const html = run('Delayed');
+    assert.match(html, /delay-tag">Delayed</);
+    assert.doesNotMatch(html, /On time/);
+  });
+  test('cancelled, never On time', () => {
+    const html = run('Cancelled');
+    assert.match(html, /cancelled</);
+    assert.doesNotMatch(html, /On time/);
+  });
+  test('no live data, no badge', () => {
+    const ctx = loadApp();
+    assert.doesNotMatch(ctx.connectionCard(leg(), route, 'out', true, 590, null), /delay-tag/);
+  });
+});
+
+test('the unconfirmed-platform flag survives the live cache (direct and connection)', () => {
+  const ctx = loadApp();
+  const d = { date: '2026-07-02', uid: 'u', _liveDepM: 600, _platformHidden: true };
+  const c = { date: '2026-07-02', uid1: 'a', uid2: 'b', _liveDepM: 600, _platform1Hidden: true, _platform2Hidden: true };
+  const dFresh = { date: '2026-07-02', uid: 'u' };
+  const cFresh = { date: '2026-07-02', uid1: 'a', uid2: 'b' };
+  ctx.restoreLegs([dFresh], false, plain(ctx.snapshotLegs([d], false)));
+  ctx.restoreLegs([cFresh], true, plain(ctx.snapshotLegs([c], true)));
+  assert.equal(dFresh._platformHidden, true);
+  assert.equal(cFresh._platform1Hidden, true);
+  assert.equal(cFresh._platform2Hidden, true);
+});

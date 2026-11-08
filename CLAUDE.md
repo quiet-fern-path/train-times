@@ -412,6 +412,33 @@ against a genuinely delayed RDG→PAD service (86 minutes late, on-time
 departure) — the delay only showed up via the destination calling point, not
 the origin board, which is exactly the case this was missing.
 
+**An at-risk connection keeps its original pairing and adds a backup.**
+Legs are paired once, at fetch time, so a late leg-1 can leave its paired
+leg-2 unmakeable. `updateConnectionRisk()` flags `leg._connAtRisk` when the
+live gap at the change station drops below `minConnectionMins`, or leg-2 is
+cancelled (not when leg-1 is: the change station is never reached).
+`findBackupLeg2()` then picks, from the change-station board already fetched
+for leg-2, the earliest-*arriving* service that leaves at least
+`minConnectionMins` after leg-1's live arrival and still calls at the
+destination. It skips cancelled and `"Delayed"` services, since the latter's
+departure time is unknown. The card shows "If missed: …" (or "Instead: …"
+for a cancelled leg-2) under the original. Three rules, all from the
+owner's spec:
+
+- **Never replace the original.** It may still work if the reader runs or
+  leg-1 makes time back. `_liveArr` stays the original's, so the card's
+  times and its sort position don't jump.
+- **Hysteresis.** The flag only clears once the gap reaches the minimum
+  plus `CONNECTION_HYSTERESIS_MINS` (2). Darwin estimates wobble by a minute,
+  and a bare threshold made the warning and backup flicker every poll.
+- **No extra call.** The backup comes only from board B. If that board fails,
+  the last backup is kept (`_backup` undefined = never searched, null =
+  searched and nothing found). Never re-pair from `schedule.json`: it only
+  holds the one leg-2 each leg-1 was paired with, not every leg-2.
+
+The connection card's delay badge (late / Delayed / On time) describes leg-1's
+departure and is checked after cancellation, same order as `directCard()`.
+
 **`overtakers()` applies to both direct and connection legs.** A paired
 connection leg's top-level `depM`/`arrM` is already the whole-journey
 origin-departure/final-arrival pair (`fetch_connection()` in
