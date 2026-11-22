@@ -382,11 +382,20 @@ A connection shows leg-1's there and leg-2's in the change row.
 - **Live**: Darwin's `destination[].locationName`, via `darwinDest()`. It is
   the board's own source, so a matched leg prefers it (`_liveDest`,
   `_liveDest1`/`_liveDest2`, cached with the other live fields). Quick routes
-  only have this. The field name is the documented Darwin convention, also
-  not yet confirmed live on this key.
+  only have this. Two board details RTT can't give:
+  - `currentDestinations`, set when a train now terminates short of its
+    timetabled destination, wins over `destination`: station screens follow
+    it, so the card must too.
+  - `via` ("via Hove") is appended to its location's name. Only Darwin has
+    it, so a saved route shows it only once live data arrives.
 
-Names are escaped (`destHtml()`), and wrap to two lines rather than
-ellipsis, since a phone has no hover to reveal a truncated name.
+  These field names are the documented Darwin convention, not yet confirmed
+  live on this key.
+
+Names are escaped (`destHtml()`) and wrap to two lines, then end in an
+ellipsis. That's deliberate, the owner's call: the start of the name is what
+identifies the train on a board, so a long via or second portion can lose
+its tail. At 320px a single name, Elizabeth line's included, fits.
 
 ## Route types: direct vs connection
 

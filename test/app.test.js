@@ -2106,6 +2106,24 @@ describe('final destination on the card', () => {
     assert.equal(ctx.darwinDest(null), null);
   });
 
+  test('darwinDest() appends via, and joins each portion with its own', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.darwinDest({ destination: [{ locationName: 'London Victoria', via: 'via Hove' }] }),
+      'London Victoria via Hove');
+    assert.equal(ctx.darwinDest({ destination: [
+      { locationName: 'Littlehampton', via: 'via Hove' }, { locationName: 'Eastbourne' }] }),
+      'Littlehampton via Hove & Eastbourne');
+  });
+
+  test('darwinDest() prefers currentDestinations when the train now terminates short', () => {
+    const ctx = loadApp();
+    const svc = { destination: [{ locationName: 'Didcot Parkway' }], currentDestinations: [{ locationName: 'Swindon' }] };
+    assert.equal(ctx.darwinDest(svc), 'Swindon');
+    // Empty or nameless currentDestinations falls back to the timetabled one.
+    assert.equal(ctx.darwinDest({ ...svc, currentDestinations: [] }), 'Didcot Parkway');
+    assert.equal(ctx.darwinDest({ ...svc, currentDestinations: [{}] }), 'Didcot Parkway');
+  });
+
   test('a quick route takes the destination from the live board', () => {
     const ctx = loadApp();
     const [leg] = ctx.synthesizeLiveLegs(board([{ locationName: 'Abbey Wood', crs: 'ABW' }]), 'PAD');

@@ -763,10 +763,20 @@ function directCard(leg, route, dir, isToday, curM, faster) {
 function destHtml(name) {
   return name ? `<div class="rdest" title="To ${escapeHtml(name)}">to ${escapeHtml(name)}</div>` : '';
 }
-// Darwin's destination for a board service. `destination` is an array of
-// locations, more than one when the train divides.
+// Darwin's destination for a board service, as station screens show it.
+// `currentDestinations` is set when the train now terminates somewhere other
+// than its timetabled `destination` (e.g. short-formed), and screens follow
+// it, so it wins. Each location can carry a `via` ("via Hove") for trains to
+// the same place by different lines; it's appended, and the card's two-line
+// clamp ellipses the tail, since the start is what identifies the train.
+// More than one location means the train divides: "A & B".
 function darwinDest(svc) {
-  const names = ((svc && svc.destination) || []).map(d => d && d.locationName).filter(Boolean);
+  if (!svc) return null;
+  const pick = (list) => (list || [])
+    .filter(d => d && d.locationName)
+    .map(d => d.via ? `${d.locationName} ${d.via}` : d.locationName);
+  const current = pick(svc.currentDestinations);
+  const names = current.length ? current : pick(svc.destination);
   return names.length ? names.join(' & ') : null;
 }
 
