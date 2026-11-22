@@ -743,6 +743,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
       <div class="track">
         <div class="rail"><div class="rdot"></div><div class="rline"></div><div class="rdot"></div></div>
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
+        ${destHtml(leg._liveDest || leg.dest)}
       </div>
       <div class="tblock">
         ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
@@ -754,6 +755,19 @@ function directCard(leg, route, dir, isToday, curM, faster) {
     ${slowerHtml}
     ${rttLink}
   </div>`;
+}
+
+// The train's final destination, as departure boards name it ("London
+// Paddington", or "A & B" for a train that divides), so it can be found on
+// the board at the station. Shown small under the journey time.
+function destHtml(name) {
+  return name ? `<div class="rdest" title="To ${escapeHtml(name)}">to ${escapeHtml(name)}</div>` : '';
+}
+// Darwin's destination for a board service. `destination` is an array of
+// locations, more than one when the train divides.
+function darwinDest(svc) {
+  const names = ((svc && svc.destination) || []).map(d => d && d.locationName).filter(Boolean);
+  return names.length ? names.join(' & ') : null;
 }
 
 // Darwin's stated cause, under the Cancelled/late tag it explains.
@@ -818,6 +832,8 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
   // platform badge above.
   const changeArrText = inlineLiveTime(leg.changeArr, leg._liveChangeArr);
   const changeDepText = inlineLiveTime(leg.changeDep, leg._liveChangeDep);
+  const dest2 = leg._liveDest2 || leg.dest2;
+  const dest2Text = dest2 ? ` to ${escapeHtml(dest2)}` : '';
 
   return `<div class="${cls}" data-depm="${effM}">
     ${nextHtml}
@@ -830,6 +846,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
       <div class="track">
         <div class="rail"><div class="rdot"></div><div class="rline"></div><div class="rdot"></div></div>
         <div class="rdur">${durFmt(leg.arrM != null ? leg.arrM - leg.depM : null)}</div>
+        ${destHtml(leg._liveDest1 || leg.dest1)}
       </div>
       <div class="tblock">
         ${depTimeHtml(leg.arr || '?', leg._liveArr, isCancelled)}
@@ -837,7 +854,7 @@ function connectionCard(leg, route, dir, isToday, curM, faster) {
         ${platformHtml(leg._platform2 || leg.platform2, leg._platform2Confirmed ?? leg.platform2Confirmed, leg._platform2Changed, leg.platform2, leg._platform2Hidden)}
       </div>
     </div>
-    <div class="change-row">Change at ${changeName}: arr ${changeArrText} &middot; dep ${changeDepText} &middot; ${leg.changeMins} min</div>
+    <div class="change-row">Change at ${changeName}: arr ${changeArrText} &middot; dep ${changeDepText}${dest2Text} &middot; ${leg.changeMins} min</div>
     ${cancelledTag}
     ${reasonHtml(leg)}
     ${tightWarning}
@@ -1549,6 +1566,7 @@ function synthesizeLiveLegs(board, destCrs) {
       serviceDate: todayStr(),
       uid: null,
       toc: svc.operatorCode,
+      dest: darwinDest(svc),
       dep: svc.std,
       depM,
       arr: destPoint.st || null,
@@ -1588,8 +1606,8 @@ function liveCacheKey(routeId) { return `liveCache:${routeId}`; }
 // Listed explicitly (not a full leg spread) so schedule-only fields (dep,
 // platform, etc., which come fresh from schedule.json on every load) never
 // get frozen into the cache and overwrite newer schedule data on restore.
-const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_platformHidden', '_delayMins', '_delayUnknown', '_liveDepM', '_liveArr', '_disruptReason'];
-const CONNECTION_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_connAtRisk', '_backup', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform1Hidden', '_platform2', '_platform2Confirmed', '_platform2Changed', '_platform2Hidden', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason'];
+const DIRECT_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_liveDep', '_platform', '_platformConfirmed', '_platformChanged', '_platformHidden', '_delayMins', '_delayUnknown', '_liveDepM', '_liveArr', '_disruptReason', '_liveDest'];
+const CONNECTION_LIVE_FIELDS = ['_liveChecked', '_cancelled', '_cancelledLeg', '_liveDep', '_liveDepM', '_liveChangeMins', '_connAtRisk', '_backup', '_platform1', '_platform1Confirmed', '_platform1Changed', '_platform1Hidden', '_platform2', '_platform2Confirmed', '_platform2Changed', '_platform2Hidden', '_liveChangeArr', '_liveChangeDep', '_liveArr', '_disruptReason', '_liveDest1', '_liveDest2'];
 // Direct legs are keyed by their RTT uid; connection legs have no single
 // uid (two services), so both are combined — matches how fetch_schedule.py
 // pairs them, and is stable across reloads since schedule.json is only
@@ -1980,6 +1998,7 @@ function applyDirectOverlay(legs, dateStr, board, destCrs) {
     // then, so without this flag the card said "On time".
     leg._delayUnknown = !leg._cancelled && svc.etd === 'Delayed';
     leg._disruptReason = serviceReason(svc, leg._cancelled, leg._delayMins > 0 || leg._delayUnknown);
+    leg._liveDest = darwinDest(svc) || leg._liveDest;
 
     // Live arrival estimate at the destination, read straight off this same
     // service's subsequentCallingPoints — the board was already fetched
@@ -2103,6 +2122,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
         leg._platform1Confirmed = platform1State.confirmed;
         leg._platform1Changed = platform1State.changed;
         leg._platform1Hidden = platform1State.hidden;
+        leg._liveDest1 = darwinDest(s1) || leg._liveDest1;
         if (s1.etd && /^\d{2}:\d{2}$/.test(s1.etd)) {
           leg._liveDep = s1.etd;
           liveDelay1 = Math.max(0, liveMinute(s1.etd) - leg.depM);
@@ -2143,6 +2163,7 @@ function applyConnectionOverlay(legs, dateStr, boardA, boardB, changeCrs, destCr
         leg._platform2Confirmed = platform2State.confirmed;
         leg._platform2Changed = platform2State.changed;
         leg._platform2Hidden = platform2State.hidden;
+        leg._liveDest2 = darwinDest(s2) || leg._liveDest2;
         if (s2.etd && /^\d{2}:\d{2}$/.test(s2.etd)) {
           leg._liveChangeDep = s2.etd;
           liveDep2M = liveMinute(s2.etd);

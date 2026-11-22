@@ -366,6 +366,28 @@ break either:
   `stations_all.json`'s codes and rounded to 4dp. It's **ODbL**: keep the
   attribution in the settings sheet. No position is ever stored.
 
+## Final destination on each card
+
+Each card shows the train's final destination ("to Abbey Wood") under the
+journey time, so the reader can find it on the station's departure board.
+A connection shows leg-1's there and leg-2's in the change row.
+
+- **Saved routes**: `fetch_schedule.py`'s `dest_name()` reads the
+  service-level `destination` array (LocationPairs, `location.description`)
+  that every `/gb-nr/location` board entry carries, per RTT's published spec.
+  Stored per leg as `dest` (`dest1`/`dest2` on connections). A dividing train
+  has more than one, joined "A & B". Not yet checked against a live payload.
+  Legs written before this field existed have none and show nothing until
+  the next full run.
+- **Live**: Darwin's `destination[].locationName`, via `darwinDest()`. It is
+  the board's own source, so a matched leg prefers it (`_liveDest`,
+  `_liveDest1`/`_liveDest2`, cached with the other live fields). Quick routes
+  only have this. The field name is the documented Darwin convention, also
+  not yet confirmed live on this key.
+
+Names are escaped (`destHtml()`), and wrap to two lines rather than
+ellipsis, since a phone has no hover to reveal a truncated name.
+
 ## Route types: direct vs connection
 
 `routes.json`'s `change` field (null vs a CRS code) determines which code

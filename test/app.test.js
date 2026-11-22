@@ -2087,3 +2087,77 @@ test('the unconfirmed-platform flag survives the live cache (direct and connecti
   assert.equal(cFresh._platform1Hidden, true);
   assert.equal(cFresh._platform2Hidden, true);
 });
+
+// Final destination, as the departure board names it, so the reader can find
+// the train on the board. Schedule legs carry RTT's name (dest/dest1/dest2);
+// a live match prefers Darwin's, which is the board's own source.
+describe('final destination on the card', () => {
+  const route = { id: 'rdg-pad', from: 'RDG', to: 'PAD' };
+  const board = (dest) => ({ trainServices: [{
+    std: '07:03', etd: 'On time', operatorCode: 'XR', destination: dest,
+    subsequentCallingPoints: [{ callingPoint: [{ crs: 'PAD', st: '07:47', et: 'On time' }] }],
+  }] });
+
+  test('darwinDest() joins a dividing train\'s destinations', () => {
+    const ctx = loadApp();
+    assert.equal(ctx.darwinDest({ destination: [{ locationName: 'Weston-super-Mare' }, { locationName: 'Bristol Temple Meads' }] }),
+      'Weston-super-Mare & Bristol Temple Meads');
+    assert.equal(ctx.darwinDest({}), null);
+    assert.equal(ctx.darwinDest(null), null);
+  });
+
+  test('a quick route takes the destination from the live board', () => {
+    const ctx = loadApp();
+    const [leg] = ctx.synthesizeLiveLegs(board([{ locationName: 'Abbey Wood', crs: 'ABW' }]), 'PAD');
+    assert.equal(leg.dest, 'Abbey Wood');
+    assert.match(ctx.directCard(leg, route, 'out', true, 400, null), /class="rdest"[^>]*>to Abbey Wood</);
+  });
+
+  test('a saved route shows the schedule destination, then Darwin\'s once matched', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:47', arrM: 467, toc: 'XR', uid: 'C1', dest: 'Abbey Wood' };
+    assert.match(ctx.directCard(leg, route, 'out', false, 0, null), /to Abbey Wood</);
+    ctx.applyDirectOverlay([leg], '2026-07-02', board([{ locationName: 'Shenfield' }]), 'PAD');
+    assert.equal(leg._liveDest, 'Shenfield');
+    assert.match(ctx.directCard(leg, route, 'out', true, 400, null), /to Shenfield</);
+    // A later board with no destination keeps the last known one.
+    ctx.applyDirectOverlay([leg], '2026-07-02', board(undefined), 'PAD');
+    assert.equal(leg._liveDest, 'Shenfield');
+  });
+
+  test('no destination known renders nothing extra', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:47', arrM: 467 };
+    assert.doesNotMatch(ctx.directCard(leg, route, 'out', false, 0, null), /rdest/);
+  });
+
+  test('the destination is escaped', () => {
+    const ctx = loadApp();
+    const leg = { date: '2026-07-02', dep: '07:03', depM: 423, arr: '07:47', arrM: 467, dest: '<b>x</b>' };
+    assert.doesNotMatch(ctx.directCard(leg, route, 'out', false, 0, null), /<b>x<\/b>/);
+  });
+
+  test('a connection shows leg-1\'s destination under the duration and leg-2\'s in the change row', () => {
+    const ctx = loadApp();
+    const croute = { id: 'rdg-hoh', from: 'RDG', to: 'HOT', change: 'TWY' };
+    const leg = { date: '2026-07-02', dep: '07:03', depM: 423, changeArr: '07:12', changeArrM: 432,
+      changeDep: '07:18', arr: '07:27', arrM: 447, changeMins: 6,
+      dest1: 'London Paddington', dest2: 'Henley-on-Thames' };
+    const html = ctx.connectionCard(leg, croute, 'out', false, 0, null);
+    assert.match(html, /class="rdest"[^>]*>to London Paddington</);
+    assert.match(html, /dep [^·]*07:18[^·]* to Henley-on-Thames &middot;/);
+  });
+
+  test('the live destination survives the live cache', () => {
+    const ctx = loadApp();
+    const d = { date: '2026-07-02', uid: 'U1', _liveDepM: 423, _liveDest: 'Shenfield' };
+    const c = { date: '2026-07-02', uid1: 'A', uid2: 'B', _liveDepM: 423, _liveDest1: 'X', _liveDest2: 'Y' };
+    const dFresh = { date: '2026-07-02', uid: 'U1' };
+    const cFresh = { date: '2026-07-02', uid1: 'A', uid2: 'B' };
+    ctx.restoreLegs([dFresh], false, plain(ctx.snapshotLegs([d], false)));
+    ctx.restoreLegs([cFresh], true, plain(ctx.snapshotLegs([c], true)));
+    assert.equal(dFresh._liveDest, 'Shenfield');
+    assert.equal(cFresh._liveDest1, 'X');
+    assert.equal(cFresh._liveDest2, 'Y');
+  });
+});

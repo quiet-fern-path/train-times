@@ -123,11 +123,13 @@ body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:var(--bg
 .platform.confirmed{color:var(--text)}
 .platform.changed{color:var(--red)}
 .platform.hidden{color:#b45309;font-style:italic;font-weight:500}
-.track{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px}
+.track{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:3px}
 .rail{display:flex;align-items:center;width:100%}
 .rdot{width:7px;height:7px;border-radius:50%;background:#d1d5db;flex-shrink:0}
 .rline{flex:1;height:2px;background:linear-gradient(to right,#d1d5db,#94a3b8,#d1d5db)}
 .rdur{font-size:.7rem;color:var(--muted);font-weight:600}
+/* Two lines at most: a dividing train names both ends ("A & B"). */
+.rdest{font-size:.64rem;color:var(--muted);max-width:100%;margin-top:-2px;text-align:center;line-height:1.25;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}
 
 .change-row{margin-top:7px;font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .delay-tag{font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:10px;background:#fef2f2;color:var(--red)}

@@ -316,6 +316,27 @@ class TestFetchStationDay(unittest.TestCase):
         self.assertEqual(deps, {})
 
 
+class TestDestName(unittest.TestCase):
+    def test_single_destination(self):
+        svc = make_svc("U1", "2026-07-02")
+        svc["destination"] = [{"location": {"description": "London Paddington", "shortCodes": ["PAD"]}}]
+        self.assertEqual(fs.dest_name(svc), "London Paddington")
+
+    def test_dividing_train_joins_destinations(self):
+        svc = make_svc("U1", "2026-07-02")
+        svc["destination"] = [
+            {"location": {"description": "Weston-super-Mare"}},
+            {"location": {"description": "Bristol Temple Meads"}},
+        ]
+        self.assertEqual(fs.dest_name(svc), "Weston-super-Mare & Bristol Temple Meads")
+
+    def test_missing_destination_is_none(self):
+        self.assertIsNone(fs.dest_name(make_svc("U1", "2026-07-02")))
+        svc = make_svc("U1", "2026-07-02")
+        svc["destination"] = [{"location": {}}]
+        self.assertIsNone(fs.dest_name(svc))
+
+
 class TestFetchLegs(unittest.TestCase):
     def setUp(self):
         fs._station_day_cache.clear()
@@ -336,6 +357,14 @@ class TestFetchLegs(unittest.TestCase):
         self.assertEqual(legs[0]["arr"], "07:27")
         self.assertEqual(legs[0]["depM"], 423)
         self.assertEqual(legs[0]["arrM"], 447)
+        self.assertIsNone(legs[0]["dest"])
+
+    def test_leg_carries_the_services_final_destination(self):
+        svc = make_svc("U1", "2026-07-02", dep_iso="2026-07-02T07:03:00", arr_iso="2026-07-02T07:27:00")
+        svc["destination"] = [{"location": {"description": "Abbey Wood"}}]
+        with patch.object(fs, "api_get", side_effect=self._mock_boards({"RDG": [svc], "PAD": [svc]})):
+            legs = fs.fetch_legs("RDG", "PAD", date(2026, 7, 2))
+        self.assertEqual(legs[0]["dest"], "Abbey Wood")
 
     def test_departure_without_matching_arrival_is_dropped(self):
         # A departure board contains every service leaving the origin, not
@@ -420,6 +449,18 @@ class TestFetchConnection(unittest.TestCase):
         self.assertEqual(out[0]["uid2"], "B2")
         self.assertEqual(out[0]["changeMins"], 3)
         self.assertEqual(out[0]["arr"], "07:27")
+
+    def test_pairs_carry_each_sub_legs_destination(self):
+        legs1 = [{"uid": "A1", "serviceDate": "2026-07-02", "dep": "07:03", "depM": 423,
+                  "arr": "07:15", "arrM": 435, "platform": None, "platformConfirmed": False,
+                  "toc": "GW", "dest": "London Paddington"}]
+        legs2 = [{"uid": "B2", "serviceDate": "2026-07-02", "dep": "07:18", "depM": 438,
+                  "arr": "07:27", "arrM": 447, "platform": None, "platformConfirmed": False,
+                  "toc": "GW", "dest": "Henley-on-Thames"}]
+        with patch.object(fs, "fetch_legs", side_effect=self._mock_legs(legs1, legs2)):
+            out = fs.fetch_connection("RDG", "TWY", "HOT", 3, [date(2026, 7, 2)])["out"]
+        self.assertEqual(out[0]["dest1"], "London Paddington")
+        self.assertEqual(out[0]["dest2"], "Henley-on-Thames")
 
     def test_leg1_with_no_valid_connection_is_dropped(self):
         legs1 = [{"uid": "A1", "serviceDate": "2026-07-02", "dep": "23:50", "depM": 1430,

@@ -306,7 +306,22 @@ def parse_dep(svc):
         "depM": dt_to_m(dep_dt),
         "platform": platform,
         "platformConfirmed": actual is not None,
+        "dest": dest_name(svc),
     }
+
+
+def dest_name(svc):
+    """The service's final destination as a departure board shows it, e.g.
+    "London Paddington", or "Weston-super-Mare & Bristol Temple Meads" for a
+    train that divides. From the service-level `destination` array of
+    LocationPairs on every /gb-nr/location board entry (per the API spec).
+    None when RTT gives no name."""
+    names = [
+        ((d or {}).get("location") or {}).get("description")
+        for d in (svc.get("destination") or [])
+    ]
+    names = [n for n in names if n]
+    return " & ".join(names) if names else None
 
 
 def parse_arr(svc):
@@ -488,6 +503,7 @@ def fetch_legs(origin, destination, tday):
                 "platform": dep["platform"],
                 "platformConfirmed": dep["platformConfirmed"],
                 "toc": dep["toc"],
+                "dest": dep.get("dest"),
             })
 
     return sorted(legs, key=lambda l: l["depM"])
@@ -551,6 +567,8 @@ def fetch_connection(origin, change, destination, min_conn_mins, days):
                     "platform2Confirmed": l2["platformConfirmed"],
                     "toc1": l1["toc"],
                     "toc2": l2["toc"],
+                    "dest1": l1.get("dest"),
+                    "dest2": l2.get("dest"),
                 })
         return paired
 
