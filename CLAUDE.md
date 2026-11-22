@@ -1315,9 +1315,25 @@ arrival — the board is already filtered `filterType:'to'`), and
 `derivePlatformState()` — called with a **null booked platform** (there isn't
 one for a quick route), so a live platform always reads as confirmed, never
 "changed": there's nothing to compare it against. `leg.uid` is always `null`
-— Darwin's `serviceID` isn't the RTT identity RTT deep links need, so
-`directCard()`'s existing `leg.uid ? ... : ''` guard already hides the link
-with no card changes. Quick routes are **direct only** — no change-station
+— Darwin's `serviceID` isn't the RTT identity RTT deep links need, and the
+RTT API that could look it up is server-only. `rttLinkHtml()` resolves a link
+at render time instead, in two tiers:
+
+- **Exact**, when a curated direct route covers the same station pair (either
+  way round): `findCuratedLeg()` takes the uid from its `schedule.json` leg,
+  matched by date and `depM`, then TOC, then arrival within
+  `MATCH_ARR_TOLERANCE_MINS`. A tie it can't break returns null rather than
+  guess: a wrong deep link is worse than the fallback.
+- **Search** otherwise ("Find on RTT"): `rttSearchUrl()` links RTT's origin
+  board filtered to the destination, starting at the train's minute
+  (`/search/detailed/gb-nr:RDG/to/gb-nr:BRI/2026-11-22/1013`). Checked on a
+  real phone: the train is the top row, one tap from its service page. It uses
+  the **booked** time, since RTT searches by booked time and a late train
+  would fall off the top. It uses the **calendar** date, so a 00:00–02:59
+  departure (`depM` 1440+) moves to the next date — the same trap as
+  `serviceDate` vs `date` above.
+
+Quick routes are **direct only** — no change-station
 field in the sheet, matching the connection-scope decision already made for
 the builder.
 

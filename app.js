@@ -639,6 +639,60 @@ function overtakers(leg, pool) {
   return pool.filter(o => o !== leg && !o._cancelled && o.depM > leg.depM && o.arrM != null && leg.arrM != null && o.arrM <= leg.arrM);
 }
 
+// ── RTT links for quick (live-only) routes ──
+// A quick route's legs come from Darwin's public board, whose serviceID is
+// not the RTT identity a /service/ deep link needs, and the RTT API that
+// could look it up is server-only (RTT_TOKEN). So:
+//  1. if a curated direct route covers the same station pair, its
+//     schedule.json legs carry the real uid — match by departure minute,
+//     then TOC, then arrival (same tiers as matchByTime). Ambiguous → null,
+//     since a wrong deep link is worse than the search fallback.
+//  2. otherwise link RTT's station search: origin board, filtered to the
+//     destination, starting at the booked departure (checked on a real
+//     phone: lands on the board with that train first).
+function findCuratedLeg(leg, fromCrs, toCrs) {
+  for (const r of ROUTES) {
+    if (r.liveOnly || r.change) continue;
+    const dir = r.from === fromCrs && r.to === toCrs ? 'out'
+      : r.from === toCrs && r.to === fromCrs ? 'ret' : null;
+    if (!dir) continue;
+    const pool = ((SCHEDULE.routes[r.id] || {})[dir] || [])
+      .filter((l) => l.uid && l.date === leg.date && l.depM === leg.depM);
+    let c = pool;
+    if (c.length > 1 && leg.toc) {
+      const byToc = c.filter((l) => l.toc === leg.toc);
+      if (byToc.length) c = byToc;
+    }
+    if (c.length > 1 && leg.arrM != null) {
+      const byArr = c.filter((l) => l.arrM != null && Math.abs(l.arrM - leg.arrM) <= MATCH_ARR_TOLERANCE_MINS);
+      if (byArr.length) c = byArr;
+    }
+    if (c.length === 1) return c[0];
+  }
+  return null;
+}
+// RTT search URLs take a calendar date, not the 3am timetable day, so a
+// 00:00–02:59 departure (depM 1440+) belongs to the next calendar date.
+// Uses the booked time, not the live one: RTT searches by booked time, so
+// a late train would otherwise drop off the top of the results.
+function rttSearchUrl(fromCrs, toCrs, dateStr, depM) {
+  const calDate = depM >= 1440 ? addDays(dateStr, 1) : dateStr;
+  const m = depM % 1440;
+  const hhmm = String(Math.floor(m / 60)).padStart(2, '0') + String(m % 60).padStart(2, '0');
+  return `https://www.realtimetrains.co.uk/search/detailed/gb-nr:${fromCrs}/to/gb-nr:${toCrs}/${calDate}/${hhmm}`;
+}
+function rttLinkHtml(leg, route, dir) {
+  if (leg.uid) {
+    return `<a class="rtt-link" href="https://www.realtimetrains.co.uk/service/gb-nr:${leg.uid}/${leg.serviceDate || leg.date}/detailed" target="_blank" rel="noopener">View on RTT &rarr;</a>`;
+  }
+  if (!route.liveOnly || leg.depM == null) return '';
+  const fromCrs = dir === 'out' ? route.from : route.to;
+  const toCrs = dir === 'out' ? route.to : route.from;
+  const match = findCuratedLeg(leg, fromCrs, toCrs);
+  if (match) return rttLinkHtml(match, route, dir);
+  return `<a class="rtt-link" href="${rttSearchUrl(fromCrs, toCrs, leg.date, leg.depM)}" target="_blank" rel="noopener">Find on RTT &rarr;</a>`;
+}
+
 function directCard(leg, route, dir, isToday, curM, faster) {
   const effM = effDepM(leg);
   const isPast = isToday && effM < curM;
@@ -667,10 +721,7 @@ function directCard(leg, route, dir, isToday, curM, faster) {
       ? `<span class="delay-tag">${leg._delayMins} min late</span>`
       : (leg._delayMins === 0 && leg._liveChecked ? `<span class="delay-tag" style="background:#f0fdf4;color:#059669">On time</span>` : '');
 
-  const rttDate = leg.serviceDate || leg.date;
-  const rttLink = leg.uid
-    ? `<a class="rtt-link" href="https://www.realtimetrains.co.uk/service/gb-nr:${leg.uid}/${rttDate}/detailed" target="_blank" rel="noopener">View on RTT &rarr;</a>`
-    : '';
+  const rttLink = rttLinkHtml(leg, route, dir);
 
   const isSlower = !!faster;
   const slowerHtml = isSlower
@@ -1475,8 +1526,8 @@ function serviceReason(svc, cancelled, delayed) {
 // is passed a null booked platform (there isn't one), so a live platform
 // always reads as confirmed, never "changed" — there's nothing to compare it
 // against. uid is always null: Darwin's serviceID isn't the RTT identity RTT
-// deep links need, so directCard's existing `leg.uid ? ... : ''` guard
-// already hides the link, no card changes required.
+// deep links need — rttLinkHtml() resolves a link at render time instead
+// (curated-route uid if one matches, else an RTT station search).
 function synthesizeLiveLegs(board, destCrs) {
   if (!board || !board.trainServices) return [];
   const legs = [];
