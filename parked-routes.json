@@ -30,5 +30,19 @@
     "to": "HXX",
     "change": "HAY",
     "minConnectionMins": 2
+  },
+  {
+    "id": "rdg-mai",
+    "name": "Reading ↔ Maidenhead",
+    "from": "RDG",
+    "to": "MAI",
+    "change": null
+  },
+  {
+    "id": "rdg-tap",
+    "name": "Reading ↔ Taplow",
+    "from": "RDG",
+    "to": "TAP",
+    "change": null
   }
 ]
